@@ -1,0 +1,17 @@
+[Unit]
+Description=M-Star Queue Daemon
+After=network.target
+
+[Service]
+User=mstar_user
+Group=mstar_user
+WorkingDirectory=/opt/mstar_queue 
+ExecStart=/usr/local/bin/mstar_queue
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+Environment="RUST_BACKTRACE=1"
+
+[Install]
+WantedBy=multi-user.target 

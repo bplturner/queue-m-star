@@ -1,0 +1,4 @@
+# Cargo configuration to store build artifacts locally on /tmp
+[build]
+# Use a local directory for the target to allow execution of build scripts
+#target-dir = "." 
