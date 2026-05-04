@@ -1,28 +1,32 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::ffi::OsStr;
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
 use notify::{Watcher, RecursiveMode, Config as NotifyConfig};
-use chrono::Local;
+use notify::PollWatcher;
 use clap::Parser;
-use md5::Context;
 use std::sync::Arc;
 use std::collections::HashMap;
-use regex::Regex;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::fs as tokio_fs;
-use tokio::time::{Duration, sleep, Instant as TokioInstant};
-use tokio::sync::RwLock as TokioRwLock;
-use tokio::task;
-use tokio::process::Command as TokioCommand;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::time::{Duration, sleep};
 
+pub mod config;
+pub mod db;
+pub mod api;
+pub mod queue;
 pub mod web_server;
 pub mod gpu_info;
+pub mod mstar_versions;
 
-// Make sure GpuInfo is defined here or re-exported from another module
+use crate::config::Config;
+use crate::db::DbHandle;
+use crate::api::{AppState, VersionList};
+
+// ============================================================
+// Shared Types
+// ============================================================
+
 #[derive(Clone, Debug)]
 pub struct GpuInfo {
     pub name: String,
@@ -31,169 +35,378 @@ pub struct GpuInfo {
     pub power_limit: f32,
     pub memory_used: u64,
     pub memory_total: u64,
+    pub temperature: f32,
+    /// True if nvidia-smi reports compute processes running on this GPU
+    pub has_compute_processes: bool,
 }
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
+#[clap(author, version, about = "M-Star CFD Queue Manager", long_about = None)]
 struct Args {
+    /// Suppress console output
     #[clap(short, long)]
     quiet: bool,
 
+    /// Enable the web server
     #[clap(long, default_value = "true")]
     enable_web_server: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct ProcessInfo {
-    pub pid: u32,
-    pub gpu_id: usize,
-    pub msb_file: String,
-    pub output_file: String,
-}
-
-type ProcessMap = Arc<TokioRwLock<HashMap<u32, ProcessInfo>>>;
-
-#[derive(Clone, Debug)]
-pub struct GpuStatus {
-    pub info: GpuInfo,
-    pub preallocated: bool,
-}
-
-type GpuStatusList = Arc<TokioMutex<Vec<GpuStatus>>>;
-
-use web_server::run_web_server;
-
-mod config;
-use crate::config::Config;
+// ============================================================
+// Main Entry Point
+// ============================================================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Load configuration
+    println!("===========================================");
+    println!("  M-Star Queue - Job Management System");
+    println!("===========================================");
+
+    // Load and validate configuration
     let config = Config::load().expect("Failed to load configuration");
-    // Validate the configuration
     config.validate().expect("Invalid configuration");
+    println!("[INIT] Configuration loaded from config.toml");
 
     // Parse command line arguments
     let args = Args::parse();
-    // Determine verbosity based on quiet flag
     let verbose = !args.quiet;
 
-    // Use config values instead of hardcoded paths for the log file
+    // Initialize database
+    println!("[INIT] Initializing database at: {}", config.paths.database_file.display());
+    let db: DbHandle = db::init_db(&config.paths.database_file)
+        .expect("Failed to initialize database");
+
+    // Ensure default admin user exists
+    {
+        let conn = db.lock().await;
+        db::ensure_default_admin(&conn)
+            .expect("Failed to create default admin");
+    }
+
+    // Discover M-Star versions
+    println!("[INIT] Scanning for M-Star versions at: {}", config.paths.mstar_install_dir.display());
+    let discovered_versions = mstar_versions::discover_versions(&config.paths.mstar_install_dir);
+    println!("[INIT] Found {} M-Star versions", discovered_versions.len());
+    for v in &discovered_versions {
+        println!("  - {} {}", v.version, if v.is_latest { "(latest)" } else { "" });
+    }
+    let versions: VersionList = Arc::new(TokioMutex::new(discovered_versions));
+
+    // Initialize log file
     let log_file = Arc::new(TokioMutex::new(OpenOptions::new()
-        .create(true) // Create the file if it doesn't exist
-        .append(true) // Append to the file if it exists
-        .open(&config.paths.log_file)?)); // Open the log file specified in the config
-    
-    // Get the queue directory from the config
-    let queue_dir = &config.paths.queue_directory;
-    
-    // Initialize the process map
-    let process_map: ProcessMap = Arc::new(TokioRwLock::new(HashMap::new()));
-    // Initialize the GPU status list, passing the config for detailed settings
-    let gpu_status: GpuStatusList = initialize_gpu_status(&log_file, verbose, &config).await?;
+        .create(true)
+        .append(true)
+        .open(&config.paths.log_file)?));
 
-    // Check if the web server should be enabled
-    if args.enable_web_server {
-        // Clone Arcs and config for the web server task
-        let web_process_map = Arc::clone(&process_map); // Clone process_map for web server
-        let web_gpu_status = Arc::clone(&gpu_status); // Clone gpu_status for web server
-        let web_log_file = Arc::clone(&log_file); // Clone log_file for web server
-        let web_config = config.web_server.clone(); // Clone web_server config section
-        let paths_config = config.paths.clone(); // Clone paths config section
-        let main_config_clone = config.clone(); // Clone the entire config for web server access if needed for GPU status
+    // Create shared application state
+    let app_state = AppState {
+        db: db.clone(),
+        versions: versions.clone(),
+        config: config.clone(),
+    };
 
-        // Spawn the web server task
+    // Ensure jobs directory exists
+    tokio_fs::create_dir_all(&config.paths.jobs_directory).await?;
+    println!("[INIT] Jobs directory: {}", config.paths.jobs_directory.display());
+
+    // Start the queue manager (background task)
+    {
+        let db_clone = db.clone();
+        let versions_clone = versions.clone();
+        let config_clone = config.clone();
         tokio::spawn(async move {
-            // Run the web server
-            if let Err(e) = run_web_server(
-                web_log_file, 
-                verbose, 
-                web_process_map, 
-                web_gpu_status,
-                &web_config, // Pass web_server config
-                paths_config, // Pass paths config
-                main_config_clone, // Pass the main config
-            ).await {
-                // Print an error message if the web server fails
-                eprintln!("Web server error: {}", e);
+            queue::run_queue_manager(db_clone, versions_clone, config_clone).await;
+        });
+        println!("[INIT] Queue manager started (polling every {}s, max {} concurrent jobs)",
+            config.queue.poll_interval_secs, config.queue.max_concurrent_jobs);
+    }
+
+    // Start GPU metrics logger (1-second snapshots)
+    {
+        let log_path = config.paths.gpu_metrics_log.clone();
+        tokio::spawn(async move {
+            gpu_metrics_logger(log_path).await;
+        });
+        println!("[INIT] GPU metrics logger started (1s interval) → {}", config.paths.gpu_metrics_log.display());
+    }
+
+    // Start the web server
+    if args.enable_web_server {
+        let state_clone = app_state.clone();
+        let web_config = config.web_server.clone();
+        tokio::spawn(async move {
+            run_web_server(state_clone, &web_config).await;
+        });
+        println!("[INIT] Web server started on port {}", config.web_server.port);
+    }
+
+    // Start file watcher for legacy network queue intake
+    let queue_dir = config.paths.queue_directory.clone();
+    if queue_dir.exists() {
+        println!("[INIT] Watching {} for .MSB files (file watcher intake)", queue_dir.display());
+
+        let db_clone = db.clone();
+        let config_clone = config.clone();
+        let log_file_clone = log_file.clone();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+        let mut watcher = PollWatcher::new(
+            move |res| { let _ = tx.blocking_send(res); },
+            NotifyConfig::default()
+                .with_poll_interval(std::time::Duration::from_secs(2))
+                .with_compare_contents(true),
+        )?;
+        watcher.watch(&queue_dir, RecursiveMode::NonRecursive)?;
+
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let Ok(notify::Event { kind: notify::EventKind::Create(_), paths, .. }) = event {
+                    for path in paths {
+                        if is_msb_file(&path) {
+                            println!("[WATCHER] Detected new .MSB file: {:?}", path);
+
+                            // Wait a moment for the file to finish copying
+                            sleep(Duration::from_secs(3)).await;
+
+                            match queue::create_job_from_file_watcher(
+                                &db_clone, &config_clone, &path
+                            ).await {
+                                Ok(job_id) => {
+                                    println!("[WATCHER] Created job {} from {:?}", job_id, path);
+                                }
+                                Err(e) => {
+                                    eprintln!("[WATCHER] Failed to create job from {:?}: {}", path, e);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
 
-        // Log that the web server has started
-        log_and_print(&log_file, "Web server started", verbose).await?;
+        // Keep watcher alive
+        std::mem::forget(watcher);
     } else {
-        // Log that the web server is disabled
-        log_and_print(&log_file, "Web server disabled", verbose).await?;
+        println!("[INIT] Queue directory {} does not exist, file watcher disabled", queue_dir.display());
     }
 
-    process_existing_files(queue_dir, &config, &log_file, verbose, &process_map, &gpu_status).await?;
+    println!("[INIT] M-Star Queue is ready!");
+    println!("[INIT] Web UI: http://localhost:{}/", config.web_server.port);
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    let mut watcher = notify::RecommendedWatcher::new(
-        move |res| { let _ = tx.blocking_send(res); },
-        NotifyConfig::default(),
-    )?;
-    watcher.watch(queue_dir, RecursiveMode::Recursive)?;
-
-    log_and_print(&log_file, &format!("Watching {} for .MSB files...", queue_dir.display()), verbose).await?;
-
-    while let Some(event) = rx.recv().await {
-        if let Ok(notify::Event { kind: notify::EventKind::Create(_), paths, .. }) = event {
-            for path in paths {
-                if is_msb_file(&path) {
-                    log_and_print(&log_file, &format!("Detected new .MSB file: {:?}", path), verbose).await?;
-                    let process_map_clone = Arc::clone(&process_map);
-                    let gpu_status_clone = Arc::clone(&gpu_status);
-                    let log_file_clone = Arc::clone(&log_file);
-                    let path_clone = path.to_path_buf();
-                    let verbose_clone = verbose;
-                    let config = config.clone();
-                    
-                    tokio::spawn(async move {
-                        match process_msb_file(
-                            &path_clone,
-                            &config,
-                            &log_file_clone,
-                            verbose_clone,
-                            process_map_clone,
-                            gpu_status_clone
-                        ).await {
-                            Ok(_) => {
-                                if let Err(e) = log_and_print(&log_file_clone, &format!("Successfully processed file: {:?}", path_clone), verbose_clone).await {
-                                    eprintln!("Error logging success: {}", e);
-                                }
-                            },
-                            Err(e) => {
-                                if let Err(log_err) = log_and_print(&log_file_clone, &format!("Error processing file {:?}: {}", path_clone, e), verbose_clone).await {
-                                    eprintln!("Error logging failure: {}", log_err);
-                                }
-                            },
-                        }
-                    });
-                }
-            }
-        }
-    }
-
+    // Keep the main task alive
+    tokio::signal::ctrl_c().await?;
+    println!("\n[SHUTDOWN] Received Ctrl+C, shutting down...");
     Ok(())
 }
 
-async fn process_existing_files(dir: &Path, config: &Config, log_file: &Arc<TokioMutex<File>>, verbose: bool, process_map: &ProcessMap, gpu_status: &GpuStatusList) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut entries = tokio_fs::read_dir(dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if is_msb_file(&path) {
-            log_and_print(log_file, &format!("Found existing .MSB file: {:?}", path), verbose).await?;
-            let process_map_clone = Arc::clone(process_map);
-            let gpu_status_clone = Arc::clone(gpu_status);
-            match process_msb_file(&path, config, log_file, verbose, process_map_clone, gpu_status_clone).await {
-                Ok(_) => log_and_print(log_file, &format!("Successfully processed file: {:?}", path), verbose).await?,
-                Err(e) => log_and_print(log_file, &format!("Error processing file {:?}: {}", path, e), verbose).await?,
+// ============================================================
+// Web Server (combining API + static files)
+// ============================================================
+
+async fn run_web_server(state: AppState, web_config: &config::WebServerConfig) {
+    use warp::Filter;
+
+    let port = web_config.port;
+
+    // API routes
+    let api = api::api_routes(state.clone());
+
+    // Job submission route (create job + upload in one step via JSON body)
+    let submit_job = warp::path("api").and(warp::path("jobs")).and(warp::path("submit"))
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::body::content_length_limit(500 * 1024 * 1024))
+        .and(warp::body::bytes())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(warp::any().map(move || state.clone()))
+        .and_then(handle_full_job_submit);
+
+    // Serve the SPA index.html for all non-API, non-static routes
+    let index = warp::get()
+        .and(warp::path::tail())
+        .and(warp::fs::file("./static/index.html"))
+        .map(|_tail: warp::path::Tail, file| file);
+
+    // Static file serving
+    let static_files = warp::path("static").and(warp::fs::dir("./static"));
+
+    let routes = submit_job.or(api).or(static_files).or(index)
+        .with(warp::cors()
+            .allow_any_origin()
+            .allow_methods(vec!["GET", "POST", "DELETE", "OPTIONS"])
+            .allow_headers(vec!["authorization", "content-type"])
+        );
+
+    warp::serve(routes)
+        .run(([0, 0, 0, 0], port))
+        .await;
+}
+
+/// Handle a full job submission: metadata via query params + MSB file as body
+async fn handle_full_job_submit(
+    auth: Option<String>,
+    file_data: bytes::Bytes,
+    params: HashMap<String, String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // Authenticate
+    let token = match auth.and_then(|h| {
+        if h.starts_with("Bearer ") { Some(h[7..].to_string()) } else { Some(h) }
+    }) {
+        Some(t) => t,
+        None => return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "Not authenticated"})),
+            warp::http::StatusCode::UNAUTHORIZED,
+        )),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(e) => return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": e})),
+            warp::http::StatusCode::UNAUTHORIZED,
+        )),
+    };
+
+    // Extract params
+    let msb_source_path = params.get("msb_source_path").cloned();
+    let filename = if let Some(ref src) = msb_source_path {
+        // Remote file: extract filename from the server path
+        std::path::Path::new(src)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("remote.msb")
+            .to_string()
+    } else {
+        params.get("filename").cloned().unwrap_or_else(|| "upload.msb".to_string())
+    };
+    let name = params.get("name").cloned().unwrap_or_else(|| {
+        filename.trim_end_matches(".msb").trim_end_matches(".MSB").to_string()
+    });
+    let version = params.get("version").cloned().unwrap_or_else(|| "latest".to_string());
+    let gpu_ids_str = params.get("gpu_ids").cloned().unwrap_or_else(|| "[0]".to_string());
+    let unified_memory = params.get("unified_memory").map(|v| v == "true" || v == "1").unwrap_or(false);
+    let priority = params.get("priority").and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
+    let copy_to = params.get("copy_to").cloned();
+
+    // SECURITY: Validate copy_to path resolves under /simulations (canonicalize parent to catch traversal)
+    if let Some(ref ctp) = copy_to {
+        let requested = std::path::Path::new(ctp);
+        // If the directory already exists, canonicalize it directly
+        // Otherwise canonicalize the nearest existing parent
+        let check_path = if requested.exists() {
+            std::fs::canonicalize(requested).ok()
+        } else if let Some(parent) = requested.parent() {
+            if parent.exists() {
+                std::fs::canonicalize(parent).ok()
+            } else {
+                // Parent doesn't exist yet — just do a string-level check as a baseline
+                Some(std::path::PathBuf::from(ctp))
             }
+        } else {
+            None
+        };
+        match check_path {
+            Some(resolved) if resolved.starts_with("/simulations") => {},
+            Some(_) => return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "copy_to path must resolve under /simulations"})),
+                warp::http::StatusCode::BAD_REQUEST,
+            )),
+            None => return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "copy_to path is invalid"})),
+                warp::http::StatusCode::BAD_REQUEST,
+            )),
         }
     }
-    Ok(())
+
+    // SECURITY: Validate msb_source_path exists and resolves under /simulations
+    if let Some(ref src) = msb_source_path {
+        let canonical = match std::fs::canonicalize(src) {
+            Ok(p) => p,
+            Err(_) => return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": format!("File not found: {}", src)})),
+                warp::http::StatusCode::BAD_REQUEST,
+            )),
+        };
+        if !canonical.starts_with("/simulations") {
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "msb_source_path must resolve under /simulations"})),
+                warp::http::StatusCode::BAD_REQUEST,
+            ));
+        }
+    }
+
+    // Create job in DB
+    let job_id = match db::create_job(&db, user.id, &name, &filename, &version, &gpu_ids_str, unified_memory, priority, copy_to.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": e})),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    };
+    drop(db); // Release lock before file I/O
+
+    // Create job directory
+    let job_dir = state.config.paths.jobs_directory.join(format!("job_{}", job_id));
+    if let Err(e) = tokio::fs::create_dir_all(&job_dir).await {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": format!("Failed to create directory: {}", e)})),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+
+    // Get MSB file into job directory
+    let msb_path = job_dir.join(&filename);
+    if let Some(ref src) = msb_source_path {
+        // Copy from server filesystem
+        if let Err(e) = tokio::fs::copy(src, &msb_path).await {
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": format!("Failed to copy MSB from server: {}", e)})),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ));
+        }
+        println!("[SUBMIT] Job {} using server file: {}", job_id, src);
+    } else {
+        // Write uploaded file data
+        if let Err(e) = tokio::fs::write(&msb_path, &file_data).await {
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": format!("Failed to write file: {}", e)})),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ));
+        }
+    }
+
+    // Update working directory in DB
+    {
+        let db = state.db.lock().await;
+        let _ = db.execute(
+            "UPDATE jobs SET working_directory = ?2 WHERE id = ?1",
+            rusqlite::params![job_id, job_dir.to_str().unwrap_or("")],
+        );
+    }
+
+    println!("[SUBMIT] Job {} created by {} ({}): version={}, gpus={}, unified_memory={}, copy_to={:?}",
+        job_id, user.username, filename, version, gpu_ids_str, unified_memory, copy_to);
+
+    Ok(warp::reply::with_status(
+        warp::reply::json(&serde_json::json!({
+            "message": "Job submitted successfully",
+            "job_id": job_id,
+            "name": name,
+            "version": version,
+            "gpu_ids": gpu_ids_str,
+            "unified_memory": unified_memory,
+            "copy_to": copy_to,
+        })),
+        warp::http::StatusCode::OK,
+    ))
 }
+
+// ============================================================
+// Utilities
+// ============================================================
 
 fn is_msb_file(path: &Path) -> bool {
     path.extension()
@@ -202,268 +415,17 @@ fn is_msb_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-async fn wait_for_file_availability(path: &Path, timeout: Duration, log_file: &Arc<TokioMutex<File>>, verbose: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let start_time = TokioInstant::now();
-    let mut last_size = 0;
-    let mut last_hash = String::new();
-    let mut consecutive_matches = 0;
-
-    while start_time.elapsed() < timeout {
-        match tokio_fs::metadata(path).await {
-            Ok(metadata) => {
-                let current_size = metadata.len();
-                if current_size > last_size {
-                    log_and_print(log_file, &format!("File size increased: {} bytes (was {} bytes)", current_size, last_size), verbose).await?;
-                    last_size = current_size;
-                    consecutive_matches = 0;
-                } else {
-                    let path_clone = path.to_path_buf();
-                    let current_hash = task::spawn_blocking(move || {
-                        let mut file = std::fs::File::open(path_clone)?;
-                        let mut hasher = Context::new();
-                        std::io::copy(&mut file, &mut hasher)?;
-                        Ok::<_, std::io::Error>(format!("{:x}", hasher.compute()))
-                    }).await??;
-
-                    if current_hash == last_hash {
-                        consecutive_matches += 1;
-                        if consecutive_matches >= 3 {
-                            log_and_print(log_file, "File copy completed and verified", verbose).await?;
-                            return Ok(());
-                        }
-                    } else {
-                        consecutive_matches = 0;
-                    }
-                    last_hash = current_hash;
-                }
-            },
-            Err(e) => {
-                log_and_print(log_file, &format!("Error checking file: {}", e), verbose).await?;
-            }
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-    Err(Box::new(io::Error::new(ErrorKind::TimedOut, "File not fully copied within timeout")))
-}
-
-async fn process_msb_file(
-    path: &Path,
-    config: &Config,
-    log_file: &Arc<TokioMutex<File>>, 
-    verbose: bool, 
-    process_map: ProcessMap, 
-    gpu_status: GpuStatusList
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Add file size validation at the start
-    let file_size = path.metadata()?.len();
-    let max_size = config.file_handling.max_file_size_mb * 1024 * 1024;
-    if file_size > max_size {
-        let err_msg = format!(
-            "File size {} bytes exceeds maximum allowed size of {} bytes",
-            file_size, max_size
-        );
-        log_and_print(log_file, &err_msg, verbose).await?;
-        return Err(err_msg.into());
-    }
-
-    // Add file type validation
-    if !config.file_handling.allowed_file_types.iter()
-        .any(|allowed| allowed.to_lowercase() == "msb") {
-        let err_msg = "MSB files are not in allowed types list".to_string();
-        log_and_print(log_file, &err_msg, verbose).await?;
-        return Err(err_msg.into());
-    }
-
-    wait_for_file_availability(path, Duration::from_secs(1800), log_file, verbose).await?;
-
-    let file_stem = path.file_stem()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "Invalid file name"))?;
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let new_dir_name = sanitize_filename(&format!("{}_{}", file_stem, timestamp));
-    let new_dir = path.parent()
-        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "Parent directory not found"))?
-        .join(new_dir_name);
-    
-    tokio_fs::create_dir(&new_dir).await?;
-    log_and_print(log_file, &format!("Created new directory: {:?}", new_dir), verbose).await?;
-
-    let new_file_path = new_dir.join(path.file_name().unwrap());
-    tokio_fs::rename(path, &new_file_path).await?;
-    log_and_print(log_file, &format!("Moved file to: {:?}", new_file_path), verbose).await?;
-
-    wait_for_file_availability(&new_file_path, Duration::from_secs(300), log_file, verbose).await?;
-
-    log_and_print(log_file, "Running unpack_msb.py...", verbose).await?;
-    let parent_dir = path.parent().ok_or_else(|| io::Error::new(ErrorKind::NotFound, "Parent directory not found"))?;
-    
-    let command = format!("python3 unpack_msb.py \"{}\" \"{}\"", new_file_path.display(), new_dir.display());
-    log_and_print(log_file, &format!("Executing command: {}", command), verbose).await?;
-
-    let unpack_output = Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .current_dir(parent_dir)
-        .output()?;
-
-    if !unpack_output.status.success() {
-        let error_msg = format!("unpack_msb.py failed with exit code: {}", unpack_output.status);
-        log_and_print(log_file, &error_msg, verbose).await?;
-        log_and_print(log_file, &format!("unpack_msb.py stdout: {}", String::from_utf8_lossy(&unpack_output.stdout)), verbose).await?;
-        log_and_print(log_file, &format!("unpack_msb.py stderr: {}", String::from_utf8_lossy(&unpack_output.stderr)), verbose).await?;
-        return Err(Box::new(io::Error::new(ErrorKind::Other, error_msg)));
-    } else {
-        log_and_print(log_file, "unpack_msb.py completed successfully", verbose).await?;
-        log_and_print(log_file, &format!("unpack_msb.py stdout: {}", String::from_utf8_lossy(&unpack_output.stdout)), verbose).await?;
-        if !unpack_output.stderr.is_empty() {
-            log_and_print(log_file, &format!("unpack_msb.py stderr (warnings): {}", String::from_utf8_lossy(&unpack_output.stderr)), verbose).await?;
-        }
-    }
-
-    log_and_print(log_file, "Running mstar-cfd-mgpu...", verbose).await?;
-    
-    let new_dir_clone = new_dir.clone();
-    let process_map_clone = process_map.clone();
-
-    let msb_file = sanitize_filename(path.file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("unknown"));
-
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let output_filename = format!("output_{}.txt", timestamp);
-    let output_file = new_dir_clone.join(output_filename);
-
-    // Open the file for writing
-    let file = tokio::fs::File::create(&output_file).await?;
-    let mut writer = tokio::io::BufWriter::new(file);
-
-    // Update the mstar-cfd-mgpu path to use config
-    let mstar_cfd_mgpu_path = &config.paths.mstar_executable;
-
-    // Get the GPU with no running processes or lowest memory utilization
-    let gpu_id = get_gpu_with_lowest_utilization(&gpu_status, &process_map, config).await?;
-
-    // Construct the full command string
-    let full_command = format!("{} -i input.xml -o out --gpu-ids={}", mstar_cfd_mgpu_path.display(), gpu_id);
-
-    // Log the full command
-    log_and_print(log_file, &format!("Full mstar-cfd-mgpu command: {}", full_command), verbose).await?;
-
-    let mut child = TokioCommand::new(mstar_cfd_mgpu_path)
-        .arg("-i")
-        .arg("input.xml")
-        .arg("-o")
-        .arg("out")
-        .arg(format!("--gpu-ids={}", gpu_id))
-        .current_dir(&new_dir_clone)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let pid = child.id().unwrap();
-
-    let process_info = ProcessInfo {
-        pid,
-        gpu_id,
-        msb_file: msb_file.clone(),
-        output_file: output_file.to_str().unwrap().to_string(),
-    };
-    process_map_clone.write().await.insert(pid, process_info);
-
-    // Log the start of the mstar-cfd-mgpu process
-    log_and_print(log_file, &format!("Started mstar-cfd-mgpu with PID: {} on GPU: {}, solving file: {}", pid, gpu_id, msb_file), verbose).await?;
-
-    // Clone variables for the logging task
-    let log_file_clone = Arc::clone(log_file); // Clone the log file Arc
-    let verbose_clone = verbose; // Clone the verbose flag
-    // Clone the config for potential use in the spawned task (e.g., for conditional logging based on config)
-    // Prefix with _ to indicate it might not be used immediately, silencing unused variable warning.
-    let _config_clone = config.clone(); 
-
-    // Take ownership of stdout and stderr from the child process
-    let stdout = child.stdout.take().expect("Failed to capture stdout"); // Expect stdout to be available
-    let stderr = child.stderr.take().expect("Failed to capture stderr"); // Expect stderr to be available
-
-    tokio::spawn(async move {
-        let mut stdout_reader = tokio::io::BufReader::new(stdout);
-        let mut stderr_reader = tokio::io::BufReader::new(stderr);
-        let mut stdout_line = String::new();
-        let mut stderr_line = String::new();
-
-        loop {
-            tokio::select! {
-                result = stdout_reader.read_line(&mut stdout_line) => {
-                    if result.unwrap() == 0 {
-                        break;
-                    }
-                    if let Err(e) = writer.write_all(stdout_line.as_bytes()).await {
-                        eprintln!("Failed to write stdout: {}", e);
-                    }
-                    stdout_line.clear();
-                }
-                result = stderr_reader.read_line(&mut stderr_line) => {
-                    if result.unwrap() == 0 {
-                        break;
-                    }
-                    if let Err(e) = writer.write_all(stderr_line.as_bytes()).await {
-                        eprintln!("Failed to write stderr: {}", e);
-                    }
-                    stderr_line.clear();
-                }
-                result = child.wait() => {
-                    if let Ok(status) = result {
-                        if status.success() {
-                            let _ = log_and_print(&log_file_clone, "mstar-cfd-mgpu completed successfully", verbose_clone).await;
-                        } else {
-                            let error_msg = format!("mstar-cfd-mgpu failed with exit code: {}", status);
-                            let _ = log_and_print(&log_file_clone, &error_msg, verbose_clone).await;
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        if let Err(e) = writer.flush().await {
-            eprintln!("Failed to flush output: {}", e);
-        }
-
-        process_map_clone.write().await.remove(&pid);
-        let _ = log_and_print(&log_file_clone, &format!("Finished processing file: {:?}", new_file_path), verbose_clone).await;
-    });
-
-    Ok(())
-}
-
-fn sanitize_filename(filename: &str) -> String {
-    let re = Regex::new(r"[^a-zA-Z0-9_.]").unwrap();
-    re.replace_all(filename, "_").to_string()
-} 
-
-async fn log_and_print(log_file: &Arc<TokioMutex<File>>, message: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let log_entry = format!("[{}] {}\n", timestamp, message);
-    
-    let mut file = log_file.lock().await;
-    file.write_all(log_entry.as_bytes())?;
-    
-    if verbose {
-        println!("{}", log_entry.trim());
-    }
-    Ok(())
-}
-
 pub fn get_gpu_info() -> Result<Vec<GpuInfo>, Box<dyn std::error::Error + Send + Sync>> {
     let output = Command::new("nvidia-smi")
-        .args(&["--query-gpu=name,utilization.gpu,power.draw,power.limit,memory.used,memory.total", 
+        .args(&["--query-gpu=name,utilization.gpu,power.draw,power.limit,memory.used,memory.total,temperature.gpu",
                 "--format=csv,noheader,nounits"])
         .output()?;
     let output_str = String::from_utf8(output.stdout)?;
-    
+
     let mut gpu_info = Vec::new();
     for line in output_str.lines() {
         let values: Vec<&str> = line.split(',').map(str::trim).collect();
-        if values.len() == 6 {
+        if values.len() == 7 {
             gpu_info.push(GpuInfo {
                 name: values[0].to_string(),
                 utilization: values[1].parse().unwrap_or(0.0),
@@ -471,126 +433,112 @@ pub fn get_gpu_info() -> Result<Vec<GpuInfo>, Box<dyn std::error::Error + Send +
                 power_limit: values[3].parse().unwrap_or(0.0),
                 memory_used: values[4].parse().unwrap_or(0),
                 memory_total: values[5].parse().unwrap_or(0),
+                temperature: values[6].parse().unwrap_or(0.0),
+                has_compute_processes: false, // will be set below
             });
         }
     }
 
-    // If no GPUs were found, return an error
     if gpu_info.is_empty() {
         return Err("No GPUs found".into());
+    }
+
+    // Query for active compute processes to detect external workloads
+    // nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name --format=csv,noheader
+    // We use gpu_bus_id instead since it maps to index order
+    if let Ok(proc_output) = Command::new("nvidia-smi")
+        .args(&["--query-compute-apps=gpu_bus_id,pid,process_name",
+                "--format=csv,noheader"])
+        .output()
+    {
+        if let Ok(proc_str) = String::from_utf8(proc_output.stdout) {
+            // Get index→bus_id mapping
+            let bus_ids = get_gpu_bus_ids();
+            
+            for line in proc_str.lines() {
+                let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+                if parts.len() >= 2 {
+                    let bus_id = parts[0].to_uppercase();
+                    // Find which GPU index this bus_id maps to
+                    if let Some(idx) = bus_ids.iter().position(|b| b.to_uppercase() == bus_id) {
+                        if idx < gpu_info.len() {
+                            gpu_info[idx].has_compute_processes = true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(gpu_info)
 }
 
-async fn initialize_gpu_status(log_file: &Arc<TokioMutex<File>>, verbose: bool, config: &Config) -> Result<GpuStatusList, Box<dyn std::error::Error + Send + Sync>> {
-    // Get the current GPU information
-    let gpu_info_vec = get_gpu_info()?;
-    // Initialize a vector to store GpuStatus structs
-    let mut gpu_status_list: Vec<GpuStatus> = Vec::new();
-
-    // Iterate over the retrieved GPU information
-    for info in gpu_info_vec {
-        // Format a message with GPU details for logging
-        let message = format!("GPU: {}, Utilization: {}%, Power: {:.2}W / {:.2}W, Memory: {} MB / {} MB",
-                 info.name, info.utilization, info.power_usage, info.power_limit,
-                 info.memory_used, info.memory_total);
-        // Log the GPU details
-        log_and_print(log_file, &message, verbose).await?;
-        
-        // Calculate initial memory usage percentage for this GPU
-        let initial_memory_usage_percent = if info.memory_total > 0 {
-            // Calculate percentage if memory_total is not zero
-            (info.memory_used as f32 / info.memory_total as f32) * 100.0
-        } else {
-            // If memory_total is zero, consider usage as 100% to be safe (or 0% if that makes more sense, but 100% makes it likely to be seen as busy)
-            100.0 
-        };
-
-        // Determine if the GPU is preallocated based on its initial utilization OR memory usage
-        let is_preallocated = info.utilization > config.gpu_selection.reserved_gpu_max_utilization || 
-                              initial_memory_usage_percent > config.gpu_selection.reserved_gpu_max_memory_usage_percent;
-
-        // Push the GpuStatus to the list
-        gpu_status_list.push(GpuStatus {
-            preallocated: is_preallocated, // Set the preallocated status based on combined criteria
-            info, // Store the GpuInfo
-        });
-    }
-
-    // Return the GpuStatusList wrapped in Arc and TokioMutex
-    Ok(Arc::new(TokioMutex::new(gpu_status_list)))
+/// Get PCI bus IDs in GPU index order (for mapping process queries to GPU indices)
+fn get_gpu_bus_ids() -> Vec<String> {
+    Command::new("nvidia-smi")
+        .args(&["--query-gpu=pci.bus_id", "--format=csv,noheader"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
+        .unwrap_or_default()
 }
 
-async fn get_gpu_with_lowest_utilization(
-    gpu_status_handle: &GpuStatusList, 
-    process_map: &ProcessMap, 
-    config: &Config
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    // Lock the GPU status list for reading
-    let status_list = gpu_status_handle.lock().await;
-    // Lock the process map for reading to check current process assignments
-    let processes = process_map.read().await;
-    
-    // Lists to hold candidate GPUs based on criteria
-    // Group 1: GPUs that are not preallocated and not running our managed processes
-    let mut completely_free_gpus: Vec<(usize, u64)> = Vec::new(); // Stores (index, memory_used)
-    // Group 2: Preallocated GPUs that are not running our managed processes and meet utilization/memory criteria
-    let mut conditionally_free_preallocated_gpus: Vec<(usize, u64)> = Vec::new(); // Stores (index, memory_used)
+// ============================================================
+// GPU Metrics Logger (1-second snapshots)
+// ============================================================
 
-    // Iterate over the available GPUs with their status
-    for (index, status) in status_list.iter().enumerate() {
-        // Check if this GPU is currently running any process managed by this application
-        let is_running_managed_process = processes.values().any(|p_info| p_info.gpu_id == index);
+/// Background task that polls nvidia-smi every 1 second and appends
+/// utilization, memory, power, and temperature metrics to a CSV log.
+/// The log auto-rotates when it exceeds ~50 MB.
+async fn gpu_metrics_logger(log_path: std::path::PathBuf) {
+    use std::io::Write;
+    use chrono::Utc;
 
-        // If the GPU is already running one of our managed processes, it's not available for a new task.
-        if is_running_managed_process {
-            continue; // Skip to the next GPU
-        }
+    let max_size: u64 = 50 * 1024 * 1024; // 50 MB rotation threshold
 
-        // If the GPU is NOT running a managed process, evaluate its availability based on preallocation status
-        if !status.preallocated {
-            // This GPU is not preallocated and not busy with our tasks: considered "completely free"
-            completely_free_gpus.push((index, status.info.memory_used));
-        } else {
-            // This GPU is preallocated. Check if it meets the criteria to be used.
-            // Calculate current memory usage percentage for this preallocated GPU
-            let memory_usage_percent = if status.info.memory_total > 0 {
-                // Calculate percentage if memory_total is not zero
-                (status.info.memory_used as f32 / status.info.memory_total as f32) * 100.0
-            } else {
-                // Assume 100% usage if memory_total is zero to prevent division by zero; effectively makes it unavailable if percent check is strict
-                100.0 
-            };
+    loop {
+        if let Ok(gpu_info) = get_gpu_info() {
+            let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-            // Check if it meets the configured thresholds for utilization and memory to be considered "conditionally free"
-            if status.info.utilization < config.gpu_selection.reserved_gpu_max_utilization && 
-               memory_usage_percent < config.gpu_selection.reserved_gpu_max_memory_usage_percent {
-                // If criteria are met, add it to the list of conditionally free preallocated GPUs
-                conditionally_free_preallocated_gpus.push((index, status.info.memory_used));
+            // Check if file needs header or rotation
+            let needs_header = !log_path.exists() || std::fs::metadata(&log_path)
+                .map(|m| m.len() == 0).unwrap_or(true);
+
+            // Rotate if too large
+            if log_path.exists() {
+                if let Ok(meta) = std::fs::metadata(&log_path) {
+                    if meta.len() > max_size {
+                        let rotated = log_path.with_extension("log.old");
+                        let _ = std::fs::rename(&log_path, &rotated);
+                    }
+                }
+            }
+
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                // Write header if new file
+                if needs_header || std::fs::metadata(&log_path).map(|m| m.len() == 0).unwrap_or(true) {
+                    let _ = writeln!(file, "timestamp,gpu_id,utilization,memory_used,memory_total,power_usage,power_limit,temperature");
+                }
+
+                for (i, info) in gpu_info.iter().enumerate() {
+                    let _ = writeln!(
+                        file,
+                        "{},{},{:.1},{},{},{:.1},{:.1},{:.0}",
+                        timestamp, i,
+                        info.utilization,
+                        info.memory_used, info.memory_total,
+                        info.power_usage, info.power_limit,
+                        info.temperature
+                    );
+                }
             }
         }
-    }
 
-    // Prioritize completely free GPUs (Group 1)
-    if !completely_free_gpus.is_empty() {
-        // If there are completely free GPUs, select the one with the minimum memory usage
-        return completely_free_gpus.into_iter()
-            .min_by_key(|&(_, mem_used)| mem_used) // Find by minimum memory_used
-            .map(|(index, _)| index) // Return the index of that GPU
-            .ok_or_else(|| "Logic error: Could not select from non-empty completely_free_gpus list".into()); // Should not happen
+        sleep(Duration::from_secs(1)).await;
     }
-
-    // If no completely free GPUs, try conditionally free preallocated GPUs (Group 2)
-    if !conditionally_free_preallocated_gpus.is_empty() {
-        // If there are conditionally free preallocated GPUs, select the one with the minimum memory usage
-        return conditionally_free_preallocated_gpus.into_iter()
-            .min_by_key(|&(_, mem_used)| mem_used) // Find by minimum memory_used
-            .map(|(index, _)| index) // Return the index of that GPU
-            .ok_or_else(|| "Logic error: Could not select from non-empty conditionally_free_preallocated_gpus list".into()); // Should not happen
-    }
-
-    // If neither group has suitable GPUs, return an error
-    Err("No suitable GPU available. All GPUs are either busy, or preallocated GPUs do not meet idle criteria.".into())
 }
-

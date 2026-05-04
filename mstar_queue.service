@@ -1,17 +1,45 @@
 [Unit]
-Description=M-Star Queue Daemon
+Description=M-Star Queue - CFD Job Management System
 After=network.target
+Documentation=https://github.com/latticept/mstar-queue
 
 [Service]
+Type=simple
 User=mstar_user
 Group=mstar_user
-WorkingDirectory=/opt/mstar_queue 
-ExecStart=/usr/local/bin/mstar_queue
-Restart=always
-RestartSec=3
+WorkingDirectory=/opt/mstar_queue
+
+# Binary with quiet flag for production
+ExecStart=/usr/local/bin/mstar_queue --quiet
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Logging
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=mstar_queue
+
+# Environment
 Environment="RUST_BACKTRACE=1"
+Environment="RUST_LOG=info"
+
+# GPU access — nvidia-smi and CUDA devices
+SupplementaryGroups=video render
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mstar_queue /shares/office-fileserver1/Queue /simulations/Queue
+ReadOnlyPaths=/opt/mstar /usr/bin/mpirun
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
 
 [Install]
-WantedBy=multi-user.target 
+WantedBy=multi-user.target
