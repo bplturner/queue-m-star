@@ -108,7 +108,17 @@ sudo mkdir -p "${WORKING_DIR_DAEMON}/${JOBS_SUBDIR}"
 sudo mkdir -p "${WORKING_DIR_DAEMON}/${ARCHIVE_SUBDIR}"
 sudo mkdir -p "${WORKING_DIR_DAEMON}/${STATIC_SUBDIR}"
 
-# --- 4. Copy Files ---
+# --- 4. Stop service before replacing binary (prevents "Text file busy") ---
+log "Stopping the service before file replacement..."
+if sudo systemctl is-active --quiet "${SERVICE_FILE_NAME}"; then
+    sudo systemctl stop "${SERVICE_FILE_NAME}"
+    log "Service was running and has been stopped."
+    sleep 1
+else
+    log "Service was not running."
+fi
+
+# --- 5. Copy Files ---
 log "Copying application binary..."
 sudo cp "${BUILT_BINARY_PATH}" "${INSTALL_BIN_DIR}/${BINARY_NAME}"
 sudo chmod +x "${INSTALL_BIN_DIR}/${BINARY_NAME}"
@@ -162,20 +172,12 @@ log "Setting ownership for daemon directories..."
 sudo chown -R "${SYSTEM_USER}:${SYSTEM_GROUP}" "${WORKING_DIR_DAEMON}"
 sudo chmod 640 "${WORKING_DIR_DAEMON}/${CONFIG_FILE_NAME}"
 
-# --- 6. Systemd Setup ---
+# --- 7. Systemd Setup ---
 log "Reloading systemd daemon..."
 sudo systemctl daemon-reload
 
 log "Enabling ${PROJECT_NAME} service to start on boot..."
 sudo systemctl enable "${SERVICE_FILE_NAME}"
-
-log "Stopping the service if it's already running..."
-if sudo systemctl is-active --quiet "${SERVICE_FILE_NAME}"; then
-    sudo systemctl stop "${SERVICE_FILE_NAME}"
-    log "Service was running and has been stopped."
-else
-    log "Service was not running."
-fi
 
 log "Starting ${PROJECT_NAME} service..."
 sudo systemctl start "${SERVICE_FILE_NAME}"
