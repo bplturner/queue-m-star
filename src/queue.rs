@@ -33,8 +33,19 @@ pub async fn run_queue_manager(
                             let alive = unsafe {
                                 libc::kill(pid as i32, 0) == 0
                             };
-                            if alive {
+                            if alive && is_mstar_process(pid as u32) {
                                 println!("[QUEUE] Job {} (PID {}) is STILL RUNNING — re-attaching", job.id, pid);
+
+                                // Re-create GPU reservations so the scheduler knows these GPUs are busy
+                                let gpu_ids: Vec<i32> = serde_json::from_str(&job.gpu_ids).unwrap_or_default();
+                                for gpu_id in &gpu_ids {
+                                    let _ = conn.execute(
+                                        "INSERT OR REPLACE INTO gpu_reservations (gpu_id, job_id) VALUES (?1, ?2)",
+                                        rusqlite::params![gpu_id, job.id],
+                                    );
+                                }
+                                println!("[QUEUE] Job {} — restored GPU reservations: {:?}", job.id, gpu_ids);
+
                                 // Spawn a waiter task that monitors the process
                                 let db_clone = db.clone();
                                 let job_id = job.id;
@@ -43,6 +54,10 @@ pub async fn run_queue_manager(
                                 tokio::spawn(async move {
                                     reattach_to_running_process(db_clone, job_id, pid as u32, job_copy_to, job_working_dir).await;
                                 });
+                            } else if alive {
+                                // PID is alive but NOT an mstar process — PID was reused by another program
+                                println!("[QUEUE] Job {} (PID {}) — PID is alive but NOT an M-Star process (PID reuse detected) — marking as failed", job.id, pid);
+                                let _ = db::fail_stale_job(&conn, job.id, "PID reused by another process after daemon restart");
                             } else {
                                 println!("[QUEUE] Job {} (PID {}) is DEAD — marking as failed", job.id, pid);
                                 let _ = db::fail_stale_job(&conn, job.id, "Process died during daemon restart");
@@ -378,7 +393,7 @@ pub async fn create_job_from_file_watcher(
 }
 
 /// Re-attach to a running process after daemon restart.
-/// Polls the PID at regular intervals and updates DB when it exits.
+/// Uses waitpid to get the actual exit status when the process exits.
 async fn reattach_to_running_process(
     db: DbHandle,
     job_id: i64,
@@ -388,31 +403,166 @@ async fn reattach_to_running_process(
 ) {
     println!("[QUEUE] Monitoring re-attached job {} (PID {})", job_id, pid);
 
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Try to use waitpid in a blocking thread to get the real exit status.
+    // waitpid only works for child processes of this daemon, so for re-attached
+    // orphans we fall back to kill-polling + output file inspection.
+    let exit_success = tokio::task::spawn_blocking(move || {
+        loop {
+            // Poll every 2 seconds
+            std::thread::sleep(std::time::Duration::from_secs(2));
 
-        // Check if process is still alive
-        let alive = unsafe {
-            libc::kill(pid as i32, 0) == 0
-        };
-
-        if !alive {
-            // Process has exited
-            let conn = db.lock().await;
-            // We mark it as completed since it finished on its own
-            // The user can check the output file for actual errors
-            println!("[QUEUE] Re-attached job {} (PID {}) has exited — marking as completed", job_id, pid);
-            let _ = db::complete_job(&conn, job_id);
-            drop(conn);
-
-            // Auto-copy results if copy_to_path is set
-            if let Some(ref copy_to) = copy_to_path {
-                copy_results_to_destination(job_id, &working_directory, copy_to).await;
+            let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+            if !alive {
+                // Process is gone. Try waitpid to reap and get status.
+                let mut status: i32 = 0;
+                let result = unsafe {
+                    libc::waitpid(pid as i32, &mut status, libc::WNOHANG)
+                };
+                if result > 0 {
+                    // We got the exit status
+                    if libc::WIFEXITED(status) {
+                        let code = libc::WEXITSTATUS(status);
+                        return Some(code == 0);
+                    } else {
+                        // Killed by signal
+                        return Some(false);
+                    }
+                }
+                // waitpid returned 0 or -1: not our child, can't get status
+                return None;
             }
+        }
+    }).await.unwrap_or(None);
 
-            break;
+    // Determine success from exit status or output file inspection
+    let success = match exit_success {
+        Some(ok) => {
+            println!("[QUEUE] Re-attached job {} (PID {}) — waitpid reports {}",
+                job_id, pid, if ok { "success" } else { "failure" });
+            ok
+        }
+        None => {
+            // Couldn't get exit status (orphaned process). Check output file for errors.
+            let ok = check_job_output_success(job_id, &working_directory).await;
+            println!("[QUEUE] Re-attached job {} (PID {}) — output file inspection reports {}",
+                job_id, pid, if ok { "success (no errors found)" } else { "failure (errors detected)" });
+            ok
+        }
+    };
+
+    let conn = db.lock().await;
+    if success {
+        println!("[QUEUE] Re-attached job {} completed successfully", job_id);
+        let _ = db::complete_job(&conn, job_id);
+    } else {
+        println!("[QUEUE] Re-attached job {} failed", job_id);
+        let _ = db::fail_job(&conn, job_id, "Process exited with errors (detected after daemon restart)");
+    }
+    drop(conn);
+
+    // Auto-copy results only on success
+    if success {
+        if let Some(ref copy_to) = copy_to_path {
+            copy_results_to_destination(job_id, &working_directory, copy_to).await;
         }
     }
+}
+
+/// Check if a PID belongs to an M-Star CFD process by inspecting /proc/{pid}/cmdline.
+/// Prevents re-attaching to a random process after PID reuse.
+fn is_mstar_process(pid: u32) -> bool {
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    match std::fs::read(&cmdline_path) {
+        Ok(data) => {
+            // cmdline is null-separated, convert to a single string
+            let cmdline = String::from_utf8_lossy(&data).to_lowercase();
+            let is_mstar = cmdline.contains("mstar-cfd") || cmdline.contains("mstar_cfd");
+            if !is_mstar {
+                println!("[QUEUE] PID {} cmdline: {:?} — NOT an M-Star process", pid,
+                    String::from_utf8_lossy(&data).replace('\0', " "));
+            }
+            is_mstar
+        }
+        Err(_) => false, // Can't read — process may have died between checks
+    }
+}
+
+/// Inspect the job's output file to determine if the simulation completed successfully.
+/// M-Star CFD writes specific patterns on success vs failure.
+async fn check_job_output_success(job_id: i64, working_directory: &Option<String>) -> bool {
+    let work_dir = match working_directory {
+        Some(ref d) => d.clone(),
+        None => return false,
+    };
+
+    // Check the output log file (output_job_N.txt)
+    let output_file = format!("{}/output_job_{}.txt", work_dir, job_id);
+    let content = match tokio::fs::read_to_string(&output_file).await {
+        Ok(c) => c,
+        Err(_) => {
+            // No output file — also check stdout capture
+            let alt = format!("{}/out/mstar_output.log", work_dir);
+            match tokio::fs::read_to_string(&alt).await {
+                Ok(c) => c,
+                Err(_) => {
+                    println!("[QUEUE] Job {} — no output file found, assuming failure", job_id);
+                    return false;
+                }
+            }
+        }
+    };
+
+    // Check the last ~2000 chars for error indicators
+    let tail: &str = if content.len() > 2000 {
+        &content[content.len() - 2000..]
+    } else {
+        &content
+    };
+    let tail_lower = tail.to_lowercase();
+
+    // M-Star error patterns
+    let error_patterns = [
+        "error",
+        "fatal",
+        "abort",
+        "segfault",
+        "segmentation fault",
+        "killed",
+        "out of memory",
+        "cuda error",
+    ];
+
+    // M-Star success patterns (simulation completed normally)
+    let success_patterns = [
+        "simulation complete",
+        "simulation finished",
+        "done.",
+        "total time",
+    ];
+
+    // If we find a success pattern near the end, it's good
+    for pat in &success_patterns {
+        if tail_lower.contains(pat) {
+            return true;
+        }
+    }
+
+    // If we find error patterns, it's bad
+    for pat in &error_patterns {
+        if tail_lower.contains(pat) {
+            return false;
+        }
+    }
+
+    // If the output exists and has substantial content but no clear indicator,
+    // check if the Stats/Timing.txt file exists (indicates simulation ran to end)
+    let timing_file = format!("{}/out/Stats/Timing.txt", work_dir);
+    if tokio::fs::metadata(&timing_file).await.is_ok() {
+        return true;
+    }
+
+    // Default: assume success if output exists and has content
+    content.len() > 100
 }
 
 /// Copy completed job results to the specified destination path

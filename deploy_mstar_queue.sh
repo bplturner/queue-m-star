@@ -119,23 +119,30 @@ cat > /tmp/${CONFIG_FILE_NAME} << EOF
 [paths]
 log_file = "${WORKING_DIR_DAEMON}/${PROJECT_NAME}.log"
 queue_directory = "/shares/office-fileserver1/Queue/"
+mstar_executable = "/opt/mstar/mstar-cfd-mgpu-latest"
+mstar_install_dir = "/opt/mstar/"
+database_file = "${WORKING_DIR_DAEMON}/${PROJECT_NAME}.db"
 jobs_directory = "/simulations/Queue/jobs/"
 archive_directory = "${WORKING_DIR_DAEMON}/${ARCHIVE_SUBDIR}/"
-database_file = "${WORKING_DIR_DAEMON}/${PROJECT_NAME}.db"
-mstar_install_dir = "/opt/mstar/"
+gpu_metrics_log = "${WORKING_DIR_DAEMON}/gpu_metrics.log"
 
 [web_server]
 port = 1111
+max_payload_size_mb = 500
 
 [file_handling]
-poll_interval_ms = 2000
-compare_contents = true
-watch_extensions = [".msb", ".MSB"]
+max_file_size_mb = 500
+allowed_file_types = ["msb"]
+
+[gpu_selection]
+reserved_gpu_max_utilization = 5.0
+reserved_gpu_max_memory_usage_percent = 10.0
 
 [queue]
 max_concurrent_jobs = 8
 poll_interval_secs = 5
 default_mstar_version = "latest"
+job_output_retention_days = 90
 EOF
 sudo cp /tmp/${CONFIG_FILE_NAME} "${WORKING_DIR_DAEMON}/${CONFIG_FILE_NAME}"
 rm /tmp/${CONFIG_FILE_NAME}

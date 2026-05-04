@@ -2,6 +2,8 @@
 Description=M-Star Queue - CFD Job Management System
 After=network.target
 Documentation=https://github.com/latticept/mstar-queue
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -15,8 +17,10 @@ ExecStart=/usr/local/bin/mstar_queue --quiet
 # Restart policy
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
+
+# Only kill the queue manager, NOT child simulation processes
+# The queue manager re-attaches to orphaned simulations on startup
+KillMode=process
 
 # Logging
 StandardOutput=journal
@@ -34,7 +38,7 @@ SupplementaryGroups=video render
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/mstar_queue /shares/office-fileserver1/Queue /simulations/Queue
+ReadWritePaths=/opt/mstar_queue /simulations/Queue
 ReadOnlyPaths=/opt/mstar /usr/bin/mpirun
 
 # Resource limits
