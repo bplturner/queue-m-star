@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Parse command line arguments
     let args = Args::parse();
-    let verbose = !args.quiet;
+    let _verbose = !args.quiet;
 
     // Initialize database
     println!("[INIT] Initializing database at: {}", config.paths.database_file.display());
@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let db_clone = db.clone();
         let config_clone = config.clone();
-        let log_file_clone = log_file.clone();
+        let _log_file_clone = log_file.clone();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 

@@ -541,8 +541,8 @@ async fn handle_get_job(
 /// Step 1 of job submission: create the job record with metadata.
 /// The MSB file is uploaded separately via POST /api/jobs/:id/upload
 async fn handle_submit_job_metadata(
-    auth: Option<String>,
-    state: AppState,
+    _auth: Option<String>,
+    _state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     // This will be called with JSON body via a custom extraction
     // For now, read from query params as a simpler approach
