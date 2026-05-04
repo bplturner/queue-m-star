@@ -56,8 +56,7 @@ fn main() {
             // If copying fails, print a warning message to Cargo
             eprintln!("cargo:warning=Failed to copy static directory from {} to {}: {}", static_src_path.display(), static_dest_path.display(), e);
         } else {
-            // If copying is successful, print an informational message to Cargo (can be seen with -vv)
-            println!("cargo:warning=Successfully copied static directory from {} to {}.", static_src_path.display(), static_dest_path.display());
+            // Success — no need to print anything
         }
     } else {
         // If the source "static" directory does not exist or is not a directory, print a warning
