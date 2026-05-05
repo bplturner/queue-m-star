@@ -38,8 +38,8 @@ SupplementaryGroups=video render
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/mstar_queue /simulations/Queue
-ReadOnlyPaths=/opt/mstar /usr/bin/mpirun
+ReadWritePaths=/opt/mstar_queue /simulations/Queue /opt/mstar /usr/local/bin
+ReadOnlyPaths=/usr/bin/mpirun
 
 # Resource limits
 LimitNOFILE=65536

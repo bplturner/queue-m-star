@@ -386,6 +386,15 @@ pub fn api_routes(
         .and(with_state(state.clone()))
         .and_then(handle_mkdir);
 
+    // Admin: install latest M-Star version
+    let admin_install_version = api.and(warp::path("admin"))
+        .and(warp::path("install-version"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_install_version);
+
     auth_login
         .or(auth_register)
         .or(auth_logout)
@@ -413,6 +422,7 @@ pub fn api_routes(
         .or(users_gpus)
         .or(users_delete)
         .or(browse_mkdir)
+        .or(admin_install_version)
         .or(browse)
 }
 
@@ -1247,6 +1257,110 @@ async fn handle_refresh_versions(
     Ok(json_ok(&serde_json::json!({
         "message": format!("Refreshed: {} versions found", count),
         "count": count,
+    })))
+}
+
+// ============================================================
+// Admin: M-Star Version Installer
+// ============================================================
+
+async fn handle_install_version(
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // Require admin role
+    let user = match require_auth(&auth, &state).await {
+        Ok(u) => u,
+        Err(e) => return Ok(e),
+    };
+    if user.role != "admin" {
+        return Ok(json_error("Admin access required", warp::http::StatusCode::FORBIDDEN));
+    }
+
+    let install_dir = state.config.paths.mstar_install_dir.clone();
+    let install_dir_str = install_dir.to_string_lossy().to_string();
+
+    // Run download-latest.sh
+    let download_script = install_dir.join("download-latest.sh");
+    if !download_script.exists() {
+        return Ok(json_error(
+            &format!("Download script not found at {}", download_script.display()),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+
+    println!("[ADMIN] User '{}' triggered M-Star version install", user.username);
+
+    let download_result = tokio::process::Command::new("bash")
+        .arg(&download_script)
+        .env("MSTAR_INSTALL_DIR", &install_dir_str)
+        .current_dir(&install_dir)
+        .output()
+        .await;
+
+    let download_output = match download_result {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if !output.status.success() {
+                println!("[ADMIN] Download script failed: {}", stderr);
+                return Ok(json_error(
+                    &format!("Download failed: {}{}", stdout, stderr),
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ));
+            }
+            println!("[ADMIN] Download script succeeded");
+            stdout
+        }
+        Err(e) => {
+            return Ok(json_error(
+                &format!("Failed to run download script: {}", e),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ));
+        }
+    };
+
+    // Run update-latest-symlink.sh
+    let symlink_script = install_dir.join("update-latest-symlink.sh");
+    let symlink_output = if symlink_script.exists() {
+        match tokio::process::Command::new("bash")
+            .arg(&symlink_script)
+            .env("MSTAR_INSTALL_DIR", &install_dir_str)
+            .current_dir(&install_dir)
+            .output()
+            .await
+        {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                if !output.status.success() {
+                    println!("[ADMIN] Symlink script warning: {}", stderr);
+                }
+                stdout
+            }
+            Err(e) => format!("Symlink script error: {}", e),
+        }
+    } else {
+        "Symlink script not found, skipped".to_string()
+    };
+
+    // Refresh the versions list
+    let new_versions = mstar_versions::discover_versions(&state.config.paths.mstar_install_dir);
+    let version_count = new_versions.len();
+    let latest_version = new_versions.iter()
+        .find(|v| v.is_latest)
+        .map(|v| v.version.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    *state.versions.lock().await = new_versions;
+
+    println!("[ADMIN] Version install complete. Latest: {}. Total versions: {}", latest_version, version_count);
+
+    Ok(json_ok(&serde_json::json!({
+        "success": true,
+        "latest_version": latest_version,
+        "total_versions": version_count,
+        "download_output": download_output,
+        "symlink_output": symlink_output,
     })))
 }
 
