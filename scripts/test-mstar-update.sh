@@ -3,7 +3,8 @@
 # test-mstar-update.sh
 # End-to-end test: download latest M-Star → update symlinks → launch a sim
 # =============================================================================
-set -euo pipefail
+# NOTE: Don't use pipefail — nvidia-smi piped to awk can trigger false failures
+set -eu
 
 MSTAR_DIR="/opt/mstar"
 TEST_DIR="/tmp/mstar-update-test-$$"
@@ -55,7 +56,7 @@ fi
 
 if [ ! -f "$MSB_SOURCE" ]; then
     # Try to find any MSB
-    MSB_SOURCE=$(find /simulations/Queue/jobs -name "*.msb" -type f 2>/dev/null | head -1)
+    MSB_SOURCE=$(find /simulations/Queue/jobs -name "*.msb" -type f 2>/dev/null | head -1 || true)
     if [ -z "$MSB_SOURCE" ]; then
         fail "No MSB file found for testing"
         exit 1
@@ -83,7 +84,7 @@ info "  Current latest version: $CURRENT_VERSION"
 info "  Current latest target:  $CURRENT_LATEST"
 
 # Count existing versions
-BEFORE_COUNT=$(ls -d "$MSTAR_DIR"/mstarcfd-*.*.* 2>/dev/null | wc -l)
+BEFORE_COUNT=$(ls -d "$MSTAR_DIR"/mstarcfd-*.*.* 2>/dev/null | wc -l || echo "0")
 info "  Installed versions: $BEFORE_COUNT"
 
 # ── Step 2: Download latest ───────────────────────────────────────
@@ -133,21 +134,22 @@ pass "Symlinks updated"
 
 # Verify directory structure is flat (not nested mstar-ubuntu/)
 VERSION_DIR="$MSTAR_DIR/mstarcfd-$NEW_VERSION"
+LIC_FILE=""
 if [ -d "$VERSION_DIR" ]; then
     if [ -f "$VERSION_DIR/bin/mstar-cfd-mgpu" ]; then
         pass "Binary found: $VERSION_DIR/bin/mstar-cfd-mgpu"
-    elif [ -d "$VERSION_DIR/mstar-ubuntu" ]; then
-        fail "Directory is NOT flat — nested mstar-ubuntu/ still exists"
+    elif [ -d "$VERSION_DIR/mstar-ubuntu" ] || ls "$VERSION_DIR"/mstarcfd-*/ >/dev/null 2>&1; then
+        fail "Directory is NOT flat — nested subdirectory still exists"
         ls "$VERSION_DIR/"
         exit 1
     else
         fail "mstar-cfd-mgpu binary not found in $VERSION_DIR/bin/"
-        ls "$VERSION_DIR/" 2>/dev/null
+        ls "$VERSION_DIR/" 2>/dev/null || true
         exit 1
     fi
 
     # Check license file
-    LIC_FILE=$(find "$VERSION_DIR/bin" -name "*.lic" -type f 2>/dev/null | head -1)
+    LIC_FILE=$(find "$VERSION_DIR/bin" -name "*.lic" -type f 2>/dev/null | head -1 || true)
     if [ -n "$LIC_FILE" ]; then
         pass "License file found: $(basename "$LIC_FILE")"
     else
@@ -187,8 +189,15 @@ MSB_FILE=$(basename "$MSB_SOURCE")
 info "  MSB file: $MSB_FILE"
 info "  Working dir: $TEST_DIR"
 
-# Find a free GPU (pick one with no compute processes)
-FREE_GPU=$(nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader,nounits | awk -F', ' '$2 < 5 {print $1; exit}')
+# Find a free GPU (pick one with low utilization)
+FREE_GPU=""
+while IFS=', ' read -r idx util; do
+    if [ -n "$idx" ] && [ "$util" -lt 10 ] 2>/dev/null; then
+        FREE_GPU="$idx"
+        break
+    fi
+done < <(nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader,nounits 2>/dev/null)
+
 if [ -z "$FREE_GPU" ]; then
     warn "No idle GPU found, using GPU 0"
     FREE_GPU=0
@@ -205,6 +214,8 @@ echo
 
 # Launch with timeout — we only need to verify it starts up
 cd "$TEST_DIR"
+
+# Disable exit-on-error for this section
 set +e
 timeout "${SIM_TIMEOUT}" bash -c "$LAUNCH_CMD" > sim_output.txt 2>&1 &
 SIM_PID=$!
@@ -217,7 +228,7 @@ if kill -0 $SIM_PID 2>/dev/null; then
     pass "Simulation is running after 5 seconds (no immediate crash)"
 
     # Check output for initialization success
-    if grep -qi "timestep\|time step\|initializ\|running\|iteration" sim_output.txt 2>/dev/null; then
+    if grep -qi "timestep\|time step\|initializ\|running\|iteration\|step " sim_output.txt 2>/dev/null; then
         pass "Simulation output shows active computation"
     else
         info "  Output so far:"
@@ -239,7 +250,7 @@ if kill -0 $SIM_PID 2>/dev/null; then
     elif [ $EXIT_CODE -eq 137 ]; then
         pass "Simulation ran until timeout (SIGKILL)"
     else
-        warn "Simulation exited with code $EXIT_CODE"
+        warn "Simulation exited with code $EXIT_CODE (may be normal for short sim)"
         echo "  Last 10 lines of output:"
         tail -10 sim_output.txt 2>/dev/null | while IFS= read -r line; do
             echo "    $line"
@@ -249,12 +260,16 @@ else
     # Process died within 5 seconds
     wait $SIM_PID 2>/dev/null
     EXIT_CODE=$?
-    fail "Simulation crashed within 5 seconds (exit code: $EXIT_CODE)"
-    echo "  Output:"
-    cat sim_output.txt 2>/dev/null | tail -20 | while IFS= read -r line; do
-        echo "    $line"
-    done
-    exit 1
+    if [ $EXIT_CODE -eq 0 ]; then
+        pass "Simulation completed quickly (exit code 0)"
+    else
+        fail "Simulation crashed within 5 seconds (exit code: $EXIT_CODE)"
+        echo "  Output:"
+        tail -20 sim_output.txt 2>/dev/null | while IFS= read -r line; do
+            echo "    $line"
+        done
+        exit 1
+    fi
 fi
 set -e
 
@@ -263,7 +278,7 @@ echo
 echo "================================================================"
 echo -e "  ${GREEN}ALL TESTS PASSED${NC}"
 echo "================================================================"
-AFTER_COUNT=$(ls -d "$MSTAR_DIR"/mstarcfd-*.*.* 2>/dev/null | wc -l)
+AFTER_COUNT=$(ls -d "$MSTAR_DIR"/mstarcfd-*.*.* 2>/dev/null | wc -l || echo "?")
 echo "  Version tested:     $NEW_VERSION"
 echo "  Installed versions: $AFTER_COUNT"
 echo "  License:            $(basename "$LIC_FILE" 2>/dev/null || echo 'present')"

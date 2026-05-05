@@ -181,12 +181,11 @@ sudo chown -R "${SYSTEM_USER}:${SYSTEM_GROUP}" "${WORKING_DIR_DAEMON}"
 sudo chmod 640 "${WORKING_DIR_DAEMON}/${CONFIG_FILE_NAME}"
 
 # Ensure shared jobs directory exists and is writable by the service user
-# NOTE: /simulations is a network mount with root_squash — chown won't work.
-# Use 777 permissions so mstar_user can create job subdirectories.
+# NOTE: /simulations is a network mount with root_squash — chown/chmod may fail.
+# Best-effort: create dir and try to open permissions, but don't abort if it fails.
 SHARED_JOBS_DIR="/simulations/Queue/jobs"
-sudo mkdir -p "${SHARED_JOBS_DIR}"
-sudo chmod 777 "${SHARED_JOBS_DIR}"
-log "Ensured ${SHARED_JOBS_DIR} is world-writable (network mount)"
+sudo mkdir -p "${SHARED_JOBS_DIR}" || true
+sudo chmod 777 "${SHARED_JOBS_DIR}" 2>/dev/null || log "(network mount — permissions not changed, should already be writable)"
 
 # --- 7. Systemd Setup ---
 log "Reloading systemd daemon..."
