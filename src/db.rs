@@ -65,6 +65,7 @@ pub struct Job {
     pub name: String,
     pub msb_filename: String,
     pub mstar_version: String,
+    pub resolved_version: Option<String>,  // Actual version used (e.g. "4.4.23"), set at launch
     pub gpu_ids: String,  // JSON array, e.g. "[0,1]"
     pub unified_memory: bool,  // Use CPU RAM (--unified-memory flag)
     pub status: String,
@@ -179,6 +180,11 @@ pub fn init_db(db_path: &Path) -> SqliteResult<DbHandle> {
     // Migration: add copy_to_path column for auto-copy on completion
     let _ = conn.execute_batch(
         "ALTER TABLE jobs ADD COLUMN copy_to_path TEXT;"
+    );
+
+    // Migration: add resolved_version — tracks the actual M-Star version used (not "latest")
+    let _ = conn.execute_batch(
+        "ALTER TABLE jobs ADD COLUMN resolved_version TEXT;"
     );
 
     // Migration: user_gpu_access table for per-GPU permissions
@@ -476,7 +482,7 @@ pub fn list_jobs(conn: &Connection, status_filter: Option<&str>, limit: Option<i
                     j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                     j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                     j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                    j.copy_to_path
+                    j.copy_to_path, j.resolved_version
              FROM jobs j LEFT JOIN users u ON j.user_id = u.id
              WHERE j.status = ?1
              ORDER BY j.priority DESC, j.submitted_at ASC
@@ -489,7 +495,7 @@ pub fn list_jobs(conn: &Connection, status_filter: Option<&str>, limit: Option<i
                     j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                     j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                     j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                    j.copy_to_path
+                    j.copy_to_path, j.resolved_version
              FROM jobs j LEFT JOIN users u ON j.user_id = u.id
              ORDER BY j.submitted_at DESC
              LIMIT ?1".to_string(),
@@ -524,6 +530,7 @@ pub fn list_jobs(conn: &Connection, status_filter: Option<&str>, limit: Option<i
             restart_from_job_id: row.get(17)?,
             restart_options: row.get(18)?,
             copy_to_path: row.get(19)?,
+            resolved_version: row.get(20)?,
         })
     }).map_err(|e| format!("Failed to query jobs: {}", e))?
     .filter_map(|r| r.ok())
@@ -539,7 +546,7 @@ pub fn get_job(conn: &Connection, job_id: i64) -> Result<Job, String> {
                 j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                 j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                 j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                j.copy_to_path
+                j.copy_to_path, j.resolved_version
          FROM jobs j LEFT JOIN users u ON j.user_id = u.id
          WHERE j.id = ?1",
         params![job_id],
@@ -565,6 +572,7 @@ pub fn get_job(conn: &Connection, job_id: i64) -> Result<Job, String> {
                 restart_from_job_id: row.get(17)?,
                 restart_options: row.get(18)?,
                 copy_to_path: row.get(19)?,
+                resolved_version: row.get(20)?,
             })
         },
     ).map_err(|_| format!("Job {} not found", job_id))
@@ -667,7 +675,7 @@ pub fn get_next_queued_job(conn: &Connection) -> Result<Option<Job>, String> {
                 j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                 j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                 j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                j.copy_to_path
+                j.copy_to_path, j.resolved_version
          FROM jobs j LEFT JOIN users u ON j.user_id = u.id
          WHERE j.status = 'queued'
          ORDER BY j.priority DESC, j.submitted_at ASC
@@ -695,6 +703,7 @@ pub fn get_next_queued_job(conn: &Connection) -> Result<Option<Job>, String> {
                 restart_from_job_id: row.get(17)?,
                 restart_options: row.get(18)?,
                 copy_to_path: row.get(19)?,
+                resolved_version: row.get(20)?,
             })
         },
     );
@@ -744,7 +753,7 @@ pub fn get_running_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
                 j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                 j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                 j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                j.copy_to_path
+                j.copy_to_path, j.resolved_version
          FROM jobs j LEFT JOIN users u ON j.user_id = u.id
          WHERE j.status = 'running'"
     ).map_err(|e| format!("Failed to prepare query: {}", e))?;
@@ -771,6 +780,7 @@ pub fn get_running_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
             restart_from_job_id: row.get(17)?,
             restart_options: row.get(18)?,
             copy_to_path: row.get(19)?,
+            resolved_version: row.get(20)?,
         })
     }).map_err(|e| format!("Failed to query running jobs: {}", e))?;
 
@@ -850,7 +860,7 @@ pub fn create_restart_job(
             orig.user_id,
             format!("{} (restart)", orig.name),
             orig.msb_filename,
-            orig.mstar_version,
+            orig.resolved_version.as_deref().unwrap_or(&orig.mstar_version),
             orig.gpu_ids,
             orig.unified_memory as i32,
             orig.priority,
@@ -860,4 +870,14 @@ pub fn create_restart_job(
     ).map_err(|e| format!("Failed to create restart job: {}", e))?;
 
     Ok(conn.last_insert_rowid())
+}
+
+/// Store the actual M-Star version used when launching a job.
+/// This is critical for checkpoint restarts — ensures the same binary is used.
+pub fn update_resolved_version(conn: &Connection, job_id: i64, version: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE jobs SET resolved_version = ?1 WHERE id = ?2",
+        params![version, job_id],
+    ).map_err(|e| format!("Failed to update resolved version: {}", e))?;
+    Ok(())
 }

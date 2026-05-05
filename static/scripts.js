@@ -87,16 +87,20 @@
         const userName = document.getElementById('user-name');
         const userRole = document.getElementById('user-role');
         const adminNav = document.getElementById('nav-admin');
+        const settingsNav = document.getElementById('nav-settings');
 
         if (state.user) {
             userInfo.style.display = 'flex';
             userAvatar.textContent = state.user.username[0].toUpperCase();
             userName.textContent = state.user.username;
             userRole.textContent = state.user.role;
-            if (adminNav) adminNav.style.display = state.user.role === 'admin' ? 'flex' : 'none';
+            const isAdmin = state.user.role === 'admin';
+            if (adminNav) adminNav.style.display = isAdmin ? 'flex' : 'none';
+            if (settingsNav) settingsNav.style.display = isAdmin ? 'flex' : 'none';
         } else {
             userInfo.style.display = 'none';
             if (adminNav) adminNav.style.display = 'none';
+            if (settingsNav) settingsNav.style.display = 'none';
         }
     }
 
@@ -123,6 +127,7 @@
         jobs: renderJobs,
         gpus: renderGpus,
         admin: renderAdmin,
+        settings: renderSettings,
     };
 
     function navigate(route) {
@@ -429,7 +434,7 @@
                                 <td class="text-mono">#${job.id}</td>
                                 <td>${escapeHtml(job.name)}</td>
                                 <td>${escapeHtml(job.username)}</td>
-                                <td class="text-mono text-sm">${job.mstar_version}</td>
+                                <td class="text-mono text-sm">${job.resolved_version || job.mstar_version}</td>
                                 <td class="text-mono text-sm">${formatGpuIds(job.gpu_ids)}</td>
                                 <td>${statusBadge(job.status)}</td>
                                 <td class="text-sm text-muted">${formatTime(job.submitted_at)}</td>
@@ -1191,22 +1196,6 @@
                         <div class="card-header"><span class="card-title">Users</span></div>
                         <div id="users-table"></div>
                     </div>
-
-                    <div class="card" style="margin-top: 1.5rem;">
-                        <div class="card-header">
-                            <span class="card-title">M-Star CFD Version Manager</span>
-                        </div>
-                        <div style="padding: 1rem 1.5rem;">
-                            <p class="text-muted text-sm" style="margin-bottom: 1rem;">
-                                Download and install the latest M-Star CFD nightly build. This will fetch the latest version,
-                                copy the license file, and update all <code>*-latest</code> symlinks.
-                            </p>
-                            <div id="install-version-status" style="display:none; margin-bottom: 1rem;"></div>
-                            <button class="btn btn-primary" id="install-version-btn" style="width: 100%;">
-                                <span id="install-version-text">⬇ Install Latest M-Star Version</span>
-                            </button>
-                        </div>
-                    </div>
                 </div>
             </div>
         `;
@@ -1235,41 +1224,6 @@
         });
 
         await loadUsersTable(gpuCount);
-
-        // M-Star version installer
-        document.getElementById('install-version-btn').addEventListener('click', async () => {
-            if (!confirm('Download and install the latest M-Star CFD nightly build?\n\nThis will:\n• Download the latest version from mstarcfd.com\n• Copy the license file\n• Update all *-latest symlinks\n• Refresh available versions')) return;
-
-            const btn = document.getElementById('install-version-btn');
-            const textEl = document.getElementById('install-version-text');
-            const statusEl = document.getElementById('install-version-status');
-
-            btn.disabled = true;
-            textEl.textContent = '⏳ Downloading and installing...';
-            statusEl.style.display = 'block';
-            statusEl.innerHTML = '<div class="badge badge-running" style="display:inline-block;">Installing...</div>';
-
-            try {
-                const result = await api.post('/admin/install-version');
-                if (result && result.success) {
-                    const output = (result.download_output || '').trim() + '\n' + (result.symlink_output || '').trim();
-                    statusEl.innerHTML = `
-                        <div class="badge badge-completed" style="display:inline-block; margin-bottom: 0.5rem;">✓ Installed v${result.latest_version}</div>
-                        <pre style="background: var(--bg-tertiary); color: var(--text-secondary); padding: 0.75rem; border-radius: 6px; font-size: 0.75rem; max-height: 200px; overflow-y: auto; white-space: pre-wrap; margin: 0;">${output.replace(/</g, '&lt;')}</pre>
-                    `;
-                    toast(`M-Star v${result.latest_version} installed (${result.total_versions} versions available)`, 'success');
-                } else {
-                    statusEl.innerHTML = `<div class="badge badge-failed" style="display:inline-block;">Failed: ${result?.error || 'Unknown error'}</div>`;
-                    toast(result?.error || 'Install failed', 'error');
-                }
-            } catch (e) {
-                statusEl.innerHTML = `<div class="badge badge-failed" style="display:inline-block;">Error: ${e.message}</div>`;
-                toast('Install failed: ' + e.message, 'error');
-            }
-
-            btn.disabled = false;
-            textEl.textContent = '⬇ Install Latest M-Star Version';
-        });
     }
 
     async function loadUsersTable(gpuCount) {
@@ -1364,6 +1318,95 @@
             } else {
                 toast(result?.error || 'Failed to update user', 'error');
             }
+        });
+    }
+
+    // ============================================================
+    // Render: Settings
+    // ============================================================
+    async function renderSettings(container) {
+        const versions = await api.get('/versions') || [];
+
+        container.innerHTML = `
+            <div class="page-enter">
+                <div class="page-header">
+                    <h1>Settings</h1>
+                    <p>Manage M-Star CFD solver versions and system configuration</p>
+                </div>
+                <div class="submit-layout">
+                    <div>
+                        <div class="card">
+                            <div class="card-header"><span class="card-title">Solver Updates</span></div>
+                            <div style="padding: 1rem 1.5rem;">
+                                <p class="text-muted text-sm" style="margin-bottom: 1rem;">
+                                    Download and install the latest M-Star CFD nightly build. This will fetch the latest version,
+                                    copy the license file, and update all <code>*-latest</code> symlinks.
+                                </p>
+                                <div id="install-version-status" style="display:none; margin-bottom: 1rem;"></div>
+                                <button class="btn btn-primary" id="install-version-btn" style="width: 100%;">
+                                    <span id="install-version-text">\u2b07 Install Latest M-Star Version</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-header"><span class="card-title">Installed Versions</span></div>
+                        <div class="table-container">
+                            <table class="data-table">
+                                <thead>
+                                    <tr><th>Version</th><th>Status</th><th>Install Path</th></tr>
+                                </thead>
+                                <tbody>
+                                    ${versions.map(v => `
+                                        <tr>
+                                            <td class="text-mono">${v.version}</td>
+                                            <td>${v.is_latest
+                                                ? '<span class="badge badge-completed">latest</span>'
+                                                : '<span class="badge badge-queued">installed</span>'}</td>
+                                            <td class="text-muted text-sm text-mono">mstarcfd-${v.version}/</td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        // Install button handler
+        document.getElementById('install-version-btn').addEventListener('click', async function() {
+            if (!confirm('Download and install the latest M-Star CFD nightly?\n\nThis will download, copy the license, and update all *-latest symlinks.')) return;
+
+            var btn = document.getElementById('install-version-btn');
+            var textEl = document.getElementById('install-version-text');
+            var statusEl = document.getElementById('install-version-status');
+
+            btn.disabled = true;
+            textEl.textContent = '\u23f3 Downloading and installing...';
+            statusEl.style.display = 'block';
+            statusEl.innerHTML = '<div class="badge badge-running" style="display:inline-block;">Installing...</div>';
+
+            try {
+                var result = await api.post('/admin/install-version');
+                if (result && result.success) {
+                    var output = (result.download_output || '').trim() + '\n' + (result.symlink_output || '').trim();
+                    statusEl.innerHTML =
+                        '<div class="badge badge-completed" style="display:inline-block; margin-bottom: 0.5rem;">\u2713 Installed v' + result.latest_version + '</div>' +
+                        '<pre style="background:var(--bg-tertiary);color:var(--text-secondary);padding:0.75rem;border-radius:6px;font-size:0.75rem;max-height:200px;overflow-y:auto;white-space:pre-wrap;margin:0">' + output.replace(/</g, '&lt;') + '</pre>';
+                    toast('M-Star v' + result.latest_version + ' installed (' + result.total_versions + ' versions)', 'success');
+                    setTimeout(function() { handleRoute(); }, 1500);
+                } else {
+                    statusEl.innerHTML = '<div class="badge badge-failed" style="display:inline-block;">Failed: ' + (result && result.error ? result.error : 'Unknown error') + '</div>';
+                    toast((result && result.error) || 'Install failed', 'error');
+                }
+            } catch (e) {
+                statusEl.innerHTML = '<div class="badge badge-failed" style="display:inline-block;">Error: ' + e.message + '</div>';
+                toast('Install failed: ' + e.message, 'error');
+            }
+
+            btn.disabled = false;
+            textEl.textContent = '\u2b07 Install Latest M-Star Version';
         });
     }
 

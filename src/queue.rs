@@ -33,7 +33,8 @@ pub async fn run_queue_manager(
                                 libc::kill(pid as i32, 0) == 0
                             };
                             if alive && is_mstar_process(pid as u32) {
-                                println!("[QUEUE] Job {} (PID {}) is STILL RUNNING — re-attaching", job.id, pid);
+                                let ver_info = job.resolved_version.as_deref().unwrap_or(&job.mstar_version);
+                                println!("[QUEUE] Job {} (PID {}, M-Star v{}) is STILL RUNNING — re-attaching", job.id, pid, ver_info);
 
                                 // Re-create GPU reservations so the scheduler knows these GPUs are busy
                                 let gpu_ids: Vec<i32> = serde_json::from_str(&job.gpu_ids).unwrap_or_default();
@@ -163,13 +164,50 @@ async fn launch_job(
     job: Job,
 ) -> Result<(), String> {
     // Resolve M-Star version
+    // For checkpoint restarts: use the exact version from the original run to avoid
+    // incompatible checkpoint formats. For new jobs: resolve normally.
+    let is_restart = job.restart_from_job_id.is_some();
+    let version_to_resolve = if is_restart {
+        // Use the resolved version from the original job if available
+        let orig_resolved = {
+            let conn = db.lock().await;
+            if let Some(orig_id) = job.restart_from_job_id {
+                db::get_job(&conn, orig_id)
+                    .ok()
+                    .and_then(|j| j.resolved_version)
+            } else {
+                None
+            }
+        };
+        orig_resolved.unwrap_or_else(|| job.mstar_version.clone())
+    } else {
+        job.mstar_version.clone()
+    };
+
     let versions_lock = versions.lock().await;
-    let version = resolve_version(&versions_lock, &job.mstar_version)
-        .ok_or_else(|| format!("M-Star version '{}' not found", job.mstar_version))?
+    let version = resolve_version(&versions_lock, &version_to_resolve)
+        .ok_or_else(|| {
+            if is_restart {
+                format!(
+                    "M-Star version '{}' (from original job) is no longer installed. \
+                     Cannot restart with a different version — checkpoint files may be incompatible.",
+                    version_to_resolve
+                )
+            } else {
+                format!("M-Star version '{}' not found", version_to_resolve)
+            }
+        })?
         .clone();
     drop(versions_lock);
 
-    let is_restart = job.restart_from_job_id.is_some();
+    // Persist the actual version used — critical for future checkpoint restarts
+    {
+        let conn = db.lock().await;
+        if let Err(e) = db::update_resolved_version(&conn, job.id, &version.version) {
+            eprintln!("[QUEUE] Warning: failed to store resolved version for job {}: {}", job.id, e);
+        }
+    }
+    println!("[QUEUE] Job {} using M-Star v{}", job.id, version.version);
 
     // Determine working directory
     let job_dir = if is_restart {
