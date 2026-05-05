@@ -180,10 +180,12 @@ log "Setting ownership for daemon directories..."
 sudo chown -R "${SYSTEM_USER}:${SYSTEM_GROUP}" "${WORKING_DIR_DAEMON}"
 sudo chmod 640 "${WORKING_DIR_DAEMON}/${CONFIG_FILE_NAME}"
 
-# Ensure shared jobs directory exists and is owned by the service user
+# Ensure shared jobs directory exists and is writable by the service user
+# NOTE: Only chown the top-level dir, NOT recursively — job output files
+# may be on a network mount that doesn't support ownership changes
 SHARED_JOBS_DIR="/simulations/Queue/jobs"
 sudo mkdir -p "${SHARED_JOBS_DIR}"
-sudo chown -R "${SYSTEM_USER}:${SYSTEM_GROUP}" "${SHARED_JOBS_DIR}"
+sudo chown "${SYSTEM_USER}:${SYSTEM_GROUP}" "${SHARED_JOBS_DIR}"
 sudo chmod 775 "${SHARED_JOBS_DIR}"
 log "Ensured ${SHARED_JOBS_DIR} is owned by ${SYSTEM_USER}"
 
