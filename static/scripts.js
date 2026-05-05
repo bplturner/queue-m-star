@@ -13,6 +13,7 @@
         token: localStorage.getItem('mstar_token') || null,
         user: JSON.parse(localStorage.getItem('mstar_user') || 'null'),
         refreshTimers: [],
+        refreshPaused: false,
     };
 
     // ============================================================
@@ -314,6 +315,7 @@
     }
 
     async function loadDashboardData() {
+        if (state.refreshPaused) return;
         const [dashboard, jobs] = await Promise.all([
             api.get('/dashboard'),
             api.get('/jobs?limit=10'),
@@ -393,6 +395,7 @@
     }
 
     async function loadJobsFiltered(filter) {
+        if (state.refreshPaused) return;  // Don't refresh while user is in a dialog
         const path = filter ? `/jobs?status=${filter}&limit=50` : '/jobs?limit=50';
         const jobs = await api.get(path);
         const tableEl = document.getElementById('jobs-table');
@@ -2647,17 +2650,24 @@
     // Actions
     // ============================================================
     async function cancelJob(jobId) {
-        if (!confirm(`Cancel job #${jobId}?`)) return;
-        const result = await api.post(`/jobs/${jobId}/cancel`);
+        state.refreshPaused = true;
+        var confirmed = confirm('Cancel job #' + jobId + '? The simulation process will be killed.');
+        state.refreshPaused = false;
+        if (!confirmed) return;
+        var result = await api.post('/jobs/' + jobId + '/cancel');
         if (result && result.message) {
             toast(result.message, 'success');
+            handleRoute(); // Refresh to show updated status
         } else {
             toast(result?.error || 'Failed to cancel', 'error');
         }
     }
 
     async function deleteUser(userId) {
-        if (!confirm(`Delete user #${userId}? This cannot be undone.`)) return;
+        state.refreshPaused = true;
+        var confirmed = confirm('Delete user #' + userId + '? This cannot be undone.');
+        state.refreshPaused = false;
+        if (!confirmed) return;
         const result = await api.del(`/users/${userId}`);
         if (result && result.message) {
             toast(result.message, 'success');
@@ -2718,7 +2728,10 @@
     // Expose global methods for inline onclick handlers
     // ============================================================
     async function restartJob(jobId) {
-        if (!confirm(`Restart failed job #${jobId} using --load-last?`)) return;
+        state.refreshPaused = true;
+        var confirmed = confirm('Restart failed job #' + jobId + ' using --load-last?');
+        state.refreshPaused = false;
+        if (!confirmed) return;
         const result = await api.post(`/jobs/${jobId}/restart`, {});
         if (result && !result.error) {
             toast(`Restart queued: Job #${result.new_job_id}`, 'success');
