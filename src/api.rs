@@ -458,6 +458,11 @@ async fn handle_register(
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let db = state.db.lock().await;
+    // Validate email domain from config before creating user
+    let domain = &state.config.security.allowed_email_domain;
+    if let Err(e) = db::validate_email(&body.email, domain) {
+        return Ok(json_error(&e, warp::http::StatusCode::BAD_REQUEST));
+    }
     match db::create_user(&db, &body.username, &body.email, &body.password, "user") {
         Ok(id) => {
             match db::create_session(&db, id) {
@@ -1779,7 +1784,7 @@ async fn handle_get_stats_file(
     }
 }
 
-/// Browse the server filesystem for MSB files (restricted to /simulations)
+/// Browse the server filesystem for MSB files (restricted to configured data_root)
 async fn handle_browse(
     auth: Option<String>,
     params: HashMap<String, String>,
@@ -1789,11 +1794,11 @@ async fn handle_browse(
         return Ok(e);
     }
 
-    let browse_root = "/simulations";
+    let browse_root = state.config.paths.data_root.to_str().unwrap_or("/");
     let requested_path = params.get("path").cloned().unwrap_or_else(|| browse_root.to_string());
     let mode = params.get("mode").cloned().unwrap_or_else(|| "all".to_string()); // "all", "dirs", "msb"
 
-    // Security: ensure the path is under /simulations and canonicalize
+    // Security: ensure the path is under the configured data_root and canonicalize
     let canonical = match std::fs::canonicalize(&requested_path) {
         Ok(p) => p,
         Err(_) => {
@@ -1803,7 +1808,7 @@ async fn handle_browse(
     };
 
     if !canonical.starts_with(browse_root) {
-        return Ok(json_error("Access denied: path must be under /simulations", warp::http::StatusCode::FORBIDDEN));
+        return Ok(json_error(&format!("Access denied: path must be under {}", browse_root), warp::http::StatusCode::FORBIDDEN));
     }
 
     let canonical_str = canonical.to_str().unwrap_or(browse_root).to_string();
@@ -1886,7 +1891,7 @@ async fn handle_browse(
     })))
 }
 
-/// Create a new directory (restricted to /simulations)
+/// Create a new directory (restricted to configured data_root)
 async fn handle_mkdir(
     auth: Option<String>,
     body: HashMap<String, String>,
@@ -1901,22 +1906,23 @@ async fn handle_mkdir(
         None => return Ok(json_error("Missing 'path' field", warp::http::StatusCode::BAD_REQUEST)),
     };
 
-    // SECURITY: Resolve the path to catch traversal attacks (e.g. /simulations/../../etc)
+    // SECURITY: Resolve the path to catch traversal attacks
     // We canonicalize the parent (which must exist) and append the leaf name
+    let data_root = state.config.paths.data_root.to_str().unwrap_or("/");
     let requested = std::path::Path::new(&path);
     let parent = match requested.parent() {
         Some(p) => p,
         None => return Ok(json_error("Invalid path", warp::http::StatusCode::BAD_REQUEST)),
     };
 
-    // The parent must exist and resolve under /simulations
+    // The parent must exist and resolve under the configured data_root
     let canonical_parent = match std::fs::canonicalize(parent) {
         Ok(p) => p,
         Err(_) => return Ok(json_error("Parent directory does not exist", warp::http::StatusCode::BAD_REQUEST)),
     };
 
-    if !canonical_parent.starts_with("/simulations") {
-        return Ok(json_error("Path must be under /simulations", warp::http::StatusCode::FORBIDDEN));
+    if !canonical_parent.starts_with(data_root) {
+        return Ok(json_error(&format!("Path must be under {}", data_root), warp::http::StatusCode::FORBIDDEN));
     }
 
     // Rebuild the safe path from canonical parent + leaf

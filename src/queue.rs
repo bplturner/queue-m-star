@@ -10,12 +10,18 @@ use crate::api::VersionList;
 ///
 /// Periodically checks for queued jobs and launches them when GPUs are available.
 /// Also monitors running jobs and updates their status on completion.
+///
+/// Production features:
+/// - Auto-requeues dead jobs on startup (if `auto_requeue_on_restart` is enabled)
+/// - Startup delay to wait for NFS mounts and GPU drivers after reboot
+/// - Systemd watchdog heartbeat every poll cycle
 pub async fn run_queue_manager(
     db: DbHandle,
     versions: VersionList,
     config: Config,
 ) {
     let poll_interval = std::time::Duration::from_secs(config.queue.poll_interval_secs);
+    let auto_requeue = config.queue.auto_requeue_on_restart;
 
     // Smart recovery: check if previously-running jobs are still alive
     {
@@ -26,6 +32,11 @@ pub async fn run_queue_manager(
                     println!("[QUEUE] No running jobs to recover from previous session");
                 } else {
                     println!("[QUEUE] Found {} running jobs from previous session, checking PIDs...", running_jobs.len());
+                    if auto_requeue {
+                        println!("[QUEUE] Auto-requeue is ENABLED — dead jobs will be re-queued for checkpoint restart");
+                    } else {
+                        println!("[QUEUE] Auto-requeue is DISABLED — dead jobs will be marked as failed");
+                    }
                     for job in &running_jobs {
                         if let Some(pid) = job.pid {
                             // Check if the process is still alive
@@ -51,26 +62,44 @@ pub async fn run_queue_manager(
                                 let job_id = job.id;
                                 let job_copy_to = job.copy_to_path.clone();
                                 let job_working_dir = job.working_directory.clone();
+                                let reattach_data_root = config.paths.data_root.to_str().unwrap_or("/").to_string();
                                 tokio::spawn(async move {
-                                    reattach_to_running_process(db_clone, job_id, pid as u32, job_copy_to, job_working_dir).await;
+                                    reattach_to_running_process(db_clone, job_id, pid as u32, job_copy_to, job_working_dir, reattach_data_root).await;
                                 });
                             } else if alive {
                                 // PID is alive but NOT an mstar process — PID was reused by another program
                                 println!("[QUEUE] Job {} (PID {}) — PID is alive but NOT an M-Star process (PID reuse detected) — marking as failed", job.id, pid);
                                 let _ = db::fail_stale_job(&conn, job.id, "PID reused by another process after daemon restart");
+                            } else if auto_requeue {
+                                // Process is dead and auto-requeue is enabled — re-queue for checkpoint restart
+                                println!("[QUEUE] Job {} (PID {}) is DEAD — RE-QUEUING for checkpoint restart", job.id, pid);
+                                let _ = db::requeue_stale_job(&conn, job.id, "Auto-requeued: process died during daemon/machine restart");
                             } else {
                                 println!("[QUEUE] Job {} (PID {}) is DEAD — marking as failed", job.id, pid);
                                 let _ = db::fail_stale_job(&conn, job.id, "Process died during daemon restart");
                             }
                         } else {
-                            println!("[QUEUE] Job {} has no PID — marking as failed", job.id);
-                            let _ = db::fail_stale_job(&conn, job.id, "No PID recorded, daemon restarted");
+                            if auto_requeue {
+                                println!("[QUEUE] Job {} has no PID — RE-QUEUING for restart", job.id);
+                                let _ = db::requeue_stale_job(&conn, job.id, "Auto-requeued: no PID recorded, daemon restarted");
+                            } else {
+                                println!("[QUEUE] Job {} has no PID — marking as failed", job.id);
+                                let _ = db::fail_stale_job(&conn, job.id, "No PID recorded, daemon restarted");
+                            }
                         }
                     }
                 }
             }
             Err(e) => eprintln!("[QUEUE] Error checking running jobs: {}", e),
         }
+    }
+
+    // Startup delay: wait for NFS mounts and GPU drivers to initialize after reboot
+    if config.queue.startup_delay_secs > 0 {
+        println!("[QUEUE] Startup delay: waiting {}s for NFS mounts and GPUs...",
+            config.queue.startup_delay_secs);
+        tokio::time::sleep(std::time::Duration::from_secs(config.queue.startup_delay_secs)).await;
+        println!("[QUEUE] Startup delay complete, beginning queue processing");
     }
 
     // Ensure jobs directory exists
@@ -80,6 +109,9 @@ pub async fn run_queue_manager(
     }
 
     loop {
+        // Systemd watchdog heartbeat — tells systemd "I'm still alive"
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+
         // Check for queued jobs
         let next_job = {
             let conn = db.lock().await;
@@ -326,6 +358,7 @@ async fn launch_job(
     let job_id = job.id;
     let job_copy_to = job.copy_to_path.clone();
     let job_working_dir = Some(job_dir_str.clone());
+    let data_root = config.paths.data_root.to_str().unwrap_or("/").to_string();
 
     tokio::spawn(async move {
         match child.wait().await {
@@ -337,7 +370,7 @@ async fn launch_job(
                     drop(conn); // Release lock before file I/O
                     // Auto-copy results if copy_to_path is set
                     if let Some(ref copy_to) = job_copy_to {
-                        copy_results_to_destination(job_id, &job_working_dir, copy_to).await;
+                        copy_results_to_destination(job_id, &job_working_dir, copy_to, &data_root).await;
                     }
                 } else {
                     let err = format!("Process exited with status: {}", status);
@@ -437,6 +470,7 @@ async fn reattach_to_running_process(
     pid: u32,
     copy_to_path: Option<String>,
     working_directory: Option<String>,
+    data_root: String,
 ) {
     println!("[QUEUE] Monitoring re-attached job {} (PID {})", job_id, pid);
 
@@ -500,7 +534,7 @@ async fn reattach_to_running_process(
     // Auto-copy results only on success
     if success {
         if let Some(ref copy_to) = copy_to_path {
-            copy_results_to_destination(job_id, &working_directory, copy_to).await;
+            copy_results_to_destination(job_id, &working_directory, copy_to, &data_root).await;
         }
     }
 }
@@ -603,12 +637,13 @@ async fn check_job_output_success(job_id: i64, working_directory: &Option<String
 }
 
 /// Copy completed job results to the specified destination path
-/// SECURITY: Validates destination resolves under /simulations
+/// SECURITY: Validates destination resolves under the configured data_root
 /// SAFETY: Never deletes source data; verifies copy before reporting success
 async fn copy_results_to_destination(
     job_id: i64,
     working_directory: &Option<String>,
     destination: &str,
+    data_root: &str,
 ) {
     let src_dir = match working_directory {
         Some(ref d) => d.clone(),
@@ -618,7 +653,7 @@ async fn copy_results_to_destination(
         }
     };
 
-    // SECURITY: Validate destination resolves under /simulations
+    // SECURITY: Validate destination resolves under the configured data_root
     let dest_path = std::path::Path::new(destination);
     // For new paths, canonicalize the nearest existing ancestor
     let mut check = dest_path.to_path_buf();
@@ -626,9 +661,9 @@ async fn copy_results_to_destination(
         if check.exists() {
             match std::fs::canonicalize(&check) {
                 Ok(canonical) => {
-                    if !canonical.starts_with("/simulations") {
-                        eprintln!("[COPY] SECURITY BLOCKED: Job {} destination {} resolves to {} which is outside /simulations",
-                            job_id, destination, canonical.display());
+                    if !canonical.starts_with(data_root) {
+                        eprintln!("[COPY] SECURITY BLOCKED: Job {} destination {} resolves to {} which is outside {}",
+                            job_id, destination, canonical.display(), data_root);
                         return;
                     }
                     break;

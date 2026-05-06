@@ -1,9 +1,10 @@
 [Unit]
 Description=M-Star Queue - CFD Job Management System
-After=network.target
-Documentation=https://github.com/latticept/mstar-queue
-StartLimitIntervalSec=60
-StartLimitBurst=3
+After=network-online.target remote-fs.target
+Wants=network-online.target remote-fs.target
+Documentation=https://github.com/your-org/mstar-queue
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -14,13 +15,20 @@ WorkingDirectory=/opt/mstar_queue
 # Binary with quiet flag for production
 ExecStart=/usr/local/bin/mstar_queue --quiet
 
-# Restart policy
-Restart=on-failure
-RestartSec=5
+# Restart policy: always restart, even on clean exit (e.g. unexpected shutdown)
+Restart=always
+RestartSec=10
 
-# Only kill the queue manager, NOT child simulation processes
+# Only kill the queue manager, NOT child simulation processes.
 # The queue manager re-attaches to orphaned simulations on startup
+# and auto-requeues dead jobs (if configured).
 KillMode=process
+
+# Watchdog: disabled (requires Type=notify which conflicts with ProtectSystem=strict)
+# WatchdogSec=120
+
+# Startup timeout
+TimeoutStartSec=30
 
 # Logging
 StandardOutput=journal
@@ -34,16 +42,26 @@ Environment="RUST_LOG=info"
 # GPU access — nvidia-smi and CUDA devices
 SupplementaryGroups=video render
 
-# Security hardening
+# --- Filesystem Sandbox ---
+# ProtectSystem=strict makes the ENTIRE filesystem read-only except ReadWritePaths.
+# PrivateTmp=true gives the service its own writable /tmp and /var/tmp.
+# This is REQUIRED for OpenMPI (session dirs), CUDA, and python3 temp files.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/mstar_queue /simulations/Queue /opt/mstar /usr/local/bin
-ReadOnlyPaths=/usr/bin/mpirun
+PrivateTmp=true
+
+# Paths the service MUST be able to write to:
+#   /opt/mstar_queue  — config, database, logs, archive
+#   /simulations      — NFS: jobs directory, copy-to destinations, MSB source files
+#   /opt/mstar        — M-Star version installs, management scripts
+#   /usr/local/bin    — mstar-*-latest wrapper symlinks
+ReadWritePaths=/opt/mstar_queue /simulations /opt/mstar /usr/local/bin
 
 # Resource limits
 LimitNOFILE=65536
 LimitNPROC=4096
+TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+# M-Star Queue Manager — Log Rotation
+# Installed to /etc/logrotate.d/mstar_queue by the installer
+
+/opt/mstar_queue/mstar_queue.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    # copytruncate is essential: the daemon holds the log file open,
+    # so we can't rename it. This copies the content and truncates in-place.
+    copytruncate
+}

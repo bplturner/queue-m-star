@@ -194,6 +194,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("[INIT] M-Star Queue is ready!");
     println!("[INIT] Web UI: http://localhost:{}/", config.web_server.port);
 
+    // Notify systemd that the service is fully initialized and ready.
+    // Required for Type=notify services — systemd waits for this before considering
+    // the service "active". Also enables the watchdog timer.
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+
     // Keep the main task alive
     tokio::signal::ctrl_c().await?;
     println!("\n[SHUTDOWN] Received Ctrl+C, shutting down...");
@@ -291,7 +296,8 @@ async fn handle_full_job_submit(
     let priority = params.get("priority").and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
     let copy_to = params.get("copy_to").cloned();
 
-    // SECURITY: Validate copy_to path resolves under /simulations (canonicalize parent to catch traversal)
+    // SECURITY: Validate copy_to path resolves under the configured data_root
+    let data_root = state.config.paths.data_root.to_str().unwrap_or("/");
     if let Some(ref ctp) = copy_to {
         let requested = std::path::Path::new(ctp);
         // If the directory already exists, canonicalize it directly
@@ -309,9 +315,9 @@ async fn handle_full_job_submit(
             None
         };
         match check_path {
-            Some(resolved) if resolved.starts_with("/simulations") => {},
+            Some(resolved) if resolved.starts_with(data_root) => {},
             Some(_) => return Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({"error": "copy_to path must resolve under /simulations"})),
+                warp::reply::json(&serde_json::json!({"error": format!("copy_to path must resolve under {}", data_root)})),
                 warp::http::StatusCode::BAD_REQUEST,
             )),
             None => return Ok(warp::reply::with_status(
@@ -321,7 +327,7 @@ async fn handle_full_job_submit(
         }
     }
 
-    // SECURITY: Validate msb_source_path exists and resolves under /simulations
+    // SECURITY: Validate msb_source_path exists and resolves under the configured data_root
     if let Some(ref src) = msb_source_path {
         let canonical = match std::fs::canonicalize(src) {
             Ok(p) => p,
@@ -330,9 +336,9 @@ async fn handle_full_job_submit(
                 warp::http::StatusCode::BAD_REQUEST,
             )),
         };
-        if !canonical.starts_with("/simulations") {
+        if !canonical.starts_with(data_root) {
             return Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({"error": "msb_source_path must resolve under /simulations"})),
+                warp::reply::json(&serde_json::json!({"error": format!("msb_source_path must resolve under {}", data_root)})),
                 warp::http::StatusCode::BAD_REQUEST,
             ));
         }

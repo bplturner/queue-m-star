@@ -3,9 +3,15 @@
 # flattens the nested directory, and copies the license file.
 set -e
 
-# Credentials
-USERNAME="mstartrial"
-PASSWORD="726fbb5"
+# M-Star download credentials — set via environment or credentials file
+# Source credentials file if it exists (created by install.sh)
+CRED_FILE="${MSTAR_CREDENTIALS_FILE:-/opt/mstar_queue/.mstar_credentials}"
+if [ -f "$CRED_FILE" ]; then
+  source "$CRED_FILE"
+fi
+
+USERNAME="${MSTAR_DOWNLOAD_USER:?ERROR: MSTAR_DOWNLOAD_USER not set. Export it or create $CRED_FILE}"
+PASSWORD="${MSTAR_DOWNLOAD_PASS:?ERROR: MSTAR_DOWNLOAD_PASS not set. Export it or create $CRED_FILE}"
 
 # Where M-Star versions live
 INSTALL_DIR="${MSTAR_INSTALL_DIR:-/opt/mstar}"

@@ -2,8 +2,8 @@ import sys # Import the sys module to manipulate Python runtime environment
 import os # Import the os module for interacting with the operating system
 import subprocess # Import the subprocess module to run shell commands
 
-# Define the root directory for M-Star, where mstar.sh is located
-mstar_root_dir = r"/opt/mstar/mstarcfd-latest/" # Root directory of M-Star installation
+# Define the root directory for M-Star (from environment or default)
+mstar_root_dir = os.environ.get("MSTAR_ROOT", "/opt/mstar/mstarcfd-latest/")  # Root directory of M-Star installation
 # Define the M-Star library directory, also used for Python's sys.path
 mstar_lib_dir = os.path.join(mstar_root_dir, "lib") # Path to the M-Star libraries and Python module
 # Path to the M-Star environment setup script

@@ -204,23 +204,30 @@ pub fn init_db(db_path: &Path) -> SqliteResult<DbHandle> {
 // User Operations
 // ============================================================
 
-/// Validate that an email address belongs to the @latticept.com domain
-pub fn validate_email(email: &str) -> Result<(), String> {
+/// Validate that an email address belongs to the allowed domain (if configured).
+/// If `allowed_domain` is empty or "*", any valid email is accepted.
+pub fn validate_email(email: &str, allowed_domain: &str) -> Result<(), String> {
     let email_lower = email.to_lowercase();
     if !email_lower.contains('@') {
         return Err("Invalid email address".to_string());
     }
-    if !email_lower.ends_with("@latticept.com") {
-        return Err("Registration is restricted to @latticept.com email addresses".to_string());
+    // If no domain restriction is configured, allow any email
+    let domain = allowed_domain.trim();
+    if domain.is_empty() || domain == "*" {
+        return Ok(());
+    }
+    let required_suffix = format!("@{}", domain.to_lowercase());
+    if !email_lower.ends_with(&required_suffix) {
+        return Err(format!("Registration is restricted to @{} email addresses", domain));
     }
     Ok(())
 }
 
 /// Create a new user, returns the user ID
 pub fn create_user(conn: &Connection, username: &str, email: &str, password: &str, role: &str) -> Result<i64, String> {
-    // Validate email domain (skip for system-created admin)
-    if role != "admin" || email != "admin@latticept.com" {
-        validate_email(email)?;
+    // Validate email domain (skip for default admin bootstrap)
+    if role != "admin" || email != "admin@localhost" {
+        validate_email(email, "")?; // Caller should use validate_email_with_config for domain checks
     }
 
     let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
@@ -806,6 +813,26 @@ pub fn fail_stale_job(conn: &Connection, job_id: i64, error: &str) -> Result<(),
     Ok(())
 }
 
+/// Re-queue a stale running job back to "queued" status for automatic restart.
+/// Used when auto_requeue_on_restart is enabled and the daemon finds dead processes
+/// after a reboot. The job will be re-launched with --load-last (checkpoint restart).
+pub fn requeue_stale_job(conn: &Connection, job_id: i64, reason: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE jobs SET status = 'queued', pid = NULL, started_at = NULL, completed_at = NULL,
+         error_message = ?2
+         WHERE id = ?1 AND status = 'running'",
+        params![job_id, reason],
+    ).map_err(|e| format!("Failed to requeue stale job {}: {}", job_id, e))?;
+
+    // Release GPU reservations so the scheduler can reassign
+    conn.execute(
+        "DELETE FROM gpu_reservations WHERE job_id = ?1",
+        params![job_id],
+    ).map_err(|e| format!("Failed to release GPU reservations for job {}: {}", job_id, e))?;
+
+    Ok(())
+}
+
 /// Get count of jobs by status
 pub fn get_job_counts(conn: &Connection) -> Result<std::collections::HashMap<String, i64>, String> {
     let mut stmt = conn.prepare(
@@ -829,7 +856,7 @@ pub fn get_job_counts(conn: &Connection) -> Result<std::collections::HashMap<Str
 /// Ensure a default admin user exists (for first-time setup)
 pub fn ensure_default_admin(conn: &Connection) -> Result<(), String> {
     if !has_admin(conn)? {
-        create_user(conn, "admin", "admin@latticept.com", "admin", "admin")?;
+        create_user(conn, "admin", "admin@localhost", "admin", "admin")?;
         println!("[SETUP] Created default admin user (username: admin, password: admin)");
         println!("[SETUP] !! CHANGE THE DEFAULT PASSWORD IMMEDIATELY !!");
     }

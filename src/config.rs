@@ -16,6 +16,9 @@ pub struct Config {
     /// Job queue settings
     #[serde(default)]
     pub queue: QueueConfig,
+    /// Security settings
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 /// Paths for log files, executables, and directories
@@ -42,10 +45,19 @@ pub struct PathConfig {
     /// Path to the GPU metrics CSV log file
     #[serde(default = "default_gpu_metrics_log")]
     pub gpu_metrics_log: PathBuf,
+    /// Root data directory — used as the security boundary for file browsing,
+    /// copy-to destinations, and MSB source paths. All user-accessible paths
+    /// must resolve under this directory.
+    #[serde(default = "default_data_root")]
+    pub data_root: PathBuf,
 }
 
 fn default_mstar_install_dir() -> PathBuf {
     PathBuf::from("/opt/mstar")
+}
+
+fn default_data_root() -> PathBuf {
+    PathBuf::from("/opt/mstar_queue/data")
 }
 
 fn default_database_file() -> PathBuf {
@@ -91,6 +103,24 @@ pub struct GpuSelectionConfig {
     pub reserved_gpu_max_memory_usage_percent: f32,
 }
 
+/// Security configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Restrict user registration to a specific email domain.
+    /// If empty or "*", any email address is allowed.
+    /// Example: "mycompany.com" only allows @mycompany.com addresses.
+    #[serde(default)]
+    pub allowed_email_domain: String,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        SecurityConfig {
+            allowed_email_domain: String::new(), // No restriction by default
+        }
+    }
+}
+
 /// Job queue configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueConfig {
@@ -106,6 +136,15 @@ pub struct QueueConfig {
     /// Interval in seconds between queue polling cycles
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+    /// Automatically re-queue jobs that were running when the daemon/machine stopped.
+    /// When true: dead jobs are reset to "queued" and re-launched with --load-last.
+    /// When false: dead jobs are marked "failed" (requires manual restart).
+    #[serde(default = "default_true")]
+    pub auto_requeue_on_restart: bool,
+    /// Delay in seconds before the queue starts processing after daemon startup.
+    /// Gives NFS mounts and GPUs time to initialize after a reboot.
+    #[serde(default = "default_startup_delay")]
+    pub startup_delay_secs: u64,
 }
 
 fn default_max_concurrent() -> usize {
@@ -120,6 +159,14 @@ fn default_poll_interval() -> u64 {
     5
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_startup_delay() -> u64 {
+    10
+}
+
 impl Default for QueueConfig {
     fn default() -> Self {
         QueueConfig {
@@ -127,6 +174,8 @@ impl Default for QueueConfig {
             default_mstar_version: default_mstar_version(),
             job_output_retention_days: 0,
             poll_interval_secs: default_poll_interval(),
+            auto_requeue_on_restart: default_true(),
+            startup_delay_secs: default_startup_delay(),
         }
     }
 }

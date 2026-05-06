@@ -236,7 +236,7 @@
                     <div class="auth-brand">
                         <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue)" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
                         <h2>Create Account</h2>
-                        <p>Registration restricted to @latticept.com emails</p>
+                        <p>Create your account to get started</p>
                     </div>
                     <form id="register-form">
                         <div class="form-group">
@@ -245,7 +245,7 @@
                         </div>
                         <div class="form-group">
                             <label class="form-label">Email</label>
-                            <input type="email" class="form-input" id="reg-email" placeholder="you@latticept.com" required>
+                            <input type="email" class="form-input" id="reg-email" placeholder="you@company.com" required>
                         </div>
                         <div class="form-group">
                             <label class="form-label">Password</label>
@@ -266,10 +266,7 @@
             const email = document.getElementById('reg-email').value;
             const password = document.getElementById('reg-password').value;
 
-            if (!email.endsWith('@latticept.com')) {
-                toast('Only @latticept.com email addresses are allowed', 'error');
-                return;
-            }
+            // Email domain validation is handled server-side via config
 
             const data = await api.post('/auth/register', { username, email, password });
             if (data && data.token) {
@@ -444,8 +441,8 @@
                                 <td>
                                     <div class="flex gap-2">
                                         ${job.status !== 'queued' ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.viewOutput(${job.id})">View</button>` : ''}
-                                        ${(job.status === 'queued' || job.status === 'running') ? `<button class="btn btn-danger btn-sm" onclick="window.mstarApp.cancelJob(${job.id})">Cancel</button>` : ''}
-                                        ${(job.status === 'failed' || job.status === 'cancelled') ? `<button class="btn btn-primary btn-sm" onclick="window.mstarApp.restartJob(${job.id})">Restart</button>` : ''}
+                                        ${(job.status === 'queued' || job.status === 'running') ? `<button class="btn btn-danger btn-sm" id="cancel-btn-${job.id}" onclick="window.mstarApp.cancelJob(${job.id})">Cancel</button>` : ''}
+                                        ${(job.status === 'failed' || job.status === 'cancelled') ? `<button class="btn btn-primary btn-sm" id="restart-btn-${job.id}" onclick="window.mstarApp.restartJob(${job.id})">Restart</button>` : ''}
                                     </div>
                                     ${job.error_message ? `<div class="text-sm" style="color:var(--accent-red);margin-top:4px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(job.error_message)}">${escapeHtml(job.error_message)}</div>` : ''}
                                 </td>
@@ -1165,7 +1162,7 @@
                             </div>
                             <div class="form-group">
                                 <label class="form-label">Email</label>
-                                <input type="email" class="form-input" id="new-email" placeholder="user@latticept.com" required>
+                                <input type="email" class="form-input" id="new-email" placeholder="user@company.com" required>
                             </div>
                             <div class="form-group">
                                 <label class="form-label">Password</label>
@@ -1257,7 +1254,7 @@
                                     <div class="flex gap-2">
                                         ${u.id !== state.user?.id ? `
                                             <button class="btn btn-secondary btn-sm" onclick="window.mstarApp.editUser(${u.id}, '${escapeHtml(u.role)}', ${JSON.stringify(u.gpu_access || [])}, ${gpuCount})">Edit</button>
-                                            <button class="btn btn-danger btn-sm" onclick="window.mstarApp.deleteUser(${u.id})">Delete</button>
+                                            <button class="btn btn-danger btn-sm" id="delete-user-${u.id}" onclick="window.mstarApp.deleteUser(${u.id})">Delete</button>
                                         ` : '<span class="text-muted text-sm">You</span>'}
                                     </div>
                                 </td>
@@ -1378,38 +1375,38 @@
         `;
 
         // Install button handler
-        document.getElementById('install-version-btn').addEventListener('click', async function() {
-            if (!confirm('Download and install the latest M-Star CFD nightly?\n\nThis will download, copy the license, and update all *-latest symlinks.')) return;
+        document.getElementById('install-version-btn').addEventListener('click', function() {
+            inlineConfirm('install-version-btn', 'Download latest nightly?', async function() {
+                var btn = document.getElementById('install-version-btn');
+                var textEl = document.getElementById('install-version-text');
+                var statusEl = document.getElementById('install-version-status');
 
-            var btn = document.getElementById('install-version-btn');
-            var textEl = document.getElementById('install-version-text');
-            var statusEl = document.getElementById('install-version-status');
+                btn.disabled = true;
+                textEl.textContent = '\u23f3 Downloading and installing...';
+                statusEl.style.display = 'block';
+                statusEl.innerHTML = '<div class="badge badge-running" style="display:inline-block;">Installing...</div>';
 
-            btn.disabled = true;
-            textEl.textContent = '\u23f3 Downloading and installing...';
-            statusEl.style.display = 'block';
-            statusEl.innerHTML = '<div class="badge badge-running" style="display:inline-block;">Installing...</div>';
-
-            try {
-                var result = await api.post('/admin/install-version');
-                if (result && result.success) {
-                    var output = (result.download_output || '').trim() + '\n' + (result.symlink_output || '').trim();
-                    statusEl.innerHTML =
-                        '<div class="badge badge-completed" style="display:inline-block; margin-bottom: 0.5rem;">\u2713 Installed v' + result.latest_version + '</div>' +
-                        '<pre style="background:var(--bg-tertiary);color:var(--text-secondary);padding:0.75rem;border-radius:6px;font-size:0.75rem;max-height:200px;overflow-y:auto;white-space:pre-wrap;margin:0">' + output.replace(/</g, '&lt;') + '</pre>';
-                    toast('M-Star v' + result.latest_version + ' installed (' + result.total_versions + ' versions)', 'success');
-                    setTimeout(function() { handleRoute(); }, 1500);
-                } else {
-                    statusEl.innerHTML = '<div class="badge badge-failed" style="display:inline-block;">Failed: ' + (result && result.error ? result.error : 'Unknown error') + '</div>';
-                    toast((result && result.error) || 'Install failed', 'error');
+                try {
+                    var result = await api.post('/admin/install-version');
+                    if (result && result.success) {
+                        var output = (result.download_output || '').trim() + '\n' + (result.symlink_output || '').trim();
+                        statusEl.innerHTML =
+                            '<div class="badge badge-completed" style="display:inline-block; margin-bottom: 0.5rem;">\u2713 Installed v' + result.latest_version + '</div>' +
+                            '<pre style="background:var(--bg-tertiary);color:var(--text-secondary);padding:0.75rem;border-radius:6px;font-size:0.75rem;max-height:200px;overflow-y:auto;white-space:pre-wrap;margin:0">' + output.replace(/</g, '&lt;') + '</pre>';
+                        toast('M-Star v' + result.latest_version + ' installed (' + result.total_versions + ' versions)', 'success');
+                        setTimeout(function() { handleRoute(); }, 1500);
+                    } else {
+                        statusEl.innerHTML = '<div class="badge badge-failed" style="display:inline-block;">Failed: ' + (result && result.error ? result.error : 'Unknown error') + '</div>';
+                        toast((result && result.error) || 'Install failed', 'error');
+                    }
+                } catch (e) {
+                    statusEl.innerHTML = '<div class="badge badge-failed" style="display:inline-block;">Error: ' + e.message + '</div>';
+                    toast('Install failed: ' + e.message, 'error');
                 }
-            } catch (e) {
-                statusEl.innerHTML = '<div class="badge badge-failed" style="display:inline-block;">Error: ' + e.message + '</div>';
-                toast('Install failed: ' + e.message, 'error');
-            }
 
-            btn.disabled = false;
-            textEl.textContent = '\u2b07 Install Latest M-Star Version';
+                btn.disabled = false;
+                textEl.textContent = '\u2b07 Install Latest M-Star Version';
+            });
         });
     }
 
@@ -2649,32 +2646,69 @@
     // ============================================================
     // Actions
     // ============================================================
-    async function cancelJob(jobId) {
+
+    // Inline confirmation helper — replaces browser confirm() dialogs.
+    // Shows "Are you sure? [Yes] [No]" inline where the button was.
+    function inlineConfirm(anchorId, message, onConfirm) {
+        const anchor = document.getElementById(anchorId);
+        if (!anchor) { onConfirm(); return; }
+
+        // Already showing a confirm? Toggle it off
+        const existing = anchor.parentNode.querySelector('.inline-confirm');
+        if (existing) { existing.remove(); anchor.style.display = ''; state.refreshPaused = false; return; }
+
+        // Pause auto-refresh so the table doesn't re-render while user is deciding
         state.refreshPaused = true;
-        var confirmed = confirm('Cancel job #' + jobId + '? The simulation process will be killed.');
-        state.refreshPaused = false;
-        if (!confirmed) return;
-        var result = await api.post('/jobs/' + jobId + '/cancel');
-        if (result && result.message) {
-            toast(result.message, 'success');
-            handleRoute(); // Refresh to show updated status
-        } else {
-            toast(result?.error || 'Failed to cancel', 'error');
-        }
+        anchor.style.display = 'none';
+
+        const wrap = document.createElement('span');
+        wrap.className = 'inline-confirm';
+        wrap.style.cssText = 'display:inline-flex;align-items:center;gap:6px;';
+        wrap.innerHTML = `
+            <span style="font-size:12px;color:var(--accent-amber);white-space:nowrap;">${message}</span>
+            <button class="btn btn-danger btn-sm" style="min-width:40px;padding:3px 8px;">Yes</button>
+            <button class="btn btn-secondary btn-sm" style="min-width:40px;padding:3px 8px;">No</button>
+        `;
+
+        anchor.parentNode.insertBefore(wrap, anchor.nextSibling);
+
+        const [yesBtn, noBtn] = wrap.querySelectorAll('button');
+
+        const cleanup = () => {
+            wrap.remove();
+            anchor.style.display = '';
+            state.refreshPaused = false;
+        };
+
+        yesBtn.addEventListener('click', () => { cleanup(); onConfirm(); });
+        noBtn.addEventListener('click', cleanup);
+
+        // Auto-dismiss after 8 seconds
+        setTimeout(() => { if (wrap.parentNode) cleanup(); }, 8000);
+    }
+
+    async function cancelJob(jobId) {
+        inlineConfirm(`cancel-btn-${jobId}`, 'Kill this job?', async () => {
+            var result = await api.post('/jobs/' + jobId + '/cancel');
+            if (result && result.message) {
+                toast(result.message, 'success');
+                handleRoute();
+            } else {
+                toast(result?.error || 'Failed to cancel', 'error');
+            }
+        });
     }
 
     async function deleteUser(userId) {
-        state.refreshPaused = true;
-        var confirmed = confirm('Delete user #' + userId + '? This cannot be undone.');
-        state.refreshPaused = false;
-        if (!confirmed) return;
-        const result = await api.del(`/users/${userId}`);
-        if (result && result.message) {
-            toast(result.message, 'success');
-            handleRoute(); // Refresh page
-        } else {
-            toast(result?.error || 'Failed to delete user', 'error');
-        }
+        inlineConfirm(`delete-user-${userId}`, 'Delete this user?', async () => {
+            const result = await api.del(`/users/${userId}`);
+            if (result && result.message) {
+                toast(result.message, 'success');
+                handleRoute();
+            } else {
+                toast(result?.error || 'Failed to delete user', 'error');
+            }
+        });
     }
 
     // ============================================================
@@ -2728,17 +2762,15 @@
     // Expose global methods for inline onclick handlers
     // ============================================================
     async function restartJob(jobId) {
-        state.refreshPaused = true;
-        var confirmed = confirm('Restart failed job #' + jobId + ' using --load-last?');
-        state.refreshPaused = false;
-        if (!confirmed) return;
-        const result = await api.post(`/jobs/${jobId}/restart`, {});
-        if (result && !result.error) {
-            toast(`Restart queued: Job #${result.new_job_id}`, 'success');
-            navigate('jobs');
-        } else {
-            toast(result?.error || 'Restart failed', 'error');
-        }
+        inlineConfirm(`restart-btn-${jobId}`, 'Restart with checkpoint?', async () => {
+            const result = await api.post(`/jobs/${jobId}/restart`, {});
+            if (result && !result.error) {
+                toast(`Restart queued: Job #${result.new_job_id}`, 'success');
+                navigate('jobs');
+            } else {
+                toast(result?.error || 'Restart failed', 'error');
+            }
+        });
     }
 
     window.mstarApp = Object.assign(window.mstarApp || {}, { viewOutput, cancelJob, deleteUser, editUser, popOutPanel, restartJob });

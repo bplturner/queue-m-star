@@ -25,3 +25,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 bcrypt = "0.15"
 rand = "0.8"
 libc = "0.2"
+sd-notify = "0.4"
