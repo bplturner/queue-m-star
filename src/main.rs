@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::ffi::OsStr;
@@ -38,6 +39,27 @@ pub struct GpuInfo {
     pub temperature: f32,
     /// True if nvidia-smi reports compute processes running on this GPU
     pub has_compute_processes: bool,
+}
+
+/// System-level CPU and memory information
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SystemInfo {
+    /// Number of logical CPU cores
+    pub cpu_cores: usize,
+    /// Overall CPU utilization percentage (0–100)
+    pub cpu_percent: f32,
+    /// Per-core utilization percentages
+    pub cpu_per_core: Vec<f32>,
+    /// Total physical RAM in MB
+    pub memory_total_mb: u64,
+    /// Used RAM in MB (total - available)
+    pub memory_used_mb: u64,
+    /// Available RAM in MB
+    pub memory_available_mb: u64,
+    /// Memory utilization percentage
+    pub memory_percent: f32,
+    /// System load averages (1, 5, 15 min)
+    pub load_avg: [f32; 3],
 }
 
 #[derive(Parser, Debug)]
@@ -477,6 +499,109 @@ pub fn get_gpu_info() -> Result<Vec<GpuInfo>, Box<dyn std::error::Error + Send +
     }
 
     Ok(gpu_info)
+}
+
+/// Read CPU times from /proc/stat. Returns (overall, per-core) tuples of (user+nice+system, total).
+fn read_cpu_times() -> Option<((u64, u64), Vec<(u64, u64)>)> {
+    let content = std::fs::read_to_string("/proc/stat").ok()?;
+    let mut overall = None;
+    let mut cores = Vec::new();
+
+    for line in content.lines() {
+        if line.starts_with("cpu") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 8 { continue; }
+            // fields: user, nice, system, idle, iowait, irq, softirq, [steal]
+            let user: u64 = parts[1].parse().unwrap_or(0);
+            let nice: u64 = parts[2].parse().unwrap_or(0);
+            let system: u64 = parts[3].parse().unwrap_or(0);
+            let idle: u64 = parts[4].parse().unwrap_or(0);
+            let iowait: u64 = parts[5].parse().unwrap_or(0);
+            let irq: u64 = parts[6].parse().unwrap_or(0);
+            let softirq: u64 = parts[7].parse().unwrap_or(0);
+            let steal: u64 = parts.get(8).and_then(|v| v.parse().ok()).unwrap_or(0);
+
+            let busy = user + nice + system + irq + softirq + steal;
+            let total = busy + idle + iowait;
+
+            if parts[0] == "cpu" {
+                overall = Some((busy, total));
+            } else {
+                cores.push((busy, total));
+            }
+        }
+    }
+
+    overall.map(|o| (o, cores))
+}
+
+/// Get system CPU and memory information.
+/// CPU utilization is computed as a delta over ~200ms for accuracy.
+pub fn get_system_info() -> Result<SystemInfo, Box<dyn std::error::Error + Send + Sync>> {
+    // --- CPU: two-sample delta ---
+    let t1 = read_cpu_times().ok_or("Failed to read /proc/stat")?;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let t2 = read_cpu_times().ok_or("Failed to read /proc/stat")?;
+
+    let cpu_percent = {
+        let d_busy = t2.0 .0.saturating_sub(t1.0 .0) as f32;
+        let d_total = t2.0 .1.saturating_sub(t1.0 .1) as f32;
+        if d_total > 0.0 { (d_busy / d_total) * 100.0 } else { 0.0 }
+    };
+
+    let cpu_per_core: Vec<f32> = t1.1.iter().zip(t2.1.iter()).map(|(a, b)| {
+        let d_busy = b.0.saturating_sub(a.0) as f32;
+        let d_total = b.1.saturating_sub(a.1) as f32;
+        if d_total > 0.0 { (d_busy / d_total) * 100.0 } else { 0.0 }
+    }).collect();
+
+    let cpu_cores = cpu_per_core.len();
+
+    // --- Memory from /proc/meminfo ---
+    let meminfo = std::fs::read_to_string("/proc/meminfo")?;
+    let mut mem_total_kb: u64 = 0;
+    let mut mem_available_kb: u64 = 0;
+
+    for line in meminfo.lines() {
+        if line.starts_with("MemTotal:") {
+            mem_total_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        } else if line.starts_with("MemAvailable:") {
+            mem_available_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        }
+    }
+
+    let memory_total_mb = mem_total_kb / 1024;
+    let memory_available_mb = mem_available_kb / 1024;
+    let memory_used_mb = memory_total_mb.saturating_sub(memory_available_mb);
+    let memory_percent = if memory_total_mb > 0 {
+        (memory_used_mb as f32 / memory_total_mb as f32) * 100.0
+    } else { 0.0 };
+
+    // --- Load averages from /proc/loadavg ---
+    let load_avg = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| {
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            if parts.len() >= 3 {
+                Some([
+                    parts[0].parse::<f32>().unwrap_or(0.0),
+                    parts[1].parse::<f32>().unwrap_or(0.0),
+                    parts[2].parse::<f32>().unwrap_or(0.0),
+                ])
+            } else { None }
+        })
+        .unwrap_or([0.0, 0.0, 0.0]);
+
+    Ok(SystemInfo {
+        cpu_cores,
+        cpu_percent,
+        cpu_per_core,
+        memory_total_mb,
+        memory_used_mb,
+        memory_available_mb,
+        memory_percent,
+        load_avg,
+    })
 }
 
 /// Get PCI bus IDs in GPU index order (for mapping process queries to GPU indices)

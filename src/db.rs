@@ -80,6 +80,7 @@ pub struct Job {
     pub restart_from_job_id: Option<i64>,
     pub restart_options: Option<String>,  // JSON for future input.xml modifications
     pub copy_to_path: Option<String>,     // Optional path to copy results on completion
+    pub archived: bool,                    // Whether this job is archived (hidden from default views)
 }
 
 /// Represents an active session
@@ -195,6 +196,11 @@ pub fn init_db(db_path: &Path) -> SqliteResult<DbHandle> {
             PRIMARY KEY (user_id, gpu_id),
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         );"
+    );
+
+    // Migration: add archived flag — allows hiding failed/cancelled jobs without deleting them
+    let _ = conn.execute_batch(
+        "ALTER TABLE jobs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;"
     );
 
     Ok(Arc::new(Mutex::new(conn)))
@@ -480,32 +486,54 @@ pub fn create_job(
 }
 
 /// List jobs with optional status filter
-pub fn list_jobs(conn: &Connection, status_filter: Option<&str>, limit: Option<i64>) -> Result<Vec<Job>, String> {
+/// List jobs with optional status filter.
+/// By default, archived jobs are excluded unless `include_archived` is true
+/// or `status_filter` is explicitly "archived".
+pub fn list_jobs(conn: &Connection, status_filter: Option<&str>, limit: Option<i64>, include_archived: bool) -> Result<Vec<Job>, String> {
     let limit_val = limit.unwrap_or(100);
 
     let (query, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(status) = status_filter {
-        (
-            "SELECT j.id, j.user_id, COALESCE(u.username, 'unknown') as username, j.name, j.msb_filename,
-                    j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
-                    j.submitted_at, j.started_at, j.completed_at, j.working_directory,
-                    j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                    j.copy_to_path, j.resolved_version
-             FROM jobs j LEFT JOIN users u ON j.user_id = u.id
-             WHERE j.status = ?1
-             ORDER BY j.priority DESC, j.submitted_at ASC
-             LIMIT ?2".to_string(),
-            vec![Box::new(status.to_string()), Box::new(limit_val)]
-        )
+        if status == "archived" {
+            // Special filter: show only archived jobs
+            (
+                "SELECT j.id, j.user_id, COALESCE(u.username, 'unknown') as username, j.name, j.msb_filename,
+                        j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
+                        j.submitted_at, j.started_at, j.completed_at, j.working_directory,
+                        j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
+                        j.copy_to_path, j.resolved_version, j.archived
+                 FROM jobs j LEFT JOIN users u ON j.user_id = u.id
+                 WHERE j.archived = 1
+                 ORDER BY j.submitted_at DESC
+                 LIMIT ?1".to_string(),
+                vec![Box::new(limit_val)]
+            )
+        } else {
+            let archive_clause = if include_archived { "" } else { " AND j.archived = 0" };
+            (
+                format!("SELECT j.id, j.user_id, COALESCE(u.username, 'unknown') as username, j.name, j.msb_filename,
+                        j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
+                        j.submitted_at, j.started_at, j.completed_at, j.working_directory,
+                        j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
+                        j.copy_to_path, j.resolved_version, j.archived
+                 FROM jobs j LEFT JOIN users u ON j.user_id = u.id
+                 WHERE j.status = ?1{}
+                 ORDER BY j.priority DESC, j.submitted_at ASC
+                 LIMIT ?2", archive_clause),
+                vec![Box::new(status.to_string()), Box::new(limit_val)]
+            )
+        }
     } else {
+        let archive_clause = if include_archived { "" } else { " WHERE j.archived = 0" };
         (
-            "SELECT j.id, j.user_id, COALESCE(u.username, 'unknown') as username, j.name, j.msb_filename,
+            format!("SELECT j.id, j.user_id, COALESCE(u.username, 'unknown') as username, j.name, j.msb_filename,
                     j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                     j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                     j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                    j.copy_to_path, j.resolved_version
+                    j.copy_to_path, j.resolved_version, j.archived
              FROM jobs j LEFT JOIN users u ON j.user_id = u.id
+             {}
              ORDER BY j.submitted_at DESC
-             LIMIT ?1".to_string(),
+             LIMIT ?1", archive_clause),
             vec![Box::new(limit_val)]
         )
     };
@@ -538,6 +566,7 @@ pub fn list_jobs(conn: &Connection, status_filter: Option<&str>, limit: Option<i
             restart_options: row.get(18)?,
             copy_to_path: row.get(19)?,
             resolved_version: row.get(20)?,
+            archived: row.get::<_, i32>(21)? != 0,
         })
     }).map_err(|e| format!("Failed to query jobs: {}", e))?
     .filter_map(|r| r.ok())
@@ -553,7 +582,7 @@ pub fn get_job(conn: &Connection, job_id: i64) -> Result<Job, String> {
                 j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                 j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                 j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                j.copy_to_path, j.resolved_version
+                j.copy_to_path, j.resolved_version, j.archived
          FROM jobs j LEFT JOIN users u ON j.user_id = u.id
          WHERE j.id = ?1",
         params![job_id],
@@ -580,6 +609,7 @@ pub fn get_job(conn: &Connection, job_id: i64) -> Result<Job, String> {
                 restart_options: row.get(18)?,
                 copy_to_path: row.get(19)?,
                 resolved_version: row.get(20)?,
+                archived: row.get::<_, i32>(21)? != 0,
             })
         },
     ).map_err(|_| format!("Job {} not found", job_id))
@@ -682,7 +712,7 @@ pub fn get_next_queued_job(conn: &Connection) -> Result<Option<Job>, String> {
                 j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                 j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                 j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                j.copy_to_path, j.resolved_version
+                j.copy_to_path, j.resolved_version, j.archived
          FROM jobs j LEFT JOIN users u ON j.user_id = u.id
          WHERE j.status = 'queued'
          ORDER BY j.priority DESC, j.submitted_at ASC
@@ -711,6 +741,7 @@ pub fn get_next_queued_job(conn: &Connection) -> Result<Option<Job>, String> {
                 restart_options: row.get(18)?,
                 copy_to_path: row.get(19)?,
                 resolved_version: row.get(20)?,
+                archived: row.get::<_, i32>(21)? != 0,
             })
         },
     );
@@ -760,7 +791,7 @@ pub fn get_running_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
                 j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                 j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                 j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                j.copy_to_path, j.resolved_version
+                j.copy_to_path, j.resolved_version, j.archived
          FROM jobs j LEFT JOIN users u ON j.user_id = u.id
          WHERE j.status = 'running'"
     ).map_err(|e| format!("Failed to prepare query: {}", e))?;
@@ -788,6 +819,7 @@ pub fn get_running_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
             restart_options: row.get(18)?,
             copy_to_path: row.get(19)?,
             resolved_version: row.get(20)?,
+            archived: row.get::<_, i32>(21)? != 0,
         })
     }).map_err(|e| format!("Failed to query running jobs: {}", e))?;
 
@@ -907,4 +939,28 @@ pub fn update_resolved_version(conn: &Connection, job_id: i64, version: &str) ->
         params![version, job_id],
     ).map_err(|e| format!("Failed to update resolved version: {}", e))?;
     Ok(())
+}
+
+/// Archive a single failed or cancelled job (hides it from the default job list).
+pub fn archive_job(conn: &Connection, job_id: i64) -> Result<(), String> {
+    let changes = conn.execute(
+        "UPDATE jobs SET archived = 1 WHERE id = ?1 AND status IN ('failed', 'cancelled', 'completed')",
+        params![job_id],
+    ).map_err(|e| format!("Failed to archive job: {}", e))?;
+
+    if changes == 0 {
+        Err(format!("Job {} not found or not in a terminal state", job_id))
+    } else {
+        Ok(())
+    }
+}
+
+/// Archive all failed jobs at once.
+pub fn archive_all_failed(conn: &Connection) -> Result<usize, String> {
+    let changes = conn.execute(
+        "UPDATE jobs SET archived = 1 WHERE status = 'failed' AND archived = 0",
+        [],
+    ).map_err(|e| format!("Failed to archive failed jobs: {}", e))?;
+
+    Ok(changes)
 }

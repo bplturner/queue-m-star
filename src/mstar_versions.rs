@@ -197,15 +197,17 @@ pub fn resolve_version<'a>(versions: &'a [MstarVersion], version_id: &str) -> Op
 ///   `mpirun -n 4 /opt/mstar/mstarcfd-X.Y.Z/bin/mstar-cfd-mgpu -i input.xml -o out --gpu-ids=4,5,6,7`
 ///
 /// `--unified-memory` enables CPU RAM spill and is independent of GPU count.
-/// `load_last` uses `--load-last` for checkpoint restart instead of `--force`.
+/// `checkpoint` controls restart behavior:
+///   - `None` → fresh run, uses `--force` to overwrite output
+///   - `Some(-1)` → restart from latest checkpoint (`--load-last`)
+///   - `Some(N)` → restart from specific checkpoint N (`-r out -l N`)
 pub fn build_mstar_command(
     version: &MstarVersion,
     input_file: &str,
     output_prefix: &str,
     gpu_ids: &[i32],
     unified_memory: bool,
-    force: bool,
-    load_last: bool,
+    checkpoint: Option<i64>,
 ) -> String {
     let gpu_ids_str: Vec<String> = gpu_ids.iter().map(|id| id.to_string()).collect();
     let gpu_count = gpu_ids.len();
@@ -214,10 +216,19 @@ pub fn build_mstar_command(
     if unified_memory {
         flags.push_str(" --unified-memory");
     }
-    if load_last {
-        flags.push_str(" --load-last");
-    } else if force {
-        flags.push_str(" --force");
+    match checkpoint {
+        Some(n) if n >= 0 => {
+            // Specific checkpoint: -r out -l N
+            flags.push_str(&format!(" -r {} -l {}", output_prefix, n));
+        }
+        Some(_) => {
+            // Negative or -1: load last checkpoint
+            flags.push_str(" --load-last");
+        }
+        None => {
+            // Fresh run
+            flags.push_str(" --force");
+        }
     }
 
     let binary = format!("\"{}\"", version.mgpu_binary.display());

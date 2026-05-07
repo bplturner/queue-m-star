@@ -258,6 +258,13 @@ pub fn api_routes(
         .and(with_state(state.clone()))
         .and_then(handle_gpu_history);
 
+    // System info route (CPU + memory)
+    let system_info = api.and(warp::path("system")).and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_system_info);
+
     // Version routes
     let versions_list = api.and(warp::path("versions")).and(warp::path::end())
         .and(warp::get())
@@ -326,6 +333,35 @@ pub fn api_routes(
         .and(warp::body::json())
         .and(with_state(state.clone()))
         .and_then(handle_restart_job);
+
+    // Job archive route (single job)
+    let jobs_archive = api.and(warp::path("jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("archive"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_archive_job);
+
+    // Archive all failed jobs (must come before parameterized routes)
+    let jobs_archive_failed = api.and(warp::path("jobs"))
+        .and(warp::path("archive-failed"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_archive_all_failed);
+
+    // Checkpoint listing route
+    let jobs_checkpoints = api.and(warp::path("jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("checkpoints"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_list_checkpoints);
 
     // Stats file listing route (dynamic discovery of out/Stats/*.txt)
     let jobs_stats_list = api.and(warp::path("jobs"))
@@ -405,6 +441,9 @@ pub fn api_routes(
         .or(jobs_get)
         .or(jobs_cancel)
         .or(jobs_restart)
+        .or(jobs_archive_failed)
+        .or(jobs_archive)
+        .or(jobs_checkpoints)
         .or(jobs_output)
         .or(jobs_progress)
         .or(jobs_stats_list)
@@ -423,6 +462,7 @@ pub fn api_routes(
         .or(users_delete)
         .or(browse_mkdir)
         .or(admin_install_version)
+        .or(system_info)
         .or(browse)
 }
 
@@ -531,8 +571,9 @@ async fn handle_list_jobs(
     }
     let status = params.get("status").map(|s| s.as_str());
     let limit = params.get("limit").and_then(|l| l.parse::<i64>().ok());
+    let include_archived = status == Some("archived");
     let db = state.db.lock().await;
-    match db::list_jobs(&db, status, limit) {
+    match db::list_jobs(&db, status, limit, include_archived) {
         Ok(jobs) => Ok(json_ok(&jobs)),
         Err(e) => Ok(json_error(&e, warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
     }
@@ -932,7 +973,7 @@ async fn handle_list_gpus(
 
     // Get running jobs to map GPUs → jobs
     let db = state.db.lock().await;
-    let running_jobs = db::list_jobs(&db, Some("running"), None).unwrap_or_default();
+    let running_jobs = db::list_jobs(&db, Some("running"), None, true).unwrap_or_default();
     drop(db);
 
     let mut gpu_responses: Vec<GpuStatusResponse> = Vec::new();
@@ -970,6 +1011,29 @@ async fn handle_list_gpus(
     }
 
     Ok(json_ok(&gpu_responses))
+}
+
+// ============================================================
+// System Info Handler (CPU + Memory)
+// ============================================================
+
+async fn handle_system_info(
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if let Err(e) = require_auth(&auth, &state).await {
+        return Ok(e);
+    }
+
+    // get_system_info() blocks for ~200ms (CPU delta sampling), so run it off the async runtime
+    let info = tokio::task::spawn_blocking(crate::get_system_info)
+        .await
+        .map_err(|_| warp::reject::reject())?;
+
+    match info {
+        Ok(sys) => Ok(json_ok(&sys)),
+        Err(e) => Ok(json_error(&format!("Failed to get system info: {}", e), warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+    }
 }
 
 // ============================================================
@@ -1560,6 +1624,9 @@ async fn handle_get_user_gpus(
 struct RestartRequest {
     #[serde(default)]
     restart_options: Option<serde_json::Value>,
+    /// Specific checkpoint number to restart from. If None, uses --load-last.
+    #[serde(default)]
+    checkpoint_number: Option<i64>,
 }
 
 async fn handle_restart_job(
@@ -1572,21 +1639,147 @@ async fn handle_restart_job(
         return Ok(e);
     }
 
-    let opts_str = body.restart_options
-        .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()));
+    // Build restart_options JSON that includes checkpoint_number if specified
+    let opts = {
+        let mut base = match &body.restart_options {
+            Some(v) => v.clone(),
+            None => serde_json::json!({}),
+        };
+        if let Some(cp) = body.checkpoint_number {
+            base["checkpoint_number"] = serde_json::json!(cp);
+        }
+        base
+    };
+
+    let opts_str = serde_json::to_string(&opts).unwrap_or_else(|_| "{}".to_string());
 
     let db = state.db.lock().await;
-    match db::create_restart_job(&db, job_id, opts_str.as_deref()) {
+    match db::create_restart_job(&db, job_id, Some(&opts_str)) {
         Ok(new_id) => {
-            println!("[API] Created restart job {} from failed job {}", new_id, job_id);
+            let cp_msg = match body.checkpoint_number {
+                Some(n) => format!(" from checkpoint {}", n),
+                None => " from latest checkpoint".to_string(),
+            };
+            println!("[API] Created restart job {} from failed job {}{}", new_id, job_id, cp_msg);
             Ok(json_ok(&serde_json::json!({
-                "message": format!("Restart job created (#{}) from job #{}", new_id, job_id),
+                "message": format!("Restart job created (#{}) from job #{}{}", new_id, job_id, cp_msg),
                 "new_job_id": new_id,
                 "original_job_id": job_id,
             })))
         }
         Err(e) => Ok(json_error(&e, warp::http::StatusCode::BAD_REQUEST)),
     }
+}
+
+// ============================================================
+// Job Archive Handlers
+// ============================================================
+
+async fn handle_archive_job(
+    job_id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if let Err(e) = require_auth(&auth, &state).await {
+        return Ok(e);
+    }
+
+    let db = state.db.lock().await;
+    match db::archive_job(&db, job_id) {
+        Ok(()) => {
+            println!("[API] Archived job {}", job_id);
+            Ok(json_ok(&serde_json::json!({ "message": format!("Job #{} archived", job_id) })))
+        }
+        Err(e) => Ok(json_error(&e, warp::http::StatusCode::BAD_REQUEST)),
+    }
+}
+
+async fn handle_archive_all_failed(
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if let Err(e) = require_auth(&auth, &state).await {
+        return Ok(e);
+    }
+
+    let db = state.db.lock().await;
+    match db::archive_all_failed(&db) {
+        Ok(count) => {
+            println!("[API] Archived {} failed jobs", count);
+            Ok(json_ok(&serde_json::json!({
+                "message": format!("{} failed job(s) archived", count),
+                "archived_count": count,
+            })))
+        }
+        Err(e) => Ok(json_error(&e, warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+    }
+}
+
+// ============================================================
+// Checkpoint Listing Handler
+// ============================================================
+
+async fn handle_list_checkpoints(
+    job_id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if let Err(e) = require_auth(&auth, &state).await {
+        return Ok(e);
+    }
+
+    let db = state.db.lock().await;
+    let job = match db::get_job(&db, job_id) {
+        Ok(j) => j,
+        Err(e) => return Ok(json_error(&e, warp::http::StatusCode::NOT_FOUND)),
+    };
+    drop(db);
+
+    let work_dir = match &job.working_directory {
+        Some(d) => d.clone(),
+        None => return Ok(json_ok(&serde_json::json!({ "checkpoints": [] }))),
+    };
+
+    let checkpoint_dir = std::path::Path::new(&work_dir).join("out").join("Checkpoint");
+    if !checkpoint_dir.exists() {
+        return Ok(json_ok(&serde_json::json!({ "checkpoints": [] })));
+    }
+
+    let mut checkpoints = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&checkpoint_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Checkpoint directories are typically numbered (e.g., "0", "1", "2", ...)
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Ok(num) = name.parse::<i64>() {
+                    let modified = path.metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .map(|t| {
+                            let datetime: chrono::DateTime<chrono::Utc> = t.into();
+                            datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                        })
+                        .unwrap_or_default();
+
+                    checkpoints.push(serde_json::json!({
+                        "number": num,
+                        "modified": modified,
+                        "is_dir": path.is_dir(),
+                    }));
+                }
+            }
+        }
+    }
+
+    // Sort by checkpoint number descending (most recent first)
+    checkpoints.sort_by(|a, b| {
+        let na = a["number"].as_i64().unwrap_or(0);
+        let nb = b["number"].as_i64().unwrap_or(0);
+        nb.cmp(&na)
+    });
+
+    Ok(json_ok(&serde_json::json!({ "checkpoints": checkpoints })))
 }
 
 // ============================================================

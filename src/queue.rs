@@ -126,7 +126,7 @@ pub async fn run_queue_manager(
             // Also check max concurrent jobs
             let running_count = {
                 let conn = db.lock().await;
-                db::list_jobs(&conn, Some("running"), None)
+                db::list_jobs(&conn, Some("running"), None, true)
                     .map(|jobs| jobs.len())
                     .unwrap_or(0)
             };
@@ -308,14 +308,25 @@ async fn launch_job(
 
     // Build the mstar command
     let gpu_ids: Vec<i32> = serde_json::from_str(&job.gpu_ids).unwrap_or_default();
+
+    // Determine checkpoint restart mode
+    let checkpoint: Option<i64> = if is_restart {
+        // Check if a specific checkpoint number was requested in restart_options
+        job.restart_options.as_ref()
+            .and_then(|opts| serde_json::from_str::<serde_json::Value>(opts).ok())
+            .and_then(|v| v.get("checkpoint_number").and_then(|n| n.as_i64()))
+            .or(Some(-1))  // Default to --load-last for restarts
+    } else {
+        None  // Fresh run — will use --force
+    };
+
     let command = build_mstar_command(
         &version,
         "input.xml",
         "out",
         &gpu_ids,
         job.unified_memory,
-        !is_restart, // --force for fresh starts only
-        is_restart,  // --load-last for restarts
+        checkpoint,
     );
 
     println!("[QUEUE] Command for job {}: {}", job.id, command);
@@ -351,7 +362,12 @@ async fn launch_job(
     }
 
     println!("[QUEUE] Job {} started with PID {} on GPUs {:?}{}", job.id, pid, gpu_ids,
-             if is_restart { " (RESTART with --load-last)" } else { "" });
+             if is_restart {
+                 match checkpoint {
+                     Some(n) if n >= 0 => format!(" (RESTART from checkpoint {})", n),
+                     _ => " (RESTART with --load-last)".to_string(),
+                 }
+             } else { String::new() });
 
     // Wait for process completion in a spawned task
     let db_clone = db.clone();

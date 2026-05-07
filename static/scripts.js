@@ -360,7 +360,13 @@
                         <h1>Jobs</h1>
                         <p>View and manage simulation jobs</p>
                     </div>
-                    <a href="#/submit" class="btn btn-primary">+ Submit Job</a>
+                    <div class="flex gap-2">
+                        <button class="btn btn-secondary btn-sm" id="archive-all-failed-btn" style="display:none" onclick="window.mstarApp.archiveAllFailed()">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="21 8 21 21 3 21 3 8"></polyline><rect x="1" y="3" width="22" height="5"></rect><line x1="10" y1="12" x2="14" y2="12"></line></svg>
+                            Archive All Failed
+                        </button>
+                        <a href="#/submit" class="btn btn-primary">+ Submit Job</a>
+                    </div>
                 </div>
                 <div class="flex gap-2 mb-4">
                     <button class="btn btn-secondary btn-sm job-filter active" data-filter="">All</button>
@@ -368,6 +374,7 @@
                     <button class="btn btn-secondary btn-sm job-filter" data-filter="queued">Queued</button>
                     <button class="btn btn-secondary btn-sm job-filter" data-filter="completed">Completed</button>
                     <button class="btn btn-secondary btn-sm job-filter" data-filter="failed">Failed</button>
+                    <button class="btn btn-secondary btn-sm job-filter" data-filter="archived">Archived</button>
                 </div>
                 <div class="card">
                     <div id="jobs-table"></div>
@@ -398,6 +405,12 @@
         const tableEl = document.getElementById('jobs-table');
         if (tableEl && Array.isArray(jobs)) {
             renderJobsTable(tableEl, jobs);
+        }
+        // Show/hide "Archive All Failed" button based on whether there are visible failed jobs
+        const archBtn = document.getElementById('archive-all-failed-btn');
+        if (archBtn && Array.isArray(jobs)) {
+            const hasFailed = jobs.some(j => j.status === 'failed');
+            archBtn.style.display = (hasFailed && filter !== 'archived') ? '' : 'none';
         }
     }
 
@@ -443,6 +456,9 @@
                                         ${job.status !== 'queued' ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.viewOutput(${job.id})">View</button>` : ''}
                                         ${(job.status === 'queued' || job.status === 'running') ? `<button class="btn btn-danger btn-sm" id="cancel-btn-${job.id}" onclick="window.mstarApp.cancelJob(${job.id})">Cancel</button>` : ''}
                                         ${(job.status === 'failed' || job.status === 'cancelled') ? `<button class="btn btn-primary btn-sm" id="restart-btn-${job.id}" onclick="window.mstarApp.restartJob(${job.id})">Restart</button>` : ''}
+                                        ${(job.status === 'failed' || job.status === 'cancelled' || job.status === 'completed') ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.archiveJob(${job.id})" title="Archive this job">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="21 8 21 21 3 21 3 8"></polyline><rect x="1" y="3" width="22" height="5"></rect><line x1="10" y1="12" x2="14" y2="12"></line></svg>
+                                        </button>` : ''}
                                     </div>
                                     ${job.error_message ? `<div class="text-sm" style="color:var(--accent-red);margin-top:4px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(job.error_message)}">${escapeHtml(job.error_message)}</div>` : ''}
                                 </td>
@@ -988,9 +1004,39 @@
         container.innerHTML = `
             <div class="page-enter">
                 <div class="page-header">
-                    <h1>GPU Monitor</h1>
-                    <p>Real-time GPU utilization, memory, power, and temperature</p>
+                    <h1>System Monitor</h1>
+                    <p>Real-time CPU, memory, and GPU utilization</p>
                 </div>
+                <div id="system-resources-panel" class="system-resources-panel">
+                    <div class="sys-card sys-cpu-card">
+                        <div class="sys-card-header">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue)" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="15" x2="23" y2="15"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="15" x2="4" y2="15"/></svg>
+                            <span class="sys-card-title">CPU</span>
+                            <span class="sys-card-value" id="sys-cpu-pct">—%</span>
+                        </div>
+                        <div class="progress-bar" style="height:6px;margin-bottom:10px;">
+                            <div class="progress-fill green" id="sys-cpu-bar" style="width:0%"></div>
+                        </div>
+                        <div id="sys-cpu-cores" class="sys-core-grid"></div>
+                        <div class="sys-meta" id="sys-load-avg">Load: —</div>
+                    </div>
+                    <div class="sys-card sys-mem-card">
+                        <div class="sys-card-header">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent-purple)" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="12" x2="6" y2="12.01"/><line x1="10" y1="12" x2="10" y2="12.01"/><line x1="14" y1="12" x2="14" y2="12.01"/><line x1="18" y1="12" x2="18" y2="12.01"/></svg>
+                            <span class="sys-card-title">Memory</span>
+                            <span class="sys-card-value" id="sys-mem-pct">—%</span>
+                        </div>
+                        <div class="progress-bar" style="height:6px;margin-bottom:10px;">
+                            <div class="progress-fill green" id="sys-mem-bar" style="width:0%"></div>
+                        </div>
+                        <div class="sys-mem-details">
+                            <div class="sys-mem-row"><span class="sys-mem-label">Used</span><span class="sys-mem-value" id="sys-mem-used">—</span></div>
+                            <div class="sys-mem-row"><span class="sys-mem-label">Available</span><span class="sys-mem-value" id="sys-mem-avail">—</span></div>
+                            <div class="sys-mem-row"><span class="sys-mem-label">Total</span><span class="sys-mem-value" id="sys-mem-total">—</span></div>
+                        </div>
+                    </div>
+                </div>
+                <div style="margin-bottom:8px;"><span style="font-size:13px;font-weight:600;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.05em;">GPUs</span></div>
                 <div id="gpu-grid" class="gpu-grid">
                     ${Array(4).fill('<div class="gpu-card"><div class="skeleton" style="height:200px"></div></div>').join('')}
                 </div>
@@ -1058,6 +1104,66 @@
         refreshGpuCards();
         const gpuTimer = setInterval(refreshGpuCards, 3000);
         state.refreshTimers.push(gpuTimer);
+
+        // System resources (CPU + Memory) refresh
+        function barColorClass(pct) {
+            return pct < 60 ? 'green' : (pct < 85 ? 'amber' : 'red');
+        }
+
+        async function refreshSystemInfo() {
+            const sys = await api.get('/system');
+            if (!sys || sys.error) return;
+
+            // CPU overall
+            const cpuPct = sys.cpu_percent || 0;
+            const cpuEl = document.getElementById('sys-cpu-pct');
+            const cpuBar = document.getElementById('sys-cpu-bar');
+            if (cpuEl) cpuEl.textContent = `${cpuPct.toFixed(0)}%`;
+            if (cpuBar) {
+                cpuBar.style.width = `${cpuPct}%`;
+                cpuBar.className = `progress-fill ${barColorClass(cpuPct)}`;
+            }
+
+            // Per-core mini grid
+            const coresEl = document.getElementById('sys-cpu-cores');
+            if (coresEl && Array.isArray(sys.cpu_per_core)) {
+                coresEl.innerHTML = sys.cpu_per_core.map((pct, i) => {
+                    const c = barColorClass(pct);
+                    const color = c === 'green' ? 'var(--accent-green)' : c === 'amber' ? 'var(--accent-amber)' : 'var(--accent-red)';
+                    return `<div class="sys-core" title="Core ${i}: ${pct.toFixed(0)}%">
+                        <div class="sys-core-bar" style="height:${Math.max(2, pct)}%;background:${color}"></div>
+                        <span class="sys-core-id">${i}</span>
+                    </div>`;
+                }).join('');
+            }
+
+            // Load avg
+            const loadEl = document.getElementById('sys-load-avg');
+            if (loadEl && Array.isArray(sys.load_avg)) {
+                loadEl.textContent = `Load: ${sys.load_avg[0].toFixed(2)}  ${sys.load_avg[1].toFixed(2)}  ${sys.load_avg[2].toFixed(2)}  ·  ${sys.cpu_cores} cores`;
+            }
+
+            // Memory
+            const memPct = sys.memory_percent || 0;
+            const memPctEl = document.getElementById('sys-mem-pct');
+            const memBar = document.getElementById('sys-mem-bar');
+            if (memPctEl) memPctEl.textContent = `${memPct.toFixed(0)}%`;
+            if (memBar) {
+                memBar.style.width = `${memPct}%`;
+                memBar.className = `progress-fill ${barColorClass(memPct)}`;
+            }
+
+            const formatMB = (mb) => mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`;
+            const usedEl = document.getElementById('sys-mem-used');
+            const availEl = document.getElementById('sys-mem-avail');
+            const totalEl = document.getElementById('sys-mem-total');
+            if (usedEl) usedEl.textContent = formatMB(sys.memory_used_mb);
+            if (availEl) availEl.textContent = formatMB(sys.memory_available_mb);
+            if (totalEl) totalEl.textContent = formatMB(sys.memory_total_mb);
+        }
+        refreshSystemInfo();
+        const sysTimer = setInterval(refreshSystemInfo, 3000);
+        state.refreshTimers.push(sysTimer);
 
         // Historical chart
         loadGpuHistory(gpuHistoryMinutes, gpuActiveMetrics);
@@ -2761,19 +2867,134 @@
     // ============================================================
     // Expose global methods for inline onclick handlers
     // ============================================================
-    async function restartJob(jobId) {
-        inlineConfirm(`restart-btn-${jobId}`, 'Restart with checkpoint?', async () => {
-            const result = await api.post(`/jobs/${jobId}/restart`, {});
+    async function archiveJob(jobId) {
+        const result = await api.post(`/jobs/${jobId}/archive`, {});
+        if (result && !result.error) {
+            toast('Job archived', 'success');
+            navigate('jobs');
+        } else {
+            toast(result?.error || 'Archive failed', 'error');
+        }
+    }
+
+    async function archiveAllFailed() {
+        inlineConfirm('archive-all-failed-btn', 'Archive all failed jobs?', async () => {
+            const result = await api.post('/jobs/archive-failed', {});
             if (result && !result.error) {
-                toast(`Restart queued: Job #${result.new_job_id}`, 'success');
+                toast(`${result.archived_count || 0} job(s) archived`, 'success');
                 navigate('jobs');
             } else {
-                toast(result?.error || 'Restart failed', 'error');
+                toast(result?.error || 'Archive failed', 'error');
             }
         });
     }
 
-    window.mstarApp = Object.assign(window.mstarApp || {}, { viewOutput, cancelJob, deleteUser, editUser, popOutPanel, restartJob });
+    async function restartJob(jobId) {
+        state.refreshPaused = true;
+        try {
+            // Fetch available checkpoints
+            const cpResult = await api.get(`/jobs/${jobId}/checkpoints`);
+            const checkpoints = (cpResult && cpResult.checkpoints) ? cpResult.checkpoints : [];
+
+            // Build modal content
+            let modalBody = '';
+            if (checkpoints.length === 0) {
+                modalBody = `
+                    <div style="padding:8px 0;color:var(--text-secondary);">
+                        <p style="margin:0 0 8px 0;">No checkpoint files found in <code>out/Checkpoint/</code>.</p>
+                        <p style="margin:0;">The job will restart from scratch with <code>--force</code>.</p>
+                    </div>
+                `;
+            } else {
+                modalBody = `
+                    <p style="margin:0 0 12px 0;color:var(--text-secondary);">Select a checkpoint to restart from:</p>
+                    <div class="checkpoint-list">
+                        <label class="checkpoint-option">
+                            <input type="radio" name="checkpoint-select" value="latest" checked>
+                            <span class="checkpoint-label">
+                                <strong>Use Latest</strong>
+                                <span class="text-muted text-sm">(--load-last)</span>
+                            </span>
+                        </label>
+                        ${checkpoints.map(cp => `
+                            <label class="checkpoint-option">
+                                <input type="radio" name="checkpoint-select" value="${cp.number}">
+                                <span class="checkpoint-label">
+                                    <strong>Checkpoint ${cp.number}</strong>
+                                    <span class="text-muted text-sm">${cp.modified || ''}</span>
+                                </span>
+                            </label>
+                        `).join('')}
+                    </div>
+                `;
+            }
+
+            // Show modal
+            const modal = document.createElement('div');
+            modal.className = 'modal-overlay';
+            modal.id = 'checkpoint-modal';
+            modal.innerHTML = `
+                <div class="modal-content" style="max-width:480px;">
+                    <div class="modal-header">
+                        <h3 style="margin:0;">Restart Job #${jobId}</h3>
+                        <button class="modal-close" id="cp-modal-close">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        ${modalBody}
+                    </div>
+                    <div class="modal-footer flex justify-end gap-2">
+                        <button class="btn btn-secondary" id="cp-cancel-btn">Cancel</button>
+                        <button class="btn btn-primary" id="cp-restart-btn">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg>
+                            Restart
+                        </button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+
+            // Animate in
+            requestAnimationFrame(() => modal.classList.add('active'));
+
+            // Wire up buttons
+            const closeModal = () => {
+                modal.classList.remove('active');
+                setTimeout(() => modal.remove(), 200);
+                state.refreshPaused = false;
+            };
+
+            modal.querySelector('#cp-modal-close').addEventListener('click', closeModal);
+            modal.querySelector('#cp-cancel-btn').addEventListener('click', closeModal);
+            modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+
+            modal.querySelector('#cp-restart-btn').addEventListener('click', async () => {
+                const selected = modal.querySelector('input[name="checkpoint-select"]:checked');
+                let checkpoint_number = null;
+                if (selected && selected.value !== 'latest') {
+                    checkpoint_number = parseInt(selected.value, 10);
+                }
+
+                const payload = {};
+                if (checkpoint_number !== null) {
+                    payload.checkpoint_number = checkpoint_number;
+                }
+
+                const result = await api.post(`/jobs/${jobId}/restart`, payload);
+                closeModal();
+                if (result && !result.error) {
+                    toast(`Restart queued: Job #${result.new_job_id}`, 'success');
+                    navigate('jobs');
+                } else {
+                    toast(result?.error || 'Restart failed', 'error');
+                }
+            });
+        } catch (err) {
+            state.refreshPaused = false;
+            toast('Failed to fetch checkpoints', 'error');
+        }
+    }
+
+    window.mstarApp = Object.assign(window.mstarApp || {}, { viewOutput, cancelJob, deleteUser, editUser, popOutPanel, restartJob, archiveJob, archiveAllFailed });
 
     // ============================================================
     // Modal close handlers

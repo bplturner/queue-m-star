@@ -7,6 +7,7 @@
 # Usage:
 #   ./deploy.sh              Build and deploy
 #   ./deploy.sh --skip-build Deploy without rebuilding (use existing binary)
+#   ./deploy.sh --static-only Deploy only static files (CSS/JS/HTML) — no restart
 # =============================================================================
 
 set -euo pipefail
@@ -17,11 +18,13 @@ SERVICE_NAME="mstar_queue.service"
 INSTALL_DIR="/opt/mstar_queue"
 
 SKIP_BUILD=false
+STATIC_ONLY=false
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=true ;;
+        --static-only) STATIC_ONLY=true ;;
         --help|-h)
-            head -n 10 "$0" | tail -n +3 | sed 's/^# \?//'
+            head -n 11 "$0" | tail -n +3 | sed 's/^# \?//'
             exit 0
             ;;
     esac
@@ -32,6 +35,19 @@ echo "======================================================"
 echo "  M-Star Queue — Deploy"
 echo "======================================================"
 echo ""
+
+# --- Static-only fast path ---------------------------------------------------
+if $STATIC_ONLY; then
+    echo "[static] Deploying static files only (no restart)..."
+    sudo cp -r "${SCRIPT_DIR}/static/"* "${INSTALL_DIR}/static/"
+    sudo chown -R mstar_user:mstar_user "${INSTALL_DIR}/static/"
+    echo "      ✓ static/ files updated"
+    echo ""
+    echo "======================================================"
+    echo "  ✓ Static deploy complete! Just refresh your browser."
+    echo "======================================================"
+    exit 0
+fi
 
 # --- Build -------------------------------------------------------------------
 if ! $SKIP_BUILD; then
