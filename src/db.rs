@@ -81,6 +81,11 @@ pub struct Job {
     pub restart_options: Option<String>,  // JSON for future input.xml modifications
     pub copy_to_path: Option<String>,     // Optional path to copy results on completion
     pub archived: bool,                    // Whether this job is archived (hidden from default views)
+    pub job_type: String,                  // "simulation" or "render"
+    pub source_job_id: Option<i64>,        // For render jobs: ID of the simulation job being rendered
+    pub sweep_group_id: Option<String>,    // Groups cases from same parameter sweep batch
+    pub sweep_case_name: Option<String>,   // Case name within sweep (e.g. "LX_75")
+    pub sweep_config: Option<String>,      // JSON: {gpus_per_case, max_concurrent, sweep_name, ...}
 }
 
 /// Represents an active session
@@ -109,6 +114,18 @@ pub fn generate_token() -> String {
 /// Initialize the database connection and create tables
 pub fn init_db(db_path: &Path) -> SqliteResult<DbHandle> {
     let conn = Connection::open(db_path)?;
+
+    // Harden file permissions: 640 (owner rw, group r, others none)
+    // Prevents other system users from reading session tokens and password hashes
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(db_path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o640);
+            let _ = std::fs::set_permissions(db_path, perms);
+        }
+    }
 
     // Enable WAL mode for better concurrent read performance
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -202,6 +219,165 @@ pub fn init_db(db_path: &Path) -> SqliteResult<DbHandle> {
     let _ = conn.execute_batch(
         "ALTER TABLE jobs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;"
     );
+
+    // Migration: add job_type column — distinguishes simulation jobs from render jobs
+    let _ = conn.execute_batch(
+        "ALTER TABLE jobs ADD COLUMN job_type TEXT NOT NULL DEFAULT 'simulation';"
+    );
+
+    // Migration: add source_job_id — for render jobs, links back to the simulation job
+    let _ = conn.execute_batch(
+        "ALTER TABLE jobs ADD COLUMN source_job_id INTEGER REFERENCES jobs(id);"
+    );
+
+    // ============================================================
+    // AI Training tables (Phase 8)
+    // ============================================================
+
+    // AI Datasets — sweep → manifest mapping
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ai_datasets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            sweep_root TEXT NOT NULL,
+            sweep_metadata_path TEXT,
+            dataset_mode TEXT NOT NULL DEFAULT 'time_averaged_2d',
+            manifest_path TEXT,
+            cache_path TEXT,
+            artifact_root TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            warnings_json TEXT,
+            config_json TEXT,
+            detected_versions TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_datasets_user ON ai_datasets(user_id);
+        CREATE INDEX IF NOT EXISTS idx_ai_datasets_status ON ai_datasets(status);"
+    );
+
+    // AI Dataset Cases — per-case metadata within a dataset
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ai_dataset_cases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset_id INTEGER NOT NULL,
+            case_name TEXT NOT NULL,
+            case_directory TEXT NOT NULL,
+            parameters_json TEXT,
+            output_files_json TEXT,
+            status TEXT NOT NULL DEFAULT 'included',
+            exclusion_reason TEXT,
+            grid_metadata_json TEXT,
+            detected_variables_json TEXT,
+            timesteps_json TEXT,
+            FOREIGN KEY (dataset_id) REFERENCES ai_datasets(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_dataset_cases_dataset ON ai_dataset_cases(dataset_id);"
+    );
+
+    // AI Training Jobs — separate from simulation jobs
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ai_training_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            run_name TEXT NOT NULL,
+            model_family TEXT NOT NULL,
+            config_path TEXT,
+            manifest_path TEXT,
+            artifact_directory TEXT,
+            checkpoint_directory TEXT,
+            log_path TEXT,
+            metrics_path TEXT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            pid INTEGER,
+            gpu_ids TEXT NOT NULL DEFAULT '[]',
+            priority INTEGER NOT NULL DEFAULT 0,
+            submitted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            started_at TEXT,
+            completed_at TEXT,
+            exit_code INTEGER,
+            failure_reason TEXT,
+            resume_from_checkpoint TEXT,
+            config_json TEXT,
+            FOREIGN KEY (dataset_id) REFERENCES ai_datasets(id),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_training_status ON ai_training_jobs(status);
+        CREATE INDEX IF NOT EXISTS idx_ai_training_user ON ai_training_jobs(user_id);
+        CREATE INDEX IF NOT EXISTS idx_ai_training_dataset ON ai_training_jobs(dataset_id);"
+    );
+
+    // AI GPU Reservations — coordinated with simulation reservations
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ai_gpu_reservations (
+            gpu_id INTEGER NOT NULL,
+            training_job_id INTEGER NOT NULL,
+            reserved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (gpu_id, training_job_id),
+            FOREIGN KEY (training_job_id) REFERENCES ai_training_jobs(id) ON DELETE CASCADE
+        );"
+    );
+
+    // ============================================================
+    // Migration: Sweep batch support (Phase 9)
+    // ============================================================
+
+    // sweep_group_id: groups related cases from a parameter sweep (UUID)
+    let _ = conn.execute_batch(
+        "ALTER TABLE jobs ADD COLUMN sweep_group_id TEXT;"
+    );
+    // sweep_case_name: the case name within the sweep (e.g. "LX_75", "RPM_60")
+    let _ = conn.execute_batch(
+        "ALTER TABLE jobs ADD COLUMN sweep_case_name TEXT;"
+    );
+    // sweep_config: JSON blob storing sweep-level settings (gpus_per_case, max_concurrent, etc.)
+    let _ = conn.execute_batch(
+        "ALTER TABLE jobs ADD COLUMN sweep_config TEXT;"
+    );
+    let _ = conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_sweep_group ON jobs(sweep_group_id);"
+    );
+
+    // ============================================================
+    // Dataset inventory migration (Phase 9 — pure data inventory)
+    // ============================================================
+    // Add new inventory columns to ai_datasets
+    let _ = conn.execute_batch(
+        "ALTER TABLE ai_datasets ADD COLUMN stats_inventory_json TEXT;"
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE ai_datasets ADD COLUMN pvd_inventory_json TEXT;"
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE ai_datasets ADD COLUMN num_cases INTEGER NOT NULL DEFAULT 0;"
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE ai_datasets ADD COLUMN num_cases_with_output INTEGER NOT NULL DEFAULT 0;"
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE ai_datasets ADD COLUMN sweep_parameters_json TEXT;"
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE ai_datasets ADD COLUMN cases_json TEXT;"
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE ai_datasets ADD COLUMN source_msb TEXT;"
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE ai_datasets ADD COLUMN sweep_group_id TEXT;"
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE ai_datasets ADD COLUMN scan_completed_at TEXT;"
+    );
+
+    // Housekeeping: purge expired sessions on startup
+    match conn.execute("DELETE FROM sessions WHERE expires_at < datetime('now')", []) {
+        Ok(n) if n > 0 => println!("[DB] Cleaned up {} expired sessions", n),
+        _ => {}
+    }
 
     Ok(Arc::new(Mutex::new(conn)))
 }
@@ -500,7 +676,9 @@ pub fn list_jobs(conn: &Connection, status_filter: Option<&str>, limit: Option<i
                         j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                         j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                         j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                        j.copy_to_path, j.resolved_version, j.archived
+                        j.copy_to_path, j.resolved_version, j.archived,
+                        j.job_type, j.source_job_id,
+                        j.sweep_group_id, j.sweep_case_name, j.sweep_config
                  FROM jobs j LEFT JOIN users u ON j.user_id = u.id
                  WHERE j.archived = 1
                  ORDER BY j.submitted_at DESC
@@ -514,7 +692,9 @@ pub fn list_jobs(conn: &Connection, status_filter: Option<&str>, limit: Option<i
                         j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                         j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                         j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                        j.copy_to_path, j.resolved_version, j.archived
+                        j.copy_to_path, j.resolved_version, j.archived,
+                        j.job_type, j.source_job_id,
+                        j.sweep_group_id, j.sweep_case_name, j.sweep_config
                  FROM jobs j LEFT JOIN users u ON j.user_id = u.id
                  WHERE j.status = ?1{}
                  ORDER BY j.priority DESC, j.submitted_at ASC
@@ -529,7 +709,9 @@ pub fn list_jobs(conn: &Connection, status_filter: Option<&str>, limit: Option<i
                     j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                     j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                     j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                    j.copy_to_path, j.resolved_version, j.archived
+                    j.copy_to_path, j.resolved_version, j.archived,
+                    j.job_type, j.source_job_id,
+                    j.sweep_group_id, j.sweep_case_name, j.sweep_config
              FROM jobs j LEFT JOIN users u ON j.user_id = u.id
              {}
              ORDER BY j.submitted_at DESC
@@ -567,6 +749,11 @@ pub fn list_jobs(conn: &Connection, status_filter: Option<&str>, limit: Option<i
             copy_to_path: row.get(19)?,
             resolved_version: row.get(20)?,
             archived: row.get::<_, i32>(21)? != 0,
+                job_type: row.get::<_, String>(22).unwrap_or_else(|_| "simulation".to_string()),
+                source_job_id: row.get(23)?,
+                sweep_group_id: row.get(24)?,
+                sweep_case_name: row.get(25)?,
+                sweep_config: row.get(26)?,
         })
     }).map_err(|e| format!("Failed to query jobs: {}", e))?
     .filter_map(|r| r.ok())
@@ -582,7 +769,9 @@ pub fn get_job(conn: &Connection, job_id: i64) -> Result<Job, String> {
                 j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                 j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                 j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                j.copy_to_path, j.resolved_version, j.archived
+                j.copy_to_path, j.resolved_version, j.archived,
+                j.job_type, j.source_job_id,
+                j.sweep_group_id, j.sweep_case_name, j.sweep_config
          FROM jobs j LEFT JOIN users u ON j.user_id = u.id
          WHERE j.id = ?1",
         params![job_id],
@@ -610,6 +799,11 @@ pub fn get_job(conn: &Connection, job_id: i64) -> Result<Job, String> {
                 copy_to_path: row.get(19)?,
                 resolved_version: row.get(20)?,
                 archived: row.get::<_, i32>(21)? != 0,
+                job_type: row.get::<_, String>(22).unwrap_or_else(|_| "simulation".to_string()),
+                source_job_id: row.get(23)?,
+                sweep_group_id: row.get(24)?,
+                sweep_case_name: row.get(25)?,
+                sweep_config: row.get(26)?,
             })
         },
     ).map_err(|_| format!("Job {} not found", job_id))
@@ -626,7 +820,7 @@ pub fn start_job(
     let changes = conn.execute(
         "UPDATE jobs SET status = 'running', pid = ?2, started_at = datetime('now'),
          working_directory = ?3, output_file = ?4
-         WHERE id = ?1 AND status = 'queued'",
+         WHERE id = ?1 AND status IN ('queued', 'launching')",
         params![job_id, pid as i64, working_directory, output_file],
     ).map_err(|e| format!("Failed to start job: {}", e))?;
 
@@ -668,7 +862,7 @@ pub fn fail_job(conn: &Connection, job_id: i64, error: &str) -> Result<(), Strin
     conn.execute(
         "UPDATE jobs SET status = 'failed', completed_at = datetime('now'), pid = NULL,
          error_message = ?2
-         WHERE id = ?1 AND (status = 'running' OR status = 'queued')",
+         WHERE id = ?1 AND status IN ('running', 'queued', 'launching')",
         params![job_id, error],
     ).map_err(|e| format!("Failed to mark job as failed: {}", e))?;
 
@@ -685,14 +879,14 @@ pub fn fail_job(conn: &Connection, job_id: i64, error: &str) -> Result<(), Strin
 pub fn cancel_job(conn: &Connection, job_id: i64) -> Result<Option<i64>, String> {
     // Get PID before cancelling (needed to kill the process)
     let pid: Option<i64> = conn.query_row(
-        "SELECT pid FROM jobs WHERE id = ?1 AND (status = 'queued' OR status = 'running')",
+        "SELECT pid FROM jobs WHERE id = ?1 AND status IN ('queued', 'launching', 'running')",
         params![job_id],
         |row| row.get(0),
     ).map_err(|_| format!("Job {} not found or already finished", job_id))?;
 
     conn.execute(
         "UPDATE jobs SET status = 'cancelled', completed_at = datetime('now'), pid = NULL
-         WHERE id = ?1 AND (status = 'queued' OR status = 'running')",
+         WHERE id = ?1 AND status IN ('queued', 'launching', 'running')",
         params![job_id],
     ).map_err(|e| format!("Failed to cancel job: {}", e))?;
 
@@ -712,7 +906,9 @@ pub fn get_next_queued_job(conn: &Connection) -> Result<Option<Job>, String> {
                 j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                 j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                 j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                j.copy_to_path, j.resolved_version, j.archived
+                j.copy_to_path, j.resolved_version, j.archived,
+                j.job_type, j.source_job_id,
+                j.sweep_group_id, j.sweep_case_name, j.sweep_config
          FROM jobs j LEFT JOIN users u ON j.user_id = u.id
          WHERE j.status = 'queued'
          ORDER BY j.priority DESC, j.submitted_at ASC
@@ -742,6 +938,11 @@ pub fn get_next_queued_job(conn: &Connection) -> Result<Option<Job>, String> {
                 copy_to_path: row.get(19)?,
                 resolved_version: row.get(20)?,
                 archived: row.get::<_, i32>(21)? != 0,
+                job_type: row.get::<_, String>(22).unwrap_or_else(|_| "simulation".to_string()),
+                source_job_id: row.get(23)?,
+                sweep_group_id: row.get(24)?,
+                sweep_case_name: row.get(25)?,
+                sweep_config: row.get(26)?,
             })
         },
     );
@@ -755,8 +956,12 @@ pub fn get_next_queued_job(conn: &Connection) -> Result<Option<Job>, String> {
 
 /// Get all currently reserved GPU IDs
 pub fn get_reserved_gpus(conn: &Connection) -> Result<Vec<i32>, String> {
+    // IMPORTANT: Query BOTH simulation and AI training GPU reservations
+    // to prevent scheduling conflicts between the two subsystems.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT gpu_id FROM gpu_reservations"
+        "SELECT DISTINCT gpu_id FROM gpu_reservations
+         UNION
+         SELECT DISTINCT gpu_id FROM ai_gpu_reservations"
     ).map_err(|e| format!("Failed to query GPU reservations: {}", e))?;
 
     let gpus = stmt.query_map([], |row| {
@@ -773,7 +978,7 @@ pub fn recover_stale_jobs(conn: &Connection) -> Result<usize, String> {
     let changes = conn.execute(
         "UPDATE jobs SET status = 'failed', completed_at = datetime('now'), pid = NULL,
          error_message = 'Daemon restarted while job was running'
-         WHERE status = 'running'",
+         WHERE status IN ('running', 'launching')",
         [],
     ).map_err(|e| format!("Failed to recover stale jobs: {}", e))?;
 
@@ -791,9 +996,11 @@ pub fn get_running_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
                 j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
                 j.submitted_at, j.started_at, j.completed_at, j.working_directory,
                 j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
-                j.copy_to_path, j.resolved_version, j.archived
+                j.copy_to_path, j.resolved_version, j.archived,
+                j.job_type, j.source_job_id,
+                j.sweep_group_id, j.sweep_case_name, j.sweep_config
          FROM jobs j LEFT JOIN users u ON j.user_id = u.id
-         WHERE j.status = 'running'"
+         WHERE j.status IN ('running', 'launching')"
     ).map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let jobs = stmt.query_map([], |row| {
@@ -820,6 +1027,11 @@ pub fn get_running_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
             copy_to_path: row.get(19)?,
             resolved_version: row.get(20)?,
             archived: row.get::<_, i32>(21)? != 0,
+                job_type: row.get::<_, String>(22).unwrap_or_else(|_| "simulation".to_string()),
+                source_job_id: row.get(23)?,
+                sweep_group_id: row.get(24)?,
+                sweep_case_name: row.get(25)?,
+                sweep_config: row.get(26)?,
         })
     }).map_err(|e| format!("Failed to query running jobs: {}", e))?;
 
@@ -885,22 +1097,42 @@ pub fn get_job_counts(conn: &Connection) -> Result<std::collections::HashMap<Str
     Ok(counts)
 }
 
-/// Ensure a default admin user exists (for first-time setup)
+/// Ensure a default admin user exists (for first-time setup).
+/// SECURITY: generates a random password instead of using a hardcoded default.
 pub fn ensure_default_admin(conn: &Connection) -> Result<(), String> {
     if !has_admin(conn)? {
-        create_user(conn, "admin", "admin@localhost", "admin", "admin")?;
-        println!("[SETUP] Created default admin user (username: admin, password: admin)");
-        println!("[SETUP] !! CHANGE THE DEFAULT PASSWORD IMMEDIATELY !!");
+        // Generate a cryptographically secure random password
+        use rand::Rng;
+        let password: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+        create_user(conn, "admin", "admin@localhost", &password, "admin")?;
+        println!("==========================================================");
+        println!("[SETUP] Created default admin user");
+        println!("[SETUP]   Username: admin");
+        println!("[SETUP]   Password: {}", password);
+        println!("[SETUP]");
+        println!("[SETUP]   !! SAVE THIS PASSWORD — IT WILL NOT BE SHOWN AGAIN !!");
+        println!("[SETUP]   Change it after first login via the Settings page.");
+        println!("==========================================================");
     }
     Ok(())
 }
 
 /// Create a restart job from a failed job.
 /// The new job reuses the same working directory and config but uses --load-last on launch.
+/// Optional override parameters allow the user to change version, GPUs, priority, etc.
 pub fn create_restart_job(
     conn: &Connection,
     original_job_id: i64,
     restart_options: Option<&str>,
+    gpu_ids_override: Option<&str>,
+    version_override: Option<&str>,
+    priority_override: Option<i32>,
+    unified_memory_override: Option<bool>,
+    copy_to_override: Option<&str>,
 ) -> Result<i64, String> {
     // Fetch the original job
     let orig = get_job(conn, original_job_id)?;
@@ -911,20 +1143,29 @@ pub fn create_restart_job(
 
     let restart_opts_val = restart_options.unwrap_or("{}");
 
+    // Use overrides when provided, otherwise fall back to original job values
+    let gpu_ids = gpu_ids_override.unwrap_or(&orig.gpu_ids);
+    let mstar_version = version_override
+        .unwrap_or_else(|| orig.resolved_version.as_deref().unwrap_or(&orig.mstar_version));
+    let priority = priority_override.unwrap_or(orig.priority);
+    let unified_memory = unified_memory_override.unwrap_or(orig.unified_memory);
+    let copy_to = copy_to_override.or(orig.copy_to_path.as_deref());
+
     conn.execute(
         "INSERT INTO jobs (user_id, name, msb_filename, mstar_version, gpu_ids, unified_memory,
-                           status, priority, restart_from_job_id, restart_options)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9)",
+                           status, priority, restart_from_job_id, restart_options, copy_to_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10)",
         params![
             orig.user_id,
             format!("{} (restart)", orig.name),
             orig.msb_filename,
-            orig.resolved_version.as_deref().unwrap_or(&orig.mstar_version),
-            orig.gpu_ids,
-            orig.unified_memory as i32,
-            orig.priority,
+            mstar_version,
+            gpu_ids,
+            unified_memory as i32,
+            priority,
             original_job_id,
             restart_opts_val,
+            copy_to,
         ],
     ).map_err(|e| format!("Failed to create restart job: {}", e))?;
 
@@ -964,3 +1205,151 @@ pub fn archive_all_failed(conn: &Connection) -> Result<usize, String> {
 
     Ok(changes)
 }
+
+/// Create a render job — uses an existing simulation job's output or a direct
+/// filesystem path as input for ParaView-based video rendering.
+///
+/// `source_job_id` is `Some(id)` when rendering from a queue job, or `None`
+/// when rendering from a direct path (e.g. Browse Server).  The `source_label`
+/// is a display string stored in msb_filename (e.g. the MSB name or directory).
+pub fn create_render_job(
+    conn: &Connection,
+    user_id: i64,
+    name: &str,
+    source_job_id: Option<i64>,
+    source_label: &str,
+    mstar_version: &str,
+    gpu_ids: &str,
+    render_options_json: &str,
+) -> Result<i64, String> {
+    // If a source job ID was provided, verify it exists and has a working directory
+    if let Some(job_id) = source_job_id {
+        let source = get_job(conn, job_id)?;
+        if source.working_directory.is_none() {
+            return Err(format!("Source job {} has no working directory", job_id));
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO jobs (user_id, name, msb_filename, mstar_version, gpu_ids, unified_memory,
+         priority, job_type, source_job_id, restart_options)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 'render', ?6, ?7)",
+        params![
+            user_id,
+            name,
+            source_label,
+            mstar_version,
+            gpu_ids,
+            source_job_id,
+            render_options_json,
+        ],
+    ).map_err(|e| format!("Failed to create render job: {}", e))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+/// Create a simulation job that is part of a parameter sweep batch.
+///
+/// Each case gets its own job but they share a `sweep_group_id` for grouped
+/// monitoring and concurrency control.  The `sweep_config` JSON contains
+/// the per-sweep settings (gpus_per_case, max_concurrent, sweep_name, etc.).
+pub fn create_sweep_job(
+    conn: &Connection,
+    user_id: i64,
+    name: &str,
+    msb_filename: &str,
+    mstar_version: &str,
+    gpu_ids: &str,
+    unified_memory: bool,
+    priority: i32,
+    copy_to_path: Option<&str>,
+    sweep_group_id: &str,
+    sweep_case_name: &str,
+    sweep_config: &str,
+) -> Result<i64, String> {
+    conn.execute(
+        "INSERT INTO jobs (user_id, name, msb_filename, mstar_version, gpu_ids, unified_memory,
+         priority, copy_to_path, sweep_group_id, sweep_case_name, sweep_config)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            user_id, name, msb_filename, mstar_version, gpu_ids,
+            unified_memory as i32, priority, copy_to_path,
+            sweep_group_id, sweep_case_name, sweep_config,
+        ],
+    ).map_err(|e| format!("Failed to create sweep job: {}", e))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+/// Count how many jobs in a sweep group are currently active (queued, launching, or running).
+pub fn count_active_sweep_jobs(conn: &Connection, sweep_group_id: &str) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE sweep_group_id = ?1 AND status IN ('running', 'launching')",
+        params![sweep_group_id],
+        |row| row.get(0),
+    ).map_err(|e| format!("Failed to count active sweep jobs: {}", e))
+}
+
+/// List all jobs in a sweep group.
+pub fn list_sweep_jobs(conn: &Connection, sweep_group_id: &str) -> Result<Vec<Job>, String> {
+    let query = "SELECT j.id, j.user_id, COALESCE(u.username, 'unknown') as username, j.name, j.msb_filename,
+                j.mstar_version, j.gpu_ids, j.unified_memory, j.status, j.priority, j.pid,
+                j.submitted_at, j.started_at, j.completed_at, j.working_directory,
+                j.output_file, j.error_message, j.restart_from_job_id, j.restart_options,
+                j.copy_to_path, j.resolved_version, j.archived,
+                j.job_type, j.source_job_id,
+                j.sweep_group_id, j.sweep_case_name, j.sweep_config
+         FROM jobs j LEFT JOIN users u ON j.user_id = u.id
+         WHERE j.sweep_group_id = ?1
+         ORDER BY j.submitted_at ASC";
+
+    let mut stmt = conn.prepare(query)
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let jobs = stmt.query_map(params![sweep_group_id], |row| {
+        Ok(Job {
+            id: row.get(0)?,
+            user_id: row.get(1)?,
+            username: row.get(2)?,
+            name: row.get(3)?,
+            msb_filename: row.get(4)?,
+            mstar_version: row.get(5)?,
+            gpu_ids: row.get(6)?,
+            unified_memory: row.get::<_, i32>(7)? != 0,
+            status: row.get(8)?,
+            priority: row.get(9)?,
+            pid: row.get(10)?,
+            submitted_at: row.get(11)?,
+            started_at: row.get(12)?,
+            completed_at: row.get(13)?,
+            working_directory: row.get(14)?,
+            output_file: row.get(15)?,
+            error_message: row.get(16)?,
+            restart_from_job_id: row.get(17)?,
+            restart_options: row.get(18)?,
+            copy_to_path: row.get(19)?,
+            resolved_version: row.get(20)?,
+            archived: row.get::<_, i32>(21)? != 0,
+            job_type: row.get::<_, String>(22).unwrap_or_else(|_| "simulation".to_string()),
+            source_job_id: row.get(23)?,
+            sweep_group_id: row.get(24)?,
+            sweep_case_name: row.get(25)?,
+            sweep_config: row.get(26)?,
+        })
+    }).map_err(|e| format!("Failed to query jobs: {}", e))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    Ok(jobs)
+}
+
+/// Cancel all pending jobs in a sweep group (those still queued).
+pub fn cancel_sweep_group(conn: &Connection, sweep_group_id: &str) -> Result<usize, String> {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "UPDATE jobs SET status = 'cancelled', completed_at = ?1
+         WHERE sweep_group_id = ?2 AND status IN ('queued')",
+        params![now, sweep_group_id],
+    ).map_err(|e| format!("Failed to cancel sweep group: {}", e))
+}
+

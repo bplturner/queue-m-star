@@ -95,8 +95,29 @@ echo "[5/6] Installing static files..."
 sudo cp -r "${SCRIPT_DIR}/static/"* "${INSTALL_DIR}/static/"
 sudo cp "${SCRIPT_DIR}/unpack_msb.py" "${INSTALL_DIR}/unpack_msb.py"
 sudo chmod +x "${INSTALL_DIR}/unpack_msb.py"
+if [ -f "${SCRIPT_DIR}/render_job.py" ]; then
+    sudo cp "${SCRIPT_DIR}/render_job.py" "${INSTALL_DIR}/render_job.py"
+    sudo chmod +x "${INSTALL_DIR}/render_job.py"
+    echo "      ✓ render_job.py"
+fi
+if [ -f "${SCRIPT_DIR}/sweep_inspector.py" ]; then
+    sudo cp "${SCRIPT_DIR}/sweep_inspector.py" "${INSTALL_DIR}/sweep_inspector.py"
+    sudo chmod +x "${INSTALL_DIR}/sweep_inspector.py"
+    echo "      ✓ sweep_inspector.py"
+fi
+if [ -f "${SCRIPT_DIR}/dataset_scanner.py" ]; then
+    sudo cp "${SCRIPT_DIR}/dataset_scanner.py" "${INSTALL_DIR}/dataset_scanner.py"
+    sudo chmod +x "${INSTALL_DIR}/dataset_scanner.py"
+    echo "      ✓ dataset_scanner.py"
+fi
+# AI Training Python package
+if [ -d "${SCRIPT_DIR}/python/ai_training" ]; then
+    sudo mkdir -p "${INSTALL_DIR}/python/ai_training"
+    sudo cp -r "${SCRIPT_DIR}/python/ai_training/"* "${INSTALL_DIR}/python/ai_training/"
+    echo "      ✓ python/ai_training/"
+fi
 sudo chown -R mstar_user:mstar_user "${INSTALL_DIR}"
-echo "      ✓ static/ and unpack_msb.py"
+echo "      ✓ static/ and scripts"
 
 # --- Start -------------------------------------------------------------------
 echo "[6/6] Starting service..."

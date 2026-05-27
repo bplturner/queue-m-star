@@ -19,6 +19,7 @@ pub mod queue;
 pub mod web_server;
 pub mod gpu_info;
 pub mod mstar_versions;
+pub mod ai_training;
 
 use crate::config::Config;
 use crate::db::DbHandle;
@@ -299,6 +300,7 @@ async fn handle_full_job_submit(
 
     // Extract params
     let msb_source_path = params.get("msb_source_path").cloned();
+    let msb_url = params.get("msb_url").cloned();
     let filename = if let Some(ref src) = msb_source_path {
         // Remote file: extract filename from the server path
         std::path::Path::new(src)
@@ -306,10 +308,17 @@ async fn handle_full_job_submit(
             .and_then(|n| n.to_str())
             .unwrap_or("remote.msb")
             .to_string()
+    } else if let Some(ref url) = msb_url {
+        // URL: extract filename from URL path
+        url.split('/').last()
+            .and_then(|s| s.split('?').next())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("remote.msb")
+            .to_string()
     } else {
         params.get("filename").cloned().unwrap_or_else(|| "upload.msb".to_string())
     };
-    let name = params.get("name").cloned().unwrap_or_else(|| {
+    let name = params.get("name").filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| {
         filename.trim_end_matches(".msb").trim_end_matches(".MSB").to_string()
     });
     let version = params.get("version").cloned().unwrap_or_else(|| "latest".to_string());
@@ -366,44 +375,272 @@ async fn handle_full_job_submit(
         }
     }
 
-    // Create job in DB
-    let job_id = match db::create_job(&db, user.id, &name, &filename, &version, &gpu_ids_str, unified_memory, priority, copy_to.as_deref()) {
-        Ok(id) => id,
-        Err(e) => return Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"error": e})),
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-        )),
-    };
+    // ----------------------------------------------------------------
+    // PHASE 1: Download/prepare MSB file into a temp staging directory
+    // We do this BEFORE creating the job in DB to avoid a race condition
+    // where the queue picks up the job before the file is ready.
+    // ----------------------------------------------------------------
     drop(db); // Release lock before file I/O
-
-    // Create job directory
-    let job_dir = state.config.paths.jobs_directory.join(format!("job_{}", job_id));
-    if let Err(e) = tokio::fs::create_dir_all(&job_dir).await {
+    let staging_dir = state.config.paths.jobs_directory.join("_staging_temp");
+    let _ = tokio::fs::create_dir_all(&staging_dir).await;
+    let staging_id = format!("{}_{}", chrono::Utc::now().timestamp_millis(), user.id);
+    let staging_subdir = staging_dir.join(&staging_id);
+    if let Err(e) = tokio::fs::create_dir_all(&staging_subdir).await {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"error": format!("Failed to create directory: {}", e)})),
+            warp::reply::json(&serde_json::json!({"error": format!("Failed to create staging dir: {}", e)})),
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
         ));
     }
 
-    // Get MSB file into job directory
-    let msb_path = job_dir.join(&filename);
+    // Track the final filename (may be updated by Content-Disposition)
+    let mut final_filename = filename.clone();
+    let mut final_name = name.clone();
+
     if let Some(ref src) = msb_source_path {
-        // Copy from server filesystem
-        if let Err(e) = tokio::fs::copy(src, &msb_path).await {
+        let dest = staging_subdir.join(&final_filename);
+        if let Err(e) = tokio::fs::copy(src, &dest).await {
+            let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
             return Ok(warp::reply::with_status(
                 warp::reply::json(&serde_json::json!({"error": format!("Failed to copy MSB from server: {}", e)})),
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             ));
         }
-        println!("[SUBMIT] Job {} using server file: {}", job_id, src);
+        println!("[SUBMIT] Using server file: {}", src);
+    } else if let Some(ref url) = msb_url {
+        println!("[SUBMIT] Downloading MSB from URL: {}", url);
+
+        let parsed_url = match url::Url::parse(url) {
+            Ok(u) => u,
+            Err(_) => {
+                let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({"error": "Invalid URL format"})),
+                    warp::http::StatusCode::BAD_REQUEST,
+                ));
+            }
+        };
+
+        match parsed_url.scheme() {
+            "http" | "https" => {},
+            other => {
+                let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({"error": format!("Unsupported URL scheme '{}'. Only http and https are allowed.", other)})),
+                    warp::http::StatusCode::BAD_REQUEST,
+                ));
+            }
+        }
+
+        let host = match parsed_url.host_str() {
+            Some(h) => h.to_string(),
+            None => {
+                let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({"error": "URL has no host"})),
+                    warp::http::StatusCode::BAD_REQUEST,
+                ));
+            }
+        };
+        let port = parsed_url.port().unwrap_or(if parsed_url.scheme() == "https" { 443 } else { 80 });
+        let lookup_addr = format!("{}:{}", host, port);
+        match tokio::net::lookup_host(&lookup_addr).await {
+            Ok(addrs) => {
+                for addr in addrs {
+                    let ip = addr.ip();
+                    if ip.is_loopback() || is_private_ip(&ip) || is_link_local_ip(&ip) {
+                        let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                        return Ok(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error": "URL must not resolve to a private or loopback address"})),
+                            warp::http::StatusCode::BAD_REQUEST,
+                        ));
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({"error": "Failed to resolve URL host"})),
+                    warp::http::StatusCode::BAD_REQUEST,
+                ));
+            }
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let max_download_size = (state.config.file_handling.max_file_size_mb as u64) * 1024 * 1024;
+
+        match client.get(url.as_str()).send().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                    return Ok(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"error": format!("URL returned HTTP {}", resp.status())})),
+                        warp::http::StatusCode::BAD_REQUEST,
+                    ));
+                }
+
+                // Extract filename from Content-Disposition header
+                let cd_filename = resp.headers()
+                    .get("content-disposition")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|cd| {
+                        cd.split(';')
+                            .map(str::trim)
+                            .find(|part| part.to_lowercase().starts_with("filename="))
+                            .map(|part| {
+                                part.splitn(2, '=').nth(1).unwrap_or("")
+                                    .trim_matches('"').trim_matches('\'')
+                                    .to_string()
+                            })
+                            .filter(|f| !f.is_empty())
+                    });
+
+                let url_path = parsed_url.path().to_lowercase();
+                let cd_has_msb = cd_filename.as_ref()
+                    .map(|f| f.to_lowercase().ends_with(".msb"))
+                    .unwrap_or(false);
+
+                if !cd_has_msb && !url_path.ends_with(".msb") {
+                    let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                    return Ok(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"error": "URL must serve an .msb file (checked URL path and Content-Disposition header)"})),
+                        warp::http::StatusCode::BAD_REQUEST,
+                    ));
+                }
+
+                // Use Content-Disposition filename if available
+                if cd_has_msb {
+                    let cd_name = cd_filename.as_ref().unwrap();
+                    final_filename = cd_name.clone();
+                    let real_name = cd_name.trim_end_matches(".msb").trim_end_matches(".MSB");
+                    // Only override name if it was auto-derived (not user-specified)
+                    if final_name == name {
+                        final_name = real_name.to_string();
+                    }
+                    println!("[SUBMIT] Filename from Content-Disposition: {}", cd_name);
+                }
+
+                if let Some(cl) = resp.content_length() {
+                    if cl > max_download_size {
+                        let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                        return Ok(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error": format!("Remote file too large ({} MB). Max is {} MB.", cl / (1024*1024), state.config.file_handling.max_file_size_mb)})),
+                            warp::http::StatusCode::BAD_REQUEST,
+                        ));
+                    }
+                }
+
+                match resp.bytes().await {
+                    Ok(data) => {
+                        if data.len() as u64 > max_download_size {
+                            let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                            return Ok(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({"error": format!("Downloaded file too large ({} MB). Max is {} MB.", data.len() / (1024*1024), state.config.file_handling.max_file_size_mb)})),
+                                warp::http::StatusCode::BAD_REQUEST,
+                            ));
+                        }
+                        if data.is_empty() {
+                            let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                            return Ok(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({"error": "Downloaded file is empty (0 bytes)"})),
+                                warp::http::StatusCode::BAD_REQUEST,
+                            ));
+                        }
+                        let dest = staging_subdir.join(&final_filename);
+                        if let Err(e) = tokio::fs::write(&dest, &data).await {
+                            let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                            return Ok(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({"error": format!("Failed to write downloaded file: {}", e)})),
+                                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            ));
+                        }
+                        println!("[SUBMIT] Downloaded {} bytes from URL", data.len());
+                    }
+                    Err(e) => {
+                        let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                        return Ok(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error": format!("Failed to read URL response: {}", e)})),
+                            warp::http::StatusCode::BAD_REQUEST,
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({"error": format!("Failed to fetch URL: {}", e)})),
+                    warp::http::StatusCode::BAD_REQUEST,
+                ));
+            }
+        }
     } else {
         // Write uploaded file data
-        if let Err(e) = tokio::fs::write(&msb_path, &file_data).await {
+        let dest = staging_subdir.join(&final_filename);
+        if let Err(e) = tokio::fs::write(&dest, &file_data).await {
+            let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
             return Ok(warp::reply::with_status(
                 warp::reply::json(&serde_json::json!({"error": format!("Failed to write file: {}", e)})),
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             ));
         }
+    }
+
+    // Validate the staged file exists and is non-empty
+    let staged_msb = staging_subdir.join(&final_filename);
+    match tokio::fs::metadata(&staged_msb).await {
+        Ok(meta) if meta.len() == 0 => {
+            let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "MSB file is empty (0 bytes). The upload or download may have failed."})),
+                warp::http::StatusCode::BAD_REQUEST,
+            ));
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "No MSB file was written. The upload or download may have failed."})),
+                warp::http::StatusCode::BAD_REQUEST,
+            ));
+        }
+        _ => {}
+    }
+
+    // ----------------------------------------------------------------
+    // PHASE 2: File is ready — create the job in DB and move files
+    // ----------------------------------------------------------------
+    let job_id = {
+        let db = state.db.lock().await;
+        match db::create_job(&db, user.id, &final_name, &final_filename, &version, &gpu_ids_str, unified_memory, priority, copy_to.as_deref()) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({"error": e})),
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ));
+            }
+        }
+    };
+
+    // Move staging dir to final job dir
+    let job_dir = state.config.paths.jobs_directory.join(format!("job_{}", job_id));
+    if let Err(_) = tokio::fs::rename(&staging_subdir, &job_dir).await {
+        // Fallback: copy + remove if rename fails (cross-device)
+        let _ = tokio::fs::create_dir_all(&job_dir).await;
+        let src_file = staging_subdir.join(&final_filename);
+        let dst_file = job_dir.join(&final_filename);
+        if let Err(e) = tokio::fs::copy(&src_file, &dst_file).await {
+            let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": format!("Failed to move MSB to job dir: {}", e)})),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ));
+        }
+        let _ = tokio::fs::remove_dir_all(&staging_subdir).await;
     }
 
     // Update working directory in DB
@@ -416,13 +653,13 @@ async fn handle_full_job_submit(
     }
 
     println!("[SUBMIT] Job {} created by {} ({}): version={}, gpus={}, unified_memory={}, copy_to={:?}",
-        job_id, user.username, filename, version, gpu_ids_str, unified_memory, copy_to);
+        job_id, user.username, final_filename, version, gpu_ids_str, unified_memory, copy_to);
 
     Ok(warp::reply::with_status(
         warp::reply::json(&serde_json::json!({
             "message": "Job submitted successfully",
             "job_id": job_id,
-            "name": name,
+            "name": final_name,
             "version": version,
             "gpu_ids": gpu_ids_str,
             "unified_memory": unified_memory,
@@ -431,6 +668,8 @@ async fn handle_full_job_submit(
         warp::http::StatusCode::OK,
     ))
 }
+
+
 
 // ============================================================
 // Utilities
@@ -441,6 +680,44 @@ fn is_msb_file(path: &Path) -> bool {
         .and_then(OsStr::to_str)
         .map(|ext| ext.eq_ignore_ascii_case("msb"))
         .unwrap_or(false)
+}
+
+/// SECURITY: Check if an IP address is in a private range (RFC 1918 / RFC 4193)
+fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 10.0.0.0/8
+            octets[0] == 10
+            // 172.16.0.0/12
+            || (octets[0] == 172 && (octets[1] & 0xf0) == 16)
+            // 192.168.0.0/16
+            || (octets[0] == 192 && octets[1] == 168)
+            // 169.254.169.254 — cloud metadata endpoint
+            || (octets[0] == 169 && octets[1] == 254 && octets[2] == 169 && octets[3] == 254)
+        }
+        std::net::IpAddr::V6(v6) => {
+            // fc00::/7 (Unique Local Addresses)
+            let segments = v6.segments();
+            (segments[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// SECURITY: Check if an IP address is link-local
+fn is_link_local_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 169.254.0.0/16
+            octets[0] == 169 && octets[1] == 254
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            // fe80::/10
+            (segments[0] & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 pub fn get_gpu_info() -> Result<Vec<GpuInfo>, Box<dyn std::error::Error + Send + Sync>> {

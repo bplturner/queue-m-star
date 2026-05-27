@@ -98,6 +98,18 @@
             const isAdmin = state.user.role === 'admin';
             if (adminNav) adminNav.style.display = isAdmin ? 'flex' : 'none';
             if (settingsNav) settingsNav.style.display = isAdmin ? 'flex' : 'none';
+
+            // Show AI Training nav if enabled (check config async)
+            const trainingNav = document.getElementById('nav-training');
+            if (trainingNav) {
+                api.get('/ai/config').then(cfg => {
+                    if (cfg && cfg.enabled) {
+                        trainingNav.style.display = 'flex';
+                    } else {
+                        trainingNav.style.display = 'none';
+                    }
+                }).catch(() => { trainingNav.style.display = 'none'; });
+            }
         } else {
             userInfo.style.display = 'none';
             if (adminNav) adminNav.style.display = 'none';
@@ -126,6 +138,8 @@
         dashboard: renderDashboard,
         submit: renderSubmit,
         jobs: renderJobs,
+        render: renderRender,
+        training: typeof renderTraining !== 'undefined' ? renderTraining : renderDashboard,
         gpus: renderGpus,
         admin: renderAdmin,
         settings: renderSettings,
@@ -141,7 +155,13 @@
         state.refreshTimers = [];
 
         const hash = window.location.hash.replace('#/', '') || 'dashboard';
-        const route = hash.split('/')[0];
+        // Parse route and query params from hash (e.g. "submit?restart_from=5")
+        const [routeAndPath, queryString] = hash.split('?');
+        const route = routeAndPath.split('/')[0];
+        const routeParams = {};
+        if (queryString) {
+            new URLSearchParams(queryString).forEach((v, k) => { routeParams[k] = v; });
+        }
 
         if (!isLoggedIn() && route !== 'login' && route !== 'register') {
             document.body.classList.add('auth-mode');
@@ -168,8 +188,10 @@
 
         const renderFn = routes[route] || renderDashboard;
         const main = document.getElementById('main-content');
+        // Run any page-specific cleanup (e.g., AI training auto-poll timer)
+        if (main._aiTrainingCleanup) { main._aiTrainingCleanup(); delete main._aiTrainingCleanup; }
         main.innerHTML = '';
-        renderFn(main);
+        renderFn(main, routeParams);
     }
 
     window.addEventListener('hashchange', handleRoute);
@@ -426,6 +448,97 @@
             return;
         }
 
+        // Group jobs by sweep_group_id for badge rendering
+        const sweepGroups = {};
+        jobs.forEach(job => {
+            if (job.sweep_group_id) {
+                if (!sweepGroups[job.sweep_group_id]) {
+                    sweepGroups[job.sweep_group_id] = { jobs: [], allComplete: true, name: '' };
+                }
+                sweepGroups[job.sweep_group_id].jobs.push(job);
+                if (job.status !== 'completed') sweepGroups[job.sweep_group_id].allComplete = false;
+                // Extract sweep name from config
+                try {
+                    const cfg = JSON.parse(job.sweep_config || '{}');
+                    if (cfg.sweep_name) sweepGroups[job.sweep_group_id].name = cfg.sweep_name;
+                } catch (_) {}
+            }
+        });
+
+        let tableRows = '';
+        const renderedGroups = new Set();
+
+        jobs.forEach((job, idx) => {
+            let sweepBadge = '';
+            if (job.sweep_group_id) {
+                // Parse sweep_config to get total cases and sweep name
+                let sweepLabel = 'sweep';
+                try {
+                    const cfg = JSON.parse(job.sweep_config || '{}');
+                    const total = cfg.total_cases || '?';
+                    // Count which case # this is in the group
+                    const groupJobs = jobs.filter(j => j.sweep_group_id === job.sweep_group_id);
+                    const caseIdx = groupJobs.findIndex(j => j.id === job.id) + 1;
+                    sweepLabel = `${caseIdx}/${total}`;
+                } catch(e) {}
+                sweepBadge = ` <span class="badge" style="background:rgba(139,92,246,0.15);color:var(--accent-purple,#8b5cf6);font-size:10px;padding:2px 6px;border-radius:4px;cursor:pointer;" data-sweep-group="${escapeHtml(job.sweep_group_id)}" title="Sweep group ${escapeHtml(job.sweep_group_id)} — click to filter">sweep ${sweepLabel}</span>`;
+            }
+            const renderBadge = job.job_type === 'render' ? ' <span class="badge badge-render">render</span>' : '';
+
+            tableRows += `
+                <tr>
+                    <td class="text-mono">#${job.id}</td>
+                    <td>${escapeHtml(job.name)}${renderBadge}${sweepBadge}</td>
+                    <td>${escapeHtml(job.username)}</td>
+                    <td class="text-mono text-sm">${job.resolved_version || job.mstar_version}</td>
+                    <td class="text-mono text-sm">${formatGpuIds(job.gpu_ids)}</td>
+                    <td>${statusBadge(job.status)}</td>
+                    <td class="text-sm text-muted">${formatTime(job.submitted_at)}</td>
+                    <td>
+                        <div class="flex gap-2">
+                            ${(job.status !== 'queued' || job.job_type === 'render') ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.viewOutput(${job.id})">View</button>` : ''}
+                            ${(job.status === 'queued' || job.status === 'running' || job.status === 'launching') ? `<button class="btn btn-danger btn-sm" id="cancel-btn-${job.id}" onclick="window.mstarApp.cancelJob(${job.id})">Cancel</button>` : ''}
+                            ${(job.status === 'failed' || job.status === 'cancelled') && job.job_type !== 'render' ? `<button class="btn btn-primary btn-sm" id="restart-btn-${job.id}" onclick="window.mstarApp.restartJob(${job.id})">Restart</button>` : ''}
+                            ${(job.status === 'failed' || job.status === 'cancelled' || job.status === 'completed') ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.archiveJob(${job.id})" title="Archive this job">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="21 8 21 21 3 21 3 8"></polyline><rect x="1" y="3" width="22" height="5"></rect><line x1="10" y1="12" x2="14" y2="12"></line></svg>
+                            </button>` : ''}
+                        </div>
+                        ${job.error_message ? `<div class="text-sm" style="color:var(--accent-red);margin-top:4px;max-width:350px;word-wrap:break-word;white-space:normal;line-height:1.3;" title="${escapeHtml(job.error_message)}">${escapeHtml(job.error_message)}</div>` : ''}
+                    </td>
+                </tr>
+            `;
+
+            // Track which group this job belongs to for the summary row below
+            if (job.sweep_group_id) {
+                renderedGroups.add(job.sweep_group_id);
+            }
+        });
+
+        // After all job rows, append "Create Dataset" rows for fully-completed sweep groups
+        renderedGroups.forEach(groupId => {
+            const group = sweepGroups[groupId];
+            if (group && group.allComplete && group.jobs.length > 1) {
+                // Escape name for safe inclusion in JS string context (onclick)
+                const safeName = (group.name || 'Sweep Dataset').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+                tableRows += `
+                    <tr style="background:rgba(139,92,246,0.04);">
+                        <td colspan="8" style="padding:8px 16px;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;">
+                                <span style="font-size:12px;color:var(--text-muted);">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path></svg>
+                                    Sweep "${escapeHtml(group.name || 'Unnamed')}" — ${group.jobs.length} cases completed
+                                </span>
+                                <button class="btn btn-sm" style="padding:4px 12px;font-size:11px;background:linear-gradient(135deg,rgba(139,92,246,0.15),rgba(59,130,246,0.15));border:1px solid rgba(139,92,246,0.3);color:var(--accent-blue);"
+                                    onclick="window.mstarApp.createDatasetFromSweep('${escapeHtml(groupId)}', '${safeName}')">
+                                    🧠 Create Training Dataset
+                                </button>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }
+        });
+
         container.innerHTML = `
             <div class="table-container">
                 <table class="data-table">
@@ -442,28 +555,7 @@
                         </tr>
                     </thead>
                     <tbody>
-                        ${jobs.map(job => `
-                            <tr>
-                                <td class="text-mono">#${job.id}</td>
-                                <td>${escapeHtml(job.name)}</td>
-                                <td>${escapeHtml(job.username)}</td>
-                                <td class="text-mono text-sm">${job.resolved_version || job.mstar_version}</td>
-                                <td class="text-mono text-sm">${formatGpuIds(job.gpu_ids)}</td>
-                                <td>${statusBadge(job.status)}</td>
-                                <td class="text-sm text-muted">${formatTime(job.submitted_at)}</td>
-                                <td>
-                                    <div class="flex gap-2">
-                                        ${job.status !== 'queued' ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.viewOutput(${job.id})">View</button>` : ''}
-                                        ${(job.status === 'queued' || job.status === 'running') ? `<button class="btn btn-danger btn-sm" id="cancel-btn-${job.id}" onclick="window.mstarApp.cancelJob(${job.id})">Cancel</button>` : ''}
-                                        ${(job.status === 'failed' || job.status === 'cancelled') ? `<button class="btn btn-primary btn-sm" id="restart-btn-${job.id}" onclick="window.mstarApp.restartJob(${job.id})">Restart</button>` : ''}
-                                        ${(job.status === 'failed' || job.status === 'cancelled' || job.status === 'completed') ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.archiveJob(${job.id})" title="Archive this job">
-                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="21 8 21 21 3 21 3 8"></polyline><rect x="1" y="3" width="22" height="5"></rect><line x1="10" y1="12" x2="14" y2="12"></line></svg>
-                                        </button>` : ''}
-                                    </div>
-                                    ${job.error_message ? `<div class="text-sm" style="color:var(--accent-red);margin-top:4px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(job.error_message)}">${escapeHtml(job.error_message)}</div>` : ''}
-                                </td>
-                            </tr>
-                        `).join('')}
+                        ${tableRows}
                     </tbody>
                 </table>
             </div>
@@ -473,20 +565,58 @@
     // ============================================================
     // Render: Submit Job
     // ============================================================
-    async function renderSubmit(container) {
+    async function renderSubmit(container, routeParams) {
+        routeParams = routeParams || {};
+        const restartFromId = routeParams.restart_from ? parseInt(routeParams.restart_from, 10) : null;
+        const isRestart = !!restartFromId;
+
+        // Fetch original job details for restart mode
+        let originalJob = null;
+        let checkpoints = [];
+        if (isRestart) {
+            const [jobData, cpData] = await Promise.all([
+                api.get(`/jobs/${restartFromId}`),
+                api.get(`/jobs/${restartFromId}/checkpoints`),
+            ]);
+            if (!jobData || jobData.error) {
+                toast(jobData?.error || 'Failed to load original job', 'error');
+                navigate('jobs');
+                return;
+            }
+            originalJob = jobData;
+            checkpoints = (cpData && cpData.checkpoints) ? cpData.checkpoints : [];
+        }
+
         container.innerHTML = `
             <div class="page-enter">
                 <div class="page-header">
-                    <h1>Submit Job</h1>
-                    <p>Select an MSB file and configure simulation parameters</p>
+                    <h1>${isRestart ? `Restart Job #${restartFromId}` : 'Submit Job'}</h1>
+                    <p>${isRestart ? 'Modify parameters and re-submit this simulation' : 'Select an MSB file and configure simulation parameters'}</p>
                 </div>
+                ${isRestart ? `
+                <div class="restart-banner" id="restart-banner">
+                    <div class="restart-banner-icon">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg>
+                    </div>
+                    <div class="restart-banner-content">
+                        <div class="restart-banner-title">Restarting from Job #${restartFromId}: ${escapeHtml(originalJob.name)}</div>
+                        ${originalJob.error_message ? `<div class="restart-banner-error">${escapeHtml(originalJob.error_message)}</div>` : ''}
+                        <div class="restart-banner-meta">
+                            Status: <span class="badge badge-${originalJob.status}">${originalJob.status}</span>
+                            &nbsp;·&nbsp; Version: <code>${originalJob.resolved_version || originalJob.mstar_version}</code>
+                            &nbsp;·&nbsp; GPUs: <code>${formatGpuIds(originalJob.gpu_ids)}</code>
+                        </div>
+                    </div>
+                </div>
+                ` : ''}
                 <div class="submit-layout">
                     <div>
                         <div class="card" style="margin-bottom:16px;">
                             <div class="card-header"><span class="card-title">MSB File</span></div>
                             <div style="display:flex;gap:0;margin-bottom:12px;">
                                 <button class="btn btn-sm msb-tab active" id="tab-browse" style="flex:1;border-radius:8px 0 0 8px;justify-content:center;">Browse Server</button>
-                                <button class="btn btn-sm msb-tab" id="tab-upload" style="flex:1;border-radius:0 8px 8px 0;justify-content:center;">Upload File</button>
+                                <button class="btn btn-sm msb-tab" id="tab-upload" style="flex:1;border-radius:0;justify-content:center;">Upload File</button>
+                                <button class="btn btn-sm msb-tab" id="tab-url" style="flex:1;border-radius:0 8px 8px 0;justify-content:center;">From URL</button>
                             </div>
                             <div id="msb-browse-panel">
                                 <div id="browse-path-bar" style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12px;color:var(--text-secondary);overflow-x:auto;white-space:nowrap;"></div>
@@ -502,7 +632,32 @@
                                 </div>
                                 <input type="file" id="file-input" accept=".msb,.MSB" style="display:none">
                             </div>
+                            <div id="msb-url-panel" style="display:none;">
+                                <div style="display:flex;flex-direction:column;gap:10px;">
+                                    <div style="display:flex;align-items:center;gap:10px;padding:16px;border:1px solid var(--border);border-radius:8px;background:rgba(99,115,156,0.04);">
+                                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+                                        <input type="text" class="form-input" id="msb-url-input" placeholder="https://example.com/path/to/simulation.msb" style="flex:1;margin:0;">
+                                    </div>
+                                    <button class="btn btn-primary btn-sm" id="msb-url-fetch-btn" style="align-self:flex-end;padding:8px 20px;gap:6px;">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                                        Fetch MSB
+                                    </button>
+                                    <div class="dropzone-hint">Paste a direct link to an .msb file. The server will download it.</div>
+                                </div>
+                            </div>
                             <div id="file-info-container"></div>
+                            <div id="sweep-detect-container" style="display:none;margin-top:8px;">
+                                <div id="sweep-detect-status" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-muted);padding:4px 0;"></div>
+                            </div>
+                        </div>
+
+                        <!-- Sweep Results Panel (hidden by default, shown after detection) -->
+                        <div id="sweep-panel" class="card" style="display:none;margin-bottom:16px;">
+                            <div class="card-header">
+                                <span class="card-title">Parameter Sweeps</span>
+                                <button class="btn btn-sm" id="sweep-close-btn" style="padding:4px 8px;font-size:12px;" title="Close sweep mode">✕</button>
+                            </div>
+                            <div id="sweep-content"></div>
                         </div>
 
                         <div class="card">
@@ -552,10 +707,65 @@
                                 <div class="skeleton" style="height:60px"></div>
                                 <div class="skeleton" style="height:60px"></div>
                             </div>
+                            <div id="sweep-gpu-allocation" style="display:none;padding:12px 16px;border-top:1px solid var(--border);">
+                                <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                                    <div style="display:flex;align-items:center;gap:6px;">
+                                        <label style="font-size:12px;font-weight:600;color:var(--text-secondary);white-space:nowrap;">GPUs per case:</label>
+                                        <div id="sweep-gpus-per-case-pills" style="display:flex;gap:4px;"></div>
+                                    </div>
+                                    <div style="width:1px;height:20px;background:var(--border);"></div>
+                                    <div style="display:flex;align-items:center;gap:6px;">
+                                        <label style="font-size:12px;font-weight:600;color:var(--text-secondary);white-space:nowrap;">Simultaneous:</label>
+                                        <div id="sweep-concurrent-pills" style="display:flex;gap:4px;"></div>
+                                    </div>
+                                </div>
+                                <div id="sweep-alloc-preview" style="margin-top:8px;font-size:12px;color:var(--text-muted);line-height:1.5;"></div>
+                            </div>
                         </div>
 
+                        ${isRestart ? `
+                        <div class="card" style="margin-bottom:16px;" id="checkpoint-card">
+                            <div class="card-header"><span class="card-title">Checkpoint</span></div>
+                            <div id="checkpoint-selector" class="checkpoint-list">
+                                ${checkpoints.length > 0 ? `
+                                <label class="checkpoint-option">
+                                    <input type="radio" name="checkpoint-select" value="latest" checked>
+                                    <span class="checkpoint-label">
+                                        <strong>Use Latest Checkpoint</strong>
+                                        <span class="text-muted text-sm">(--load-last)</span>
+                                    </span>
+                                </label>
+                                ${checkpoints.map(cp => `
+                                    <label class="checkpoint-option">
+                                        <input type="radio" name="checkpoint-select" value="${cp.number}">
+                                        <span class="checkpoint-label">
+                                            <strong>Checkpoint ${cp.number}</strong>
+                                            <span class="text-muted text-sm">${cp.modified || ''}</span>
+                                        </span>
+                                    </label>
+                                `).join('')}
+                                <label class="checkpoint-option">
+                                    <input type="radio" name="checkpoint-select" value="fresh">
+                                    <span class="checkpoint-label">
+                                        <strong>Fresh Start</strong>
+                                        <span class="text-muted text-sm">(--force, ignore checkpoints)</span>
+                                    </span>
+                                </label>
+                                ` : `
+                                <label class="checkpoint-option">
+                                    <input type="radio" name="checkpoint-select" value="fresh" checked>
+                                    <span class="checkpoint-label">
+                                        <strong>Fresh Start</strong>
+                                        <span class="text-muted text-sm">(--force, no checkpoints found)</span>
+                                    </span>
+                                </label>
+                                `}
+                            </div>
+                        </div>
+                        ` : ''}
+
                         <button class="btn btn-primary" id="submit-btn" style="width:100%;justify-content:center;padding:14px;font-size:15px;" disabled>
-                            Submit Job
+                            ${isRestart ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg> Restart Job` : 'Submit Job'}
                         </button>
                     </div>
                 </div>
@@ -565,21 +775,36 @@
         let selectedFile = null;
         let selectedServerPath = null;
         let selectedGpus = new Set();
+        let restartMsbLocked = false;
+
+        // Sweep mode state
+        let sweepMode = false;
+        let detectedSweeps = null;
+        let selectedSweepIndex = 0;
+        let selectedCases = new Set();
+        let gpusPerCase = 1;
+        let maxConcurrent = 1;
+        let sweepDetectTimer = null;
+        let sweepDetectRequestId = 0; // For stale request tracking
 
         // --- Tab switching ---
         const tabBrowse = document.getElementById('tab-browse');
         const tabUpload = document.getElementById('tab-upload');
+        const tabUrl = document.getElementById('tab-url');
         const browsePanel = document.getElementById('msb-browse-panel');
         const uploadPanel = document.getElementById('msb-upload-panel');
+        const urlPanel = document.getElementById('msb-url-panel');
 
-        tabBrowse.addEventListener('click', () => {
-            tabBrowse.classList.add('active'); tabUpload.classList.remove('active');
-            browsePanel.style.display = ''; uploadPanel.style.display = 'none';
-        });
-        tabUpload.addEventListener('click', () => {
-            tabUpload.classList.add('active'); tabBrowse.classList.remove('active');
-            uploadPanel.style.display = ''; browsePanel.style.display = 'none';
-        });
+        function activateTab(activeTab) {
+            [tabBrowse, tabUpload, tabUrl].forEach(t => t.classList.remove('active'));
+            activeTab.classList.add('active');
+            browsePanel.style.display = activeTab === tabBrowse ? '' : 'none';
+            uploadPanel.style.display = activeTab === tabUpload ? '' : 'none';
+            urlPanel.style.display = activeTab === tabUrl ? '' : 'none';
+        }
+        tabBrowse.addEventListener('click', () => activateTab(tabBrowse));
+        tabUpload.addEventListener('click', () => activateTab(tabUpload));
+        tabUrl.addEventListener('click', () => activateTab(tabUrl));
 
         // --- Remote file browser ---
         async function loadBrowse(path) {
@@ -637,6 +862,9 @@
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
                             <span>Server: ${escapeHtml(selectedServerPath)}</span>
                         </div>`;
+                    // Auto-detect sweeps for server files
+                    clearSweepMode();
+                    autoDetectSweeps();
                     updateSubmitButton();
                     // Update copy-back checkbox
                     const cb = document.getElementById('copy-to-source-cb');
@@ -807,6 +1035,8 @@
         function handleFileSelect(file) {
             selectedFile = file;
             selectedServerPath = null; // Clear server selection
+            selectedMsbUrl = null; // Clear URL selection
+            clearSweepMode(); // Exit sweep mode if active
             const nameInput = document.getElementById('job-name');
             if (!nameInput.value) nameInput.value = file.name.replace(/\.(msb|MSB)$/, '');
             document.getElementById('file-info-container').innerHTML = `
@@ -817,9 +1047,52 @@
             updateSubmitButton();
         }
 
+        // --- URL fetch handling ---
+        let selectedMsbUrl = null;
+        const urlFetchBtn = document.getElementById('msb-url-fetch-btn');
+        const urlInput = document.getElementById('msb-url-input');
+
+        urlFetchBtn.addEventListener('click', () => {
+            const url = urlInput.value.trim();
+            if (!url) { toast('Enter a URL to an MSB file', 'error'); return; }
+            try { new URL(url); } catch { toast('Invalid URL format', 'error'); return; }
+
+            selectedMsbUrl = url;
+            selectedFile = null;
+            selectedServerPath = null;
+            clearSweepMode(); // Exit sweep mode if active
+            const fname = url.split('/').pop().split('?')[0] || 'remote.msb';
+            const nameInput = document.getElementById('job-name');
+            // Only auto-fill name if the URL segment looks like a real filename (has .msb extension)
+            // Hash-based download links (e.g. /api/download/ebba405eff49) don't contain useful names —
+            // leave blank so the server can derive the real name from Content-Disposition header
+            if (!nameInput.value && /\.(msb|MSB)$/.test(fname)) {
+                nameInput.value = fname.replace(/\.(msb|MSB)$/, '');
+            }
+            document.getElementById('file-info-container').innerHTML = `
+                <div class="file-info">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+                    <span>URL: ${escapeHtml(fname)}</span>
+                </div>`;
+            updateSubmitButton();
+            toast('MSB URL set — configure settings and submit', 'success');
+        });
+
+        urlInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); urlFetchBtn.click(); }
+        });
+
         function updateSubmitButton() {
             const btn = document.getElementById('submit-btn');
-            btn.disabled = !((selectedFile || selectedServerPath) && selectedGpus.size > 0);
+            if (sweepMode && selectedCases.size > 0 && selectedGpus.size > 0) {
+                btn.disabled = false;
+                btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path></svg> Submit Sweep (${selectedCases.size} case${selectedCases.size > 1 ? 's' : ''})`;
+            } else if (sweepMode) {
+                btn.disabled = true;
+                btn.textContent = 'Select cases and GPUs';
+            } else {
+                btn.disabled = !((selectedFile || selectedServerPath || selectedMsbUrl || restartMsbLocked) && selectedGpus.size > 0);
+            }
         }
 
         // Load versions
@@ -829,6 +1102,67 @@
             versionSelect.innerHTML = versions.map(v =>
                 `<option value="${v.version}" ${v.is_latest ? 'selected' : ''}>${v.label}</option>`
             ).join('');
+        }
+
+        // --- Pre-populate fields in restart mode ---
+        if (isRestart && originalJob) {
+            // Job name
+            document.getElementById('job-name').value = originalJob.name.replace(/ \(restart\)$/, '');
+
+            // Priority
+            document.getElementById('job-priority').value = String(originalJob.priority);
+
+            // Unified memory
+            document.getElementById('unified-memory').checked = originalJob.unified_memory;
+
+            // Copy-to path
+            if (originalJob.copy_to_path) {
+                document.getElementById('copy-to-path').value = originalJob.copy_to_path;
+            }
+
+            // M-Star version — select the version used by the original job
+            const origVersion = originalJob.resolved_version || originalJob.mstar_version;
+            if (origVersion && versionSelect) {
+                const opt = versionSelect.querySelector(`option[value="${origVersion}"]`);
+                if (opt) {
+                    opt.selected = true;
+                } else {
+                    // Version no longer installed — add it as an option with a warning
+                    const warnOpt = document.createElement('option');
+                    warnOpt.value = origVersion;
+                    warnOpt.textContent = `${origVersion} (original — not installed)`;
+                    warnOpt.selected = true;
+                    versionSelect.prepend(warnOpt);
+                }
+            }
+
+            // Lock MSB source — show the original job's MSB file path
+            restartMsbLocked = true;
+            const msbCard = document.querySelector('#msb-browse-panel')?.closest('.card');
+            if (msbCard) {
+                // Replace the MSB file card content with a locked display
+                const header = msbCard.querySelector('.card-header');
+                if (header) header.innerHTML = '<span class="card-title">MSB File (from original job)</span>';
+                // Hide tab bar and panels
+                const tabBar = msbCard.querySelector('div[style*="display:flex;gap:0"]');
+                if (tabBar) tabBar.style.display = 'none';
+                const browsePanel = document.getElementById('msb-browse-panel');
+                const uploadPanel = document.getElementById('msb-upload-panel');
+                const urlPanel = document.getElementById('msb-url-panel');
+                if (browsePanel) browsePanel.style.display = 'none';
+                if (uploadPanel) uploadPanel.style.display = 'none';
+                if (urlPanel) urlPanel.style.display = 'none';
+                // Show locked file info
+                document.getElementById('file-info-container').innerHTML = `
+                    <div class="file-info">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+                        <span>${escapeHtml(originalJob.msb_filename)}</span>
+                        <span class="text-muted text-sm" style="margin-left:auto;">From Job #${originalJob.id}</span>
+                    </div>`;
+            }
+
+            // Pre-select GPUs from original job — done after GPU grid renders below
+            updateSubmitButton();
         }
 
         // Load GPU status
@@ -868,24 +1202,131 @@
                         card.classList.add('selected');
                     }
                     updateSubmitButton();
+                    updateGpuAllocation();
                 });
             });
+
+            // In restart mode, pre-select GPUs from the original job
+            if (isRestart && originalJob) {
+                try {
+                    const origGpuIds = JSON.parse(originalJob.gpu_ids);
+                    origGpuIds.forEach(gpuId => {
+                        const card = gpuGrid.querySelector(`.gpu-select-card[data-gpu-id="${gpuId}"]`);
+                        if (card && !card.classList.contains('reserved')) {
+                            selectedGpus.add(gpuId);
+                            card.classList.add('selected');
+                        }
+                    });
+                    updateSubmitButton();
+                } catch (_) {}
+            }
         }
 
-        // Submit
+        // Submit / Restart
         document.getElementById('submit-btn').addEventListener('click', async () => {
-            if (!(selectedFile || selectedServerPath) || selectedGpus.size === 0) return;
+            // In sweep mode, validate differently
+            if (sweepMode) {
+                if (selectedCases.size === 0 || selectedGpus.size === 0) return;
+            } else {
+                if (!(selectedFile || selectedServerPath || selectedMsbUrl || restartMsbLocked) || selectedGpus.size === 0) return;
+            }
 
             const btn = document.getElementById('submit-btn');
             btn.disabled = true;
-            btn.innerHTML = '<div class="spinner"></div> Submitting...';
 
-            const name = document.getElementById('job-name').value || (selectedServerPath ? selectedServerPath.split('/').pop().replace(/\.(msb|MSB)$/, '') : selectedFile.name.replace(/\.(msb|MSB)$/, ''));
+            // --- Sweep submit mode ---
+            if (sweepMode && selectedCases.size > 0) {
+                btn.innerHTML = '<div class="spinner"></div> Submitting Sweep...';
+
+                const version = document.getElementById('mstar-version').value;
+                const priority = document.getElementById('job-priority').value;
+                const unifiedMemory = document.getElementById('unified-memory').checked;
+                const copyTo = document.getElementById('copy-to-path').value || '';
+
+                const sweep = detectedSweeps[selectedSweepIndex];
+                const payload = {
+                    msb_path: selectedServerPath,
+                    sweep_index: selectedSweepIndex,
+                    mstar_version: version,
+                    cases: [...selectedCases],
+                    gpu_pool: [...selectedGpus].sort(),
+                    gpus_per_case: gpusPerCase,
+                    max_concurrent: maxConcurrent,
+                    priority: parseInt(priority, 10),
+                    unified_memory: unifiedMemory,
+                    copy_to_path: copyTo,
+                    sweep_name: sweep?.name || 'Sweep',
+                };
+
+                const result = await api.post('/sweep/submit', payload);
+                if (result && result.sweep_group_id) {
+                    let msg = `Sweep submitted: ${result.total_created} jobs queued`;
+                    if (result.sweep_root) {
+                        msg += `\nSweep directory: ${result.sweep_root}`;
+                    }
+                    if (result.dataset_id) {
+                        msg += `\nDataset #${result.dataset_id} auto-created (pending)`;
+                    }
+                    toast(msg, 'success');
+                    navigate('jobs');
+                } else {
+                    toast(result?.error || 'Sweep submission failed', 'error');
+                    btn.disabled = false;
+                    updateSubmitButton();
+                }
+                return;
+            }
+
             const version = document.getElementById('mstar-version').value;
             const priority = document.getElementById('job-priority').value;
             const unifiedMemory = document.getElementById('unified-memory').checked;
             const gpuIds = JSON.stringify([...selectedGpus].sort());
             const copyTo = document.getElementById('copy-to-path').value || '';
+
+            // --- Restart mode: call restart API with overrides ---
+            if (isRestart && restartFromId) {
+                btn.innerHTML = '<div class="spinner"></div> Restarting...';
+
+                const payload = {
+                    gpu_ids: gpuIds,
+                    mstar_version: version,
+                    priority: parseInt(priority, 10),
+                    unified_memory: unifiedMemory,
+                };
+                if (copyTo) payload.copy_to_path = copyTo;
+
+                // Checkpoint selection
+                const cpRadio = document.querySelector('input[name="checkpoint-select"]:checked');
+                if (cpRadio) {
+                    if (cpRadio.value === 'fresh') {
+                        // Explicit fresh start — send 0 as sentinel for --force
+                        payload.checkpoint_number = 0;
+                    } else if (cpRadio.value !== 'latest') {
+                        payload.checkpoint_number = parseInt(cpRadio.value, 10);
+                    }
+                    // 'latest' → omit checkpoint_number, backend defaults to --load-last
+                }
+
+                const result = await api.post(`/jobs/${restartFromId}/restart`, payload);
+                if (result && !result.error) {
+                    toast(`Restart queued: Job #${result.new_job_id}`, 'success');
+                    navigate('jobs');
+                } else {
+                    toast(result?.error || 'Restart failed', 'error');
+                    btn.disabled = false;
+                    btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg> Restart Job';
+                }
+                return;
+            }
+
+            // --- Normal submit mode ---
+            btn.innerHTML = '<div class="spinner"></div> Submitting...';
+
+            let defaultName;
+            if (selectedServerPath) defaultName = selectedServerPath.split('/').pop().replace(/\.(msb|MSB)$/, '');
+            else if (selectedMsbUrl) defaultName = (selectedMsbUrl.split('/').pop().split('?')[0] || 'remote').replace(/\.(msb|MSB)$/, '');
+            else defaultName = selectedFile.name.replace(/\.(msb|MSB)$/, '');
+            const name = document.getElementById('job-name').value || defaultName;
 
             const params = { name, version, priority, unified_memory: unifiedMemory, gpu_ids: gpuIds };
             if (copyTo) params.copy_to = copyTo;
@@ -894,6 +1335,11 @@
             if (selectedServerPath) {
                 // Server-side file: no upload needed, just send metadata
                 params.msb_source_path = selectedServerPath;
+                result = await api.uploadJob(new Blob([]), params);
+            } else if (selectedMsbUrl) {
+                // URL download: server will fetch the file
+                params.msb_url = selectedMsbUrl;
+                btn.innerHTML = '<div class="spinner"></div> Downloading from URL...';
                 result = await api.uploadJob(new Blob([]), params);
             } else {
                 params.filename = selectedFile.name;
@@ -908,6 +1354,294 @@
                 btn.disabled = false;
                 btn.textContent = 'Submit Job';
             }
+        });
+
+        // ============================================================
+        // Sweep Detection & Configuration
+        // ============================================================
+
+        function clearSweepMode() {
+            sweepMode = false;
+            detectedSweeps = null;
+            selectedSweepIndex = 0;
+            selectedCases.clear();
+            gpusPerCase = 1;
+            maxConcurrent = 1;
+            // Cancel any pending auto-detection
+            if (sweepDetectTimer) { clearTimeout(sweepDetectTimer); sweepDetectTimer = null; }
+            sweepDetectRequestId++; // Invalidate any in-flight detection
+            const panel = document.getElementById('sweep-panel');
+            if (panel) panel.style.display = 'none';
+            const allocEl = document.getElementById('sweep-gpu-allocation');
+            if (allocEl) allocEl.style.display = 'none';
+            updateSubmitButton();
+        }
+
+        function autoDetectSweeps() {
+            // Debounce: cancel previous pending detection
+            if (sweepDetectTimer) clearTimeout(sweepDetectTimer);
+            if (!selectedServerPath) return;
+
+            // Show container and loading indicator
+            document.getElementById('sweep-detect-container').style.display = '';
+            const statusEl = document.getElementById('sweep-detect-status');
+            statusEl.innerHTML = '<div class="spinner" style="width:14px;height:14px;border-width:2px;"></div> Checking for parameter sweeps...';
+
+            // Debounce 300ms to handle rapid re-selections
+            sweepDetectTimer = setTimeout(() => detectSweeps(), 300);
+        }
+
+        async function detectSweeps() {
+            if (!selectedServerPath) return;
+
+            const requestId = ++sweepDetectRequestId;
+            const statusEl = document.getElementById('sweep-detect-status');
+
+            const version = document.getElementById('mstar-version').value;
+            const result = await api.post('/sweep/detect', {
+                msb_path: selectedServerPath,
+                mstar_version: version,
+            });
+
+            // Discard stale response if user selected a different MSB
+            if (requestId !== sweepDetectRequestId) return;
+
+            if (result?.error) {
+                statusEl.innerHTML = `<span style="color:var(--accent-red);">⚠ ${escapeHtml(result.error)}</span>`;
+                return;
+            }
+
+            const sweeps = result?.sweeps || [];
+            if (sweeps.length === 0) {
+                statusEl.innerHTML = '<span style="color:var(--text-muted);">No parameter sweeps in this file</span>';
+                return;
+            }
+
+            // Sweeps found — enter sweep mode
+            statusEl.innerHTML = '';
+            document.getElementById('sweep-detect-container').style.display = 'none';
+            detectedSweeps = sweeps;
+            sweepMode = true;
+            selectedSweepIndex = 0;
+            renderSweepPanel();
+            updateGpuAllocation();
+            toast(`Found ${sweeps.length} sweep${sweeps.length > 1 ? 's' : ''} with ${sweeps.reduce((s,sw) => s + sw.num_cases, 0)} total cases`, 'success');
+        }
+
+        function renderSweepPanel() {
+            const panel = document.getElementById('sweep-panel');
+            const content = document.getElementById('sweep-content');
+            if (!panel || !content || !detectedSweeps) return;
+
+            panel.style.display = '';
+            const sweep = detectedSweeps[selectedSweepIndex];
+            if (!sweep) return;
+
+            // Select all cases by default
+            selectedCases.clear();
+            sweep.cases.forEach(c => selectedCases.add(c));
+
+            let html = '';
+
+            // Sweep selector (if multiple sweeps)
+            if (detectedSweeps.length > 1) {
+                html += `<div style="margin-bottom:12px;">
+                    <label class="form-label">Select Sweep</label>
+                    <select class="form-select" id="sweep-selector">
+                        ${detectedSweeps.map((s, i) => `<option value="${i}" ${i === selectedSweepIndex ? 'selected' : ''}>${escapeHtml(s.name)} (${s.num_cases} cases)</option>`).join('')}
+                    </select>
+                </div>`;
+            }
+
+            // Sweep info
+            html += `<div style="padding:10px 14px;background:rgba(139,92,246,0.08);border-radius:8px;margin-bottom:12px;font-size:13px;">
+                <strong>${escapeHtml(sweep.name)}</strong> — ${sweep.num_cases} case${sweep.num_cases !== 1 ? 's' : ''}
+                ${sweep.properties.length > 0 ? `<br><span style="color:var(--text-muted);">Parameters: ${sweep.properties.map(p => escapeHtml(p.name)).join(', ')}</span>` : ''}
+            </div>`;
+
+            // Case selection with parameter table
+            html += `<div style="margin-bottom:12px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <label class="form-label" style="margin:0;">Cases</label>
+                    <div style="display:flex;gap:6px;">
+                        <button class="btn btn-sm" id="sweep-select-all" style="padding:4px 10px;font-size:11px;">Select All</button>
+                        <button class="btn btn-sm" id="sweep-select-none" style="padding:4px 10px;font-size:11px;">None</button>
+                    </div>
+                </div>
+                <div style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;">
+                    <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                        <thead>
+                            <tr style="background:rgba(99,115,156,0.06);position:sticky;top:0;">
+                                <th style="padding:8px 10px;text-align:left;font-weight:600;width:30px;">
+                                    <input type="checkbox" id="sweep-check-all" checked>
+                                </th>
+                                <th style="padding:8px 10px;text-align:left;font-weight:600;">Case</th>
+                                ${sweep.properties.map(p => `<th style="padding:8px 10px;text-align:left;font-weight:600;">${escapeHtml(p.name)}</th>`).join('')}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${sweep.cases.map((caseName, ci) => `
+                                <tr class="sweep-case-row" style="border-top:1px solid var(--border);cursor:pointer;" data-case="${escapeHtml(caseName)}">
+                                    <td style="padding:6px 10px;"><input type="checkbox" class="sweep-case-cb" data-case="${escapeHtml(caseName)}" checked></td>
+                                    <td style="padding:6px 10px;font-weight:500;">${escapeHtml(caseName)}</td>
+                                    ${sweep.properties.map(p => `<td style="padding:6px 10px;color:var(--text-secondary);">${escapeHtml(p.values[ci] || '—')}</td>`).join('')}
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>`;
+
+            // Note: GPU allocation config is now in the GPU section below the grid
+
+            content.innerHTML = html;
+
+            // Bind event handlers
+            // Sweep selector
+            const selector = document.getElementById('sweep-selector');
+            if (selector) {
+                selector.addEventListener('change', (e) => {
+                    selectedSweepIndex = parseInt(e.target.value, 10);
+                    renderSweepPanel();
+                });
+            }
+
+            // Case checkboxes
+            content.querySelectorAll('.sweep-case-cb').forEach(cb => {
+                cb.addEventListener('change', () => {
+                    if (cb.checked) selectedCases.add(cb.dataset.case);
+                    else selectedCases.delete(cb.dataset.case);
+                    document.getElementById('sweep-check-all').checked = selectedCases.size === sweep.cases.length;
+                    updateSweepSummary();
+                    updateSubmitButton();
+                });
+            });
+
+            // Row click toggles checkbox
+            content.querySelectorAll('.sweep-case-row').forEach(row => {
+                row.addEventListener('click', (e) => {
+                    if (e.target.tagName === 'INPUT') return;
+                    const cb = row.querySelector('.sweep-case-cb');
+                    cb.checked = !cb.checked;
+                    cb.dispatchEvent(new Event('change'));
+                });
+            });
+
+            // Check all
+            document.getElementById('sweep-check-all').addEventListener('change', (e) => {
+                const checked = e.target.checked;
+                content.querySelectorAll('.sweep-case-cb').forEach(cb => {
+                    cb.checked = checked;
+                    if (checked) selectedCases.add(cb.dataset.case);
+                    else selectedCases.delete(cb.dataset.case);
+                });
+                updateSweepSummary();
+                updateSubmitButton();
+            });
+
+            // Select all / none buttons
+            document.getElementById('sweep-select-all').addEventListener('click', () => {
+                content.querySelectorAll('.sweep-case-cb').forEach(cb => { cb.checked = true; selectedCases.add(cb.dataset.case); });
+                document.getElementById('sweep-check-all').checked = true;
+                updateSweepSummary();
+                updateSubmitButton();
+            });
+            document.getElementById('sweep-select-none').addEventListener('click', () => {
+                content.querySelectorAll('.sweep-case-cb').forEach(cb => { cb.checked = false; });
+                selectedCases.clear();
+                document.getElementById('sweep-check-all').checked = false;
+                updateSweepSummary();
+                updateSubmitButton();
+            });
+
+            updateGpuAllocation();
+            updateSubmitButton();
+        }
+
+        // GPU allocation for sweep mode — factor-based pill selectors
+        function getFactors(n) {
+            const factors = [];
+            for (let i = 1; i <= n; i++) { if (n % i === 0) factors.push(i); }
+            return factors;
+        }
+
+        function updateGpuAllocation() {
+            const allocEl = document.getElementById('sweep-gpu-allocation');
+            if (!allocEl) return;
+
+            if (!sweepMode || selectedGpus.size === 0) {
+                allocEl.style.display = 'none';
+                return;
+            }
+
+            allocEl.style.display = '';
+            const totalGpus = selectedGpus.size;
+            const factors = getFactors(totalGpus);
+
+            // Ensure gpusPerCase is valid
+            if (!factors.includes(gpusPerCase)) gpusPerCase = 1;
+            const maxPossibleConcurrent = Math.floor(totalGpus / gpusPerCase);
+            // Only reset maxConcurrent if it exceeds what's possible, otherwise preserve user choice
+            if (maxConcurrent > maxPossibleConcurrent || maxConcurrent < 1) {
+                maxConcurrent = maxPossibleConcurrent;
+            }
+
+            // Render GPUs-per-case pills
+            const perCasePills = document.getElementById('sweep-gpus-per-case-pills');
+            perCasePills.innerHTML = factors.map(f => {
+                const active = f === gpusPerCase;
+                return `<button class="pill-btn ${active ? 'active' : ''}" data-gpus-per="${f}" style="
+                    padding:4px 10px;font-size:12px;border-radius:12px;border:1px solid ${active ? 'var(--accent-blue)' : 'var(--border)'};
+                    background:${active ? 'rgba(59,130,246,0.15)' : 'transparent'};color:${active ? 'var(--accent-blue)' : 'var(--text-secondary)'};
+                    cursor:pointer;font-weight:${active ? '600' : '400'};
+                ">${f}</button>`;
+            }).join('');
+
+            // Render simultaneous pills (concurrent = totalGpus / gpusPerCase, but user can reduce)
+            const maxPossible = Math.floor(totalGpus / gpusPerCase);
+            const concOptions = getFactors(maxPossible).length > 1 ? getFactors(maxPossible) : [maxPossible];
+            if (!concOptions.includes(maxConcurrent)) maxConcurrent = maxPossible;
+
+            const concPills = document.getElementById('sweep-concurrent-pills');
+            concPills.innerHTML = concOptions.map(f => {
+                const active = f === maxConcurrent;
+                return `<button class="pill-btn ${active ? 'active' : ''}" data-concurrent="${f}" style="
+                    padding:4px 10px;font-size:12px;border-radius:12px;border:1px solid ${active ? 'var(--accent-green)' : 'var(--border)'};
+                    background:${active ? 'rgba(34,197,94,0.12)' : 'transparent'};color:${active ? 'var(--accent-green)' : 'var(--text-secondary)'};
+                    cursor:pointer;font-weight:${active ? '600' : '400'};
+                ">${f}</button>`;
+            }).join('');
+
+            // Preview
+            const totalCases = selectedCases.size || (detectedSweeps ? detectedSweeps[selectedSweepIndex]?.num_cases || 0 : 0);
+            const batches = maxConcurrent > 0 ? Math.ceil(totalCases / maxConcurrent) : totalCases;
+            const preview = document.getElementById('sweep-alloc-preview');
+            preview.innerHTML = `
+                <span style="color:var(--text-primary);font-weight:500;">${maxConcurrent} simulation${maxConcurrent !== 1 ? 's' : ''} at once</span>,
+                each using <strong>${gpusPerCase} GPU${gpusPerCase > 1 ? 's' : ''}</strong>
+                → <strong>${batches} batch${batches !== 1 ? 'es' : ''}</strong> for ${totalCases} cases
+            `;
+
+            // Bind pill click handlers
+            perCasePills.querySelectorAll('.pill-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    gpusPerCase = parseInt(btn.dataset.gpusPer, 10);
+                    maxConcurrent = Math.floor(totalGpus / gpusPerCase);
+                    updateGpuAllocation();
+                });
+            });
+            concPills.querySelectorAll('.pill-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    maxConcurrent = parseInt(btn.dataset.concurrent, 10);
+                    updateGpuAllocation();
+                });
+            });
+        }
+
+        // Close sweep mode button
+        document.getElementById('sweep-close-btn')?.addEventListener('click', () => {
+            clearSweepMode();
+            updateSubmitButton();
         });
     }
 
@@ -995,6 +1729,14 @@
                 ${jobBadge}
             </div>`;
         }).join('');
+    }
+
+    // ============================================================
+    // Render: Render Page
+    // ============================================================
+    async function renderRender(container) {
+        container.innerHTML = getRenderPageHTML();
+        initRenderPage(api, state, toast, escapeHtml, formatFileSize, navigate);
     }
 
     // ============================================================
@@ -1611,16 +2353,18 @@
         title.textContent = `Job #${jobId}`;
         modal.style.display = 'flex';
 
+        // Fetch job metadata to determine type
+        const jobMeta = await api.get(`/jobs/${jobId}`);
+        if (jobMeta && jobMeta.job_type === 'render') {
+            return viewRenderOutput(jobId, jobMeta, modal, title, modalBody, modalFooter);
+        }
+
         // Build the full progress dashboard
         modalBody.innerHTML = `
             <div class="progress-tabs">
                 <button class="btn btn-secondary btn-sm active" id="tab-progress" onclick="window.mstarApp.switchTab('progress')">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
                     Dashboard
-                </button>
-                <button class="btn btn-secondary btn-sm" id="tab-panels" onclick="window.mstarApp.switchTab('panels')">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
-                    Charts
                 </button>
                 <button class="btn btn-secondary btn-sm" id="tab-files" onclick="window.mstarApp.switchTab('files')">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
@@ -1631,6 +2375,14 @@
                     Raw Log
                 </button>
                 <span style="flex:1;"></span>
+                <button class="btn btn-secondary btn-sm" id="tab-panels" onclick="window.mstarApp.switchTab('panels')">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+                    Charts
+                </button>
+                <button class="btn btn-secondary btn-sm btn-visuals" id="tab-visuals" onclick="if(window._pvdViewer&&window._pvdViewer.openMultiLayerViewer){window._pvdViewer.openMultiLayerViewer(${jobId})}else{toast('Viewer loading...','error')}">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></svg>
+                    Visuals
+                </button>
                 <button class="btn btn-secondary btn-sm report-generate-btn" id="btn-generate-report" onclick="window.mstarApp.generateReport()" title="Generate PDF report of selected charts" style="display:none;">
                     📄 Generate Report <span id="report-count-badge" class="report-count-badge" style="display:none;">0</span>
                 </button>
@@ -1695,6 +2447,9 @@
                 if (el) el.style.display = t === tab ? (t === 'panels' ? 'flex' : 'block') : 'none';
                 if (btn) btn.classList.toggle('active', t === tab);
             });
+            // Toggle modal-body scroll: charts handles its own scroll, others need normal scroll
+            const mb = document.querySelector('.modal-body');
+            if (mb) mb.style.overflowY = (tab === 'panels') ? 'hidden' : 'auto';
             if (tab === 'log') loadRawLog(jobId);
             if (tab === 'files') loadFileBrowser(jobId, '');
             if (tab === 'panels') {
@@ -2070,6 +2825,227 @@
         }, 5000);
     }
 
+    // ============================================================
+    // Render Job Viewer (replaces viewOutput for render jobs)
+    // ============================================================
+    async function viewRenderOutput(jobId, jobMeta, modal, title, modalBody, modalFooter) {
+        title.textContent = `Render #${jobId} — ${escapeHtml(jobMeta.name)} (${jobMeta.status})`;
+        modalFooter.innerHTML = '';
+
+        modalBody.innerHTML = `
+            <div class="progress-tabs">
+                <button class="btn btn-secondary btn-sm active" id="rtab-status" onclick="window.mstarApp.switchRenderTab('status')">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
+                    Render Status
+                </button>
+                <button class="btn btn-secondary btn-sm" id="rtab-log" onclick="window.mstarApp.switchRenderTab('log')">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    Raw Log
+                </button>
+                <button class="btn btn-secondary btn-sm" id="rtab-files" onclick="window.mstarApp.switchRenderTab('files')">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                    File Browser
+                </button>
+            </div>
+            <div id="rview-status" class="progress-dashboard">
+                <div id="render-status-cards" class="stats-grid" style="margin-bottom:16px;"></div>
+                <div id="render-progress-section"></div>
+                <div id="render-video-section" style="margin-top:16px;"></div>
+            </div>
+            <div id="rview-log" style="display:none;">
+                <pre id="output-content" class="output-content" style="max-height:600px;">Loading...</pre>
+            </div>
+            <div id="rview-files" style="display:none;">
+                <div id="file-browser-breadcrumb" class="file-breadcrumb"></div>
+                <div id="file-browser-content"></div>
+            </div>
+        `;
+
+        // Tab switching for render modal
+        window.mstarApp.switchRenderTab = function(tab) {
+            ['status', 'log', 'files'].forEach(t => {
+                const el = document.getElementById(`rview-${t}`);
+                const btn = document.getElementById(`rtab-${t}`);
+                if (el) el.style.display = t === tab ? 'block' : 'none';
+                if (btn) btn.classList.toggle('active', t === tab);
+            });
+            if (tab === 'log') loadRawLog(jobId);
+            if (tab === 'files') loadFileBrowser(jobId, '');
+        };
+
+        // Initial render status fetch
+        await refreshAndBuildRenderStatus(jobId, jobMeta);
+
+        // Poll every 3 seconds
+        progressState.masterTimer = setInterval(async () => {
+            if (modal.style.display === 'none') {
+                clearInterval(progressState.masterTimer);
+                return;
+            }
+            await refreshAndBuildRenderStatus(jobId, jobMeta);
+        }, 3000);
+    }
+
+    async function refreshAndBuildRenderStatus(jobId, jobMeta) {
+        const status = await api.get(`/render/${jobId}/status`);
+        // Also refresh the job meta to check if status changed
+        const freshJob = await api.get(`/jobs/${jobId}`);
+        if (freshJob) jobMeta = freshJob;
+
+        const cardsEl = document.getElementById('render-status-cards');
+        const progressEl = document.getElementById('render-progress-section');
+        const videoEl = document.getElementById('render-video-section');
+        const titleEl = document.getElementById('output-modal-title');
+        if (!cardsEl || !progressEl) return;
+
+        if (titleEl) {
+            titleEl.textContent = `Render #${jobId} — ${escapeHtml(jobMeta.name)} (${jobMeta.status})`;
+        }
+
+        if (!status || status.error) {
+            if (jobMeta.status === 'queued') {
+                cardsEl.innerHTML = `
+                    <div class="stat-card blue">
+                        <div class="stat-value" style="font-size:18px;">⏳ Queued</div>
+                        <div class="stat-label">Waiting for available GPU</div>
+                    </div>
+                `;
+            } else if (jobMeta.status === 'failed') {
+                cardsEl.innerHTML = `
+                    <div class="stat-card red">
+                        <div class="stat-value" style="font-size:16px;">❌ Render Failed</div>
+                        <div class="stat-label">${escapeHtml(jobMeta.error_message || 'No error details available')}</div>
+                    </div>
+                `;
+            } else {
+                cardsEl.innerHTML = `
+                    <div class="stat-card blue">
+                        <div class="stat-value" style="font-size:18px;">🔄 Initializing</div>
+                        <div class="stat-label">Setting up ParaView render pipeline...</div>
+                    </div>
+                `;
+            }
+            progressEl.innerHTML = '';
+            if (videoEl) videoEl.innerHTML = '';
+            return;
+        }
+
+        const percent = status.percent || 0;
+        const currentFrame = status.current_frame || 0;
+        const totalFrames = status.total_frames || 0;
+        const elapsed = status.elapsed_seconds || 0;
+        const eta = status.eta_seconds || 0;
+        const state_val = status.state || jobMeta.status;
+        const videoFile = status.video_file || null;
+
+        // Format time helper
+        function fmtTime(s) {
+            if (!s || s <= 0) return '—';
+            if (s < 60) return `${Math.round(s)}s`;
+            if (s < 3600) return `${Math.floor(s/60)}m ${Math.round(s%60)}s`;
+            return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+        }
+
+        const isComplete = state_val === 'completed' || state_val === 'done' || percent >= 100;
+        const isFailed = state_val === 'failed' || state_val === 'error';
+        const isRunning = state_val === 'running' || state_val === 'rendering';
+
+        // Summary cards
+        if (isFailed) {
+            cardsEl.innerHTML = `
+                <div class="stat-card red">
+                    <div class="stat-value" style="font-size:16px;">❌ Render Failed</div>
+                    <div class="stat-label">${escapeHtml(status.error || jobMeta.error_message || 'Unknown error')}</div>
+                </div>
+            `;
+        } else if (isComplete) {
+            cardsEl.innerHTML = `
+                <div class="stat-card green">
+                    <div class="stat-value">✅ Complete</div>
+                    <div class="stat-label">${totalFrames} frames rendered</div>
+                </div>
+                <div class="stat-card blue">
+                    <div class="stat-value">${fmtTime(elapsed)}</div>
+                    <div class="stat-label">Total Time</div>
+                </div>
+                <div class="stat-card amber">
+                    <div class="stat-value">${totalFrames > 0 && elapsed > 0 ? (elapsed / totalFrames).toFixed(1) + 's' : '—'}</div>
+                    <div class="stat-label">Per Frame</div>
+                </div>
+            `;
+        } else {
+            cardsEl.innerHTML = `
+                <div class="stat-card blue">
+                    <div class="stat-value">${percent.toFixed(1)}%</div>
+                    <div class="stat-label">Progress</div>
+                </div>
+                <div class="stat-card green">
+                    <div class="stat-value">${currentFrame} / ${totalFrames || '?'}</div>
+                    <div class="stat-label">Frames</div>
+                </div>
+                <div class="stat-card amber">
+                    <div class="stat-value">${fmtTime(elapsed)}</div>
+                    <div class="stat-label">Elapsed</div>
+                </div>
+                <div class="stat-card purple" style="--card-color: var(--accent-purple, #8b5cf6);">
+                    <div class="stat-value">${fmtTime(eta)}</div>
+                    <div class="stat-label">ETA</div>
+                </div>
+            `;
+        }
+
+        // Progress bar
+        if (!isComplete && !isFailed) {
+            const barColor = isRunning ? 'var(--accent-blue)' : 'var(--accent-amber)';
+            progressEl.innerHTML = `
+                <div style="background:rgba(99,115,156,0.15);border-radius:8px;overflow:hidden;height:28px;position:relative;">
+                    <div style="background:${barColor};height:100%;width:${percent}%;transition:width 0.5s ease;border-radius:8px;"></div>
+                    <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;color:var(--text-primary);">
+                        ${isRunning ? `Rendering frame ${currentFrame}/${totalFrames || '?'} — ${percent.toFixed(1)}%` : 'Waiting...'}
+                    </div>
+                </div>
+            `;
+        } else {
+            progressEl.innerHTML = '';
+        }
+
+        // Video embed when complete
+        if (videoEl) {
+            if (isComplete && videoFile) {
+                // Only update if not already showing this video
+                if (!videoEl.dataset.videoFile || videoEl.dataset.videoFile !== videoFile) {
+                    videoEl.dataset.videoFile = videoFile;
+                    videoEl.innerHTML = `
+                        <div class="card" style="padding:16px;">
+                            <div style="font-weight:600;margin-bottom:12px;color:var(--text-primary);display:flex;align-items:center;gap:8px;">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent-green)" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
+                                Rendered Video
+                            </div>
+                            <video controls style="width:100%;max-height:500px;border-radius:8px;background:#000;">
+                                <source src="/api/jobs/${jobId}/files/download?path=${encodeURIComponent(videoFile)}" type="video/mp4">
+                                Your browser does not support video playback.
+                            </video>
+                            <div style="margin-top:8px;display:flex;gap:8px;">
+                                <a href="/api/jobs/${jobId}/files/download?path=${encodeURIComponent(videoFile)}" download class="btn btn-secondary btn-sm" style="text-decoration:none;">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                                    Download Video
+                                </a>
+                            </div>
+                        </div>
+                    `;
+                }
+            } else if (isComplete && !videoFile) {
+                videoEl.innerHTML = `
+                    <div class="card" style="padding:16px;color:var(--text-muted);text-align:center;">
+                        Render complete — frames saved. No video file was generated (video generation may have been disabled).
+                    </div>
+                `;
+            } else {
+                videoEl.innerHTML = '';
+            }
+        }
+    }
+
     async function refreshProgressData() {
         const data = await api.get(`/jobs/${progressState.jobId}/progress`);
         if (data) progressState.data = data;
@@ -2261,7 +3237,15 @@
         // Keep legacy helper for select dropdown
         window.mstarApp._addStatsPanel = function(filename, column) {
             addStatsChartPanel(jobId, filename, column);
-            syncButtonStates();
+            // Inline button sync (syncButtonStates is closure-scoped)
+            document.querySelectorAll('.stats-col-btn[data-panel-key]').forEach(btn => {
+                const key = btn.getAttribute('data-panel-key');
+                if (progressState.panels.find(p => p.panelKey === key)) {
+                    btn.classList.add('active');
+                } else {
+                    btn.classList.remove('active');
+                }
+            });
         };
     }
 
@@ -2358,7 +3342,9 @@
             showCumAvg: false, showMovAvg: false, movAvgWindow: 20, inReport: false,
         };
         progressState.panels.push(panel);
-        updateChartsEmptyState();
+        // Update empty state (inline to avoid scope issues)
+        var emptyEl = document.getElementById('charts-empty-state');
+        if (emptyEl) emptyEl.style.display = progressState.panels.length > 0 ? 'none' : 'flex';
 
         // Render from existing progress data
         requestAnimationFrame(() => {
@@ -2497,7 +3483,9 @@
             showCumAvg: false, showMovAvg: false, movAvgWindow: 20, inReport: false,
         };
         progressState.panels.push(panel);
-        updateChartsEmptyState();
+        // Update empty state (inline to avoid scope issues)
+        var emptyEl = document.getElementById('charts-empty-state');
+        if (emptyEl) emptyEl.style.display = progressState.panels.length > 0 ? 'none' : 'flex';
 
         // Defer initial render
         requestAnimationFrame(() => {
@@ -2681,6 +3669,8 @@
                             const icon = entry.is_dir
                                 ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent-amber)" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>'
                                 : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+                            const isPvd = !entry.is_dir && entry.name.toLowerCase().endsWith('.pvd');
+                            const isTxt = !entry.is_dir && entry.name.toLowerCase().endsWith('.txt');
                             return `
                                 <tr>
                                     <td>
@@ -2694,10 +3684,20 @@
                                     <td class="text-sm text-muted text-mono">${entry.is_dir ? '—' : formatFileSize(entry.size)}</td>
                                     <td class="text-sm text-muted">${entry.modified ? formatTime(entry.modified) : '—'}</td>
                                     <td>
+                                        <div class="flex gap-2">
                                         ${!entry.is_dir ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp._downloadFile(${jobId}, '${escapeHtml(entryPath)}')">
                                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                                             Download
                                         </button>` : ''}
+                                        ${isPvd ? `<button class="btn btn-sm btn-view-pvd" onclick="window.mstarApp._viewPvd(${jobId}, '${escapeHtml(entryPath)}')">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                                            View
+                                        </button>` : ''}
+                                        ${isTxt ? `<button class="btn btn-sm btn-view-pvd" data-csv-check="${escapeHtml(entryPath)}" style="display:none;" onclick="window.mstarApp._viewCsvChart(${jobId}, '${escapeHtml(entryPath)}')">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                                            View
+                                        </button>` : ''}
+                                        </div>
                                     </td>
                                 </tr>
                             `;
@@ -2707,9 +3707,86 @@
             </div>
         `;
 
+        // Async CSV detection for .txt files — sniff first line for tab-separated columns
+        document.querySelectorAll('[data-csv-check]').forEach(async (btn) => {
+            const fpath = btn.getAttribute('data-csv-check');
+            try {
+                const resp = await fetch(`/api/jobs/${jobId}/files/download?path=${encodeURIComponent(fpath)}`, {
+                    headers: { 'Authorization': `Bearer ${state.token}`, 'Range': 'bytes=0-512' }
+                });
+                if (!resp.ok) return;
+                const text = await resp.text();
+                const firstLine = text.split('\n')[0] || '';
+                const cols = firstLine.split('\t').filter(c => c.trim());
+                // It's a CSV chart file if it has ≥2 tab-separated columns and looks like a header
+                if (cols.length >= 2 && /\[.*\]/.test(firstLine)) {
+                    btn.style.display = '';
+                }
+            } catch (e) { /* ignore — just don't show button */ }
+        });
+
         // Register helpers
         window.mstarApp._browseFiles = function(p) {
             loadFileBrowser(jobId, p);
+        };
+        window.mstarApp.openVisuals = function() {
+            if (window._pvdViewer && window._pvdViewer.openMultiLayerViewer) {
+                window._pvdViewer.openMultiLayerViewer(jobId);
+            } else {
+                toast('Visuals viewer is still loading. Please try again in a moment.', 'error');
+            }
+        };
+        window.mstarApp._viewPvd = function(jid, fpath) {
+            if (window._pvdViewer && window._pvdViewer.openPvdViewer) {
+                window._pvdViewer.openPvdViewer(jid, fpath);
+            } else {
+                toast('PVD Viewer is still loading. Please try again in a moment.', 'error');
+            }
+        };
+        window.mstarApp._viewCsvChart = async function(jid, fpath) {
+            // Extract the .txt filename (e.g. "Stats/Fluid.txt" → "Fluid.txt")
+            const filename = fpath.split('/').pop();
+
+            // Switch to Charts tab (this also triggers loadStatsFiles)
+            if (window.mstarApp.switchTab) {
+                window.mstarApp.switchTab('panels');
+            }
+
+            // Wait for stats sidebar to load
+            await new Promise(r => setTimeout(r, 600));
+
+            // Fetch the stats file listing to get its columns
+            const resp = await api.get(`/jobs/${jid}/stats`);
+            if (!resp || !resp.files) {
+                toast('Could not load chart data', 'error');
+                return;
+            }
+
+            const statsFile = resp.files.find(f => f.filename === filename);
+            if (!statsFile) {
+                toast(`File "${filename}" not found in Stats. Only files in out/Stats/ can be charted.`, 'error');
+                return;
+            }
+
+            // Add ALL plottable columns (skip Time) using module-level addStatsChartPanel
+            const cols = statsFile.columns.filter(c => c !== 'Time [s]');
+            let added = 0;
+            cols.forEach(col => {
+                addStatsChartPanel(jid, filename, col);
+                added++;
+            });
+
+            // Manually sync sidebar button active states (inline because syncButtonStates is closure-scoped)
+            document.querySelectorAll('.stats-col-btn[data-panel-key]').forEach(btn => {
+                const key = btn.getAttribute('data-panel-key');
+                if (progressState.panels.find(p => p.panelKey === key)) {
+                    btn.classList.add('active');
+                } else {
+                    btn.classList.remove('active');
+                }
+            });
+
+            toast(`Added ${added} charts from ${filename.replace('.txt', '')}`, 'success');
         };
         window.mstarApp._downloadFile = function(jid, fpath) {
             const url = `/api/jobs/${jid}/files/download?path=${encodeURIComponent(fpath)}`;
@@ -2822,13 +3899,17 @@
     // ============================================================
     function escapeHtml(str) {
         if (!str) return '';
-        const div = document.createElement('div');
-        div.textContent = str;
-        return div.innerHTML;
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     function statusBadge(status) {
-        const dot = status === 'running' ? '<span class="badge-dot"></span>' : '';
+        const animated = status === 'running' || status === 'launching' || status === 'preflight';
+        const dot = animated ? '<span class="badge-dot"></span>' : '';
         return `<span class="badge badge-${status}">${dot}${status}</span>`;
     }
 
@@ -2890,111 +3971,28 @@
     }
 
     async function restartJob(jobId) {
-        state.refreshPaused = true;
-        try {
-            // Fetch available checkpoints
-            const cpResult = await api.get(`/jobs/${jobId}/checkpoints`);
-            const checkpoints = (cpResult && cpResult.checkpoints) ? cpResult.checkpoints : [];
+        // Navigate to the submit page in restart mode — pre-populated with the failed job's settings
+        navigate('submit?restart_from=' + jobId);
+    }
 
-            // Build modal content
-            let modalBody = '';
-            if (checkpoints.length === 0) {
-                modalBody = `
-                    <div style="padding:8px 0;color:var(--text-secondary);">
-                        <p style="margin:0 0 8px 0;">No checkpoint files found in <code>out/Checkpoint/</code>.</p>
-                        <p style="margin:0;">The job will restart from scratch with <code>--force</code>.</p>
-                    </div>
-                `;
-            } else {
-                modalBody = `
-                    <p style="margin:0 0 12px 0;color:var(--text-secondary);">Select a checkpoint to restart from:</p>
-                    <div class="checkpoint-list">
-                        <label class="checkpoint-option">
-                            <input type="radio" name="checkpoint-select" value="latest" checked>
-                            <span class="checkpoint-label">
-                                <strong>Use Latest</strong>
-                                <span class="text-muted text-sm">(--load-last)</span>
-                            </span>
-                        </label>
-                        ${checkpoints.map(cp => `
-                            <label class="checkpoint-option">
-                                <input type="radio" name="checkpoint-select" value="${cp.number}">
-                                <span class="checkpoint-label">
-                                    <strong>Checkpoint ${cp.number}</strong>
-                                    <span class="text-muted text-sm">${cp.modified || ''}</span>
-                                </span>
-                            </label>
-                        `).join('')}
-                    </div>
-                `;
-            }
+    async function createDatasetFromSweep(sweepGroupId, sweepName) {
+        const name = prompt('Dataset name:', sweepName + ' Dataset');
+        if (!name) return;
 
-            // Show modal
-            const modal = document.createElement('div');
-            modal.className = 'modal-overlay';
-            modal.id = 'checkpoint-modal';
-            modal.innerHTML = `
-                <div class="modal-content" style="max-width:480px;">
-                    <div class="modal-header">
-                        <h3 style="margin:0;">Restart Job #${jobId}</h3>
-                        <button class="modal-close" id="cp-modal-close">&times;</button>
-                    </div>
-                    <div class="modal-body">
-                        ${modalBody}
-                    </div>
-                    <div class="modal-footer flex justify-end gap-2">
-                        <button class="btn btn-secondary" id="cp-cancel-btn">Cancel</button>
-                        <button class="btn btn-primary" id="cp-restart-btn">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg>
-                            Restart
-                        </button>
-                    </div>
-                </div>
-            `;
-            document.body.appendChild(modal);
+        const result = await api.post(`/sweep/${sweepGroupId}/create-dataset`, {
+            name: name,
+            dataset_mode: 'time_averaged_2d',
+        });
 
-            // Animate in
-            requestAnimationFrame(() => modal.classList.add('active'));
-
-            // Wire up buttons
-            const closeModal = () => {
-                modal.classList.remove('active');
-                setTimeout(() => modal.remove(), 200);
-                state.refreshPaused = false;
-            };
-
-            modal.querySelector('#cp-modal-close').addEventListener('click', closeModal);
-            modal.querySelector('#cp-cancel-btn').addEventListener('click', closeModal);
-            modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
-
-            modal.querySelector('#cp-restart-btn').addEventListener('click', async () => {
-                const selected = modal.querySelector('input[name="checkpoint-select"]:checked');
-                let checkpoint_number = null;
-                if (selected && selected.value !== 'latest') {
-                    checkpoint_number = parseInt(selected.value, 10);
-                }
-
-                const payload = {};
-                if (checkpoint_number !== null) {
-                    payload.checkpoint_number = checkpoint_number;
-                }
-
-                const result = await api.post(`/jobs/${jobId}/restart`, payload);
-                closeModal();
-                if (result && !result.error) {
-                    toast(`Restart queued: Job #${result.new_job_id}`, 'success');
-                    navigate('jobs');
-                } else {
-                    toast(result?.error || 'Restart failed', 'error');
-                }
-            });
-        } catch (err) {
-            state.refreshPaused = false;
-            toast('Failed to fetch checkpoints', 'error');
+        if (result?.dataset_id) {
+            toast(`Training dataset "${name}" created (${result.cases_added} cases)`, 'success');
+            navigate('training');
+        } else {
+            toast(result?.error || 'Failed to create dataset', 'error');
         }
     }
 
-    window.mstarApp = Object.assign(window.mstarApp || {}, { viewOutput, cancelJob, deleteUser, editUser, popOutPanel, restartJob, archiveJob, archiveAllFailed });
+    window.mstarApp = Object.assign(window.mstarApp || {}, { viewOutput, cancelJob, deleteUser, editUser, popOutPanel, restartJob, archiveJob, archiveAllFailed, createDatasetFromSweep });
 
     // ============================================================
     // Modal close handlers

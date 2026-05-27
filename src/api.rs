@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::db::{self, DbHandle, User};
 use crate::mstar_versions::{self, MstarVersion};
 use crate::config::Config;
+use crate::ai_training;
+
+// SECURITY: In-memory login rate limiter
+use std::time::Instant;
+static LOGIN_ATTEMPTS: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // ============================================================
 // Request / Response types
@@ -104,6 +110,24 @@ pub struct DashboardResponse {
     pub total_gpus: usize,
     pub active_gpus: usize,
     pub available_versions: usize,
+}
+
+// AI Training request/response types
+
+#[derive(Deserialize)]
+pub struct CreateAiDatasetRequest {
+    pub name: String,
+    pub sweep_root: String,
+    pub config: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateAiTrainingJobRequest {
+    pub dataset_id: i64,
+    pub model_family: String,
+    pub run_name: Option<String>,
+    pub gpu_ids: Option<Vec<i32>>,
+    pub config: Option<serde_json::Value>,
 }
 
 // ============================================================
@@ -268,6 +292,7 @@ pub fn api_routes(
     // Version routes
     let versions_list = api.and(warp::path("versions")).and(warp::path::end())
         .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
         .and(with_state(state.clone()))
         .and_then(handle_list_versions);
 
@@ -406,6 +431,39 @@ pub fn api_routes(
         .and(with_state(state.clone()))
         .and_then(handle_download_file);
 
+    // PVD viewer routes
+    let jobs_pvd_info = api.and(warp::path("jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("files"))
+        .and(warp::path("pvd-info"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::query::<HashMap<String, String>>())
+        .and(with_state(state.clone()))
+        .and_then(handle_pvd_info);
+
+    let jobs_vtk_serve = api.and(warp::path("jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("files"))
+        .and(warp::path("vtk-serve"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::query::<HashMap<String, String>>())
+        .and(with_state(state.clone()))
+        .and_then(handle_vtk_serve);
+
+    // Visuals — scan Output dir for all loadable layers (slices, surfaces, STLs — not volumes)
+    let jobs_visuals_layers = api.and(warp::path("jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("visuals-layers"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_visuals_layers);
+
     // Browse server filesystem route (for remote MSB selection)
     let browse = api.and(warp::path("browse")).and(warp::path::end())
         .and(warp::get())
@@ -422,6 +480,46 @@ pub fn api_routes(
         .and(with_state(state.clone()))
         .and_then(handle_mkdir);
 
+    // Render: submit a render job
+    let render_submit = api.and(warp::path("render"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::body::json::<RenderRequest>())
+        .and(with_state(state.clone()))
+        .and_then(handle_render_submit);
+
+    // Render: get render status (reads render_status.json)
+    let render_status = api.and(warp::path("render"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_render_status);
+
+    // Render: upload a state file for a job
+    let render_upload_state = api.and(warp::path("jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("upload-state"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::multipart::form().max_length(500 * 1024 * 1024)) // 500 MB
+        .and(with_state(state.clone()))
+        .and_then(handle_upload_state_file);
+
+    // Render: list state files for a job
+    let render_list_states = api.and(warp::path("jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("state-files"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_list_state_files);
+
     // Admin: install latest M-Star version
     let admin_install_version = api.and(warp::path("admin"))
         .and(warp::path("install-version"))
@@ -431,6 +529,120 @@ pub fn api_routes(
         .and(with_state(state.clone()))
         .and_then(handle_install_version);
 
+    // ---- AI Training routes ----
+
+    // GET /api/ai/datasets
+    let ai_datasets_list = api.and(warp::path("ai")).and(warp::path("datasets")).and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_list_datasets);
+
+    // POST /api/ai/datasets
+    let ai_datasets_create = api.and(warp::path("ai")).and(warp::path("datasets")).and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::body::json())
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_create_dataset);
+
+    // GET /api/ai/datasets/:id
+    let ai_datasets_get = api.and(warp::path("ai")).and(warp::path("datasets"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_get_dataset);
+
+    // POST /api/ai/datasets/:id/rescan
+    let ai_datasets_rescan = api.and(warp::path("ai")).and(warp::path("datasets"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("rescan"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_rescan_dataset);
+
+    // GET /api/ai/training-jobs
+    let ai_training_jobs_list = api.and(warp::path("ai")).and(warp::path("training-jobs")).and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::query::<HashMap<String, String>>())
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_list_training_jobs);
+
+    // POST /api/ai/training-jobs
+    let ai_training_jobs_create = api.and(warp::path("ai")).and(warp::path("training-jobs")).and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::body::json())
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_create_training_job);
+
+    // GET /api/ai/training-jobs/:id
+    let ai_training_jobs_get = api.and(warp::path("ai")).and(warp::path("training-jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_get_training_job);
+
+    // POST /api/ai/training-jobs/:id/cancel
+    let ai_training_jobs_cancel = api.and(warp::path("ai")).and(warp::path("training-jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("cancel"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_cancel_training_job);
+
+    // GET /api/ai/config  (return enabled status + defaults)
+    let ai_training_config = api.and(warp::path("ai")).and(warp::path("config")).and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_config);
+
+    // POST /api/ai/preflight
+    let ai_preflight = api.and(warp::path("ai")).and(warp::path("preflight")).and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::body::json::<serde_json::Value>())
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_preflight);
+
+    // ---------- Sweep detection routes ----------
+    // POST /api/sweep/detect — detect sweeps in an MSB file
+    let sweep_detect = api.and(warp::path("sweep")).and(warp::path("detect")).and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::body::json::<serde_json::Value>())
+        .and(with_state(state.clone()))
+        .and_then(handle_sweep_detect);
+
+    // POST /api/sweep/submit — submit a sweep batch (creates N jobs)
+    let sweep_submit = api.and(warp::path("sweep")).and(warp::path("submit")).and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::body::json::<serde_json::Value>())
+        .and(with_state(state.clone()))
+        .and_then(handle_sweep_submit);
+
+    // POST /api/sweep/:group_id/create-dataset — create AI training dataset from completed sweep
+    let sweep_create_dataset = api.and(warp::path("sweep"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("create-dataset"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(warp::body::json::<serde_json::Value>())
+        .and(with_state(state.clone()))
+        .and_then(handle_sweep_create_dataset);
+
     auth_login
         .or(auth_register)
         .or(auth_logout)
@@ -439,6 +651,7 @@ pub fn api_routes(
         .or(jobs_submit)
         .or(jobs_upload)
         .or(jobs_get)
+        .or(jobs_visuals_layers)
         .or(jobs_cancel)
         .or(jobs_restart)
         .or(jobs_archive_failed)
@@ -449,7 +662,13 @@ pub fn api_routes(
         .or(jobs_stats_list)
         .or(jobs_stats_data)
         .or(jobs_files_download)
+        .or(jobs_pvd_info)
+        .or(jobs_vtk_serve)
         .or(jobs_files_list)
+        .or(render_submit)
+        .or(render_status)
+        .or(render_upload_state)
+        .or(render_list_states)
         .or(gpus_history)
         .or(gpus_list)
         .or(versions_list)
@@ -464,6 +683,21 @@ pub fn api_routes(
         .or(admin_install_version)
         .or(system_info)
         .or(browse)
+        // AI Training routes
+        .or(ai_datasets_list)
+        .or(ai_datasets_create)
+        .or(ai_datasets_get)
+        .or(ai_datasets_rescan)
+        .or(ai_training_jobs_list)
+        .or(ai_training_jobs_create)
+        .or(ai_training_jobs_get)
+        .or(ai_training_jobs_cancel)
+        .or(ai_training_config)
+        .or(ai_preflight)
+        // Sweep routes
+        .or(sweep_detect)
+        .or(sweep_submit)
+        .or(sweep_create_dataset)
 }
 
 fn with_state(state: AppState) -> impl Filter<Extract = (AppState,), Error = std::convert::Infallible> + Clone {
@@ -478,9 +712,30 @@ async fn handle_login(
     body: LoginRequest,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
+    // SECURITY: Rate limit login attempts (max 10 per 5 minutes per username)
+    let rate_limit_window = std::time::Duration::from_secs(300);
+    let max_attempts: usize = 10;
+    {
+        let mut attempts = LOGIN_ATTEMPTS.lock().await;
+        let entry = attempts.entry(body.username.clone()).or_insert_with(Vec::new);
+        let now = Instant::now();
+        entry.retain(|t| now.duration_since(*t) < rate_limit_window);
+        if entry.len() >= max_attempts {
+            return Ok(json_error("Too many login attempts. Try again in a few minutes.", warp::http::StatusCode::TOO_MANY_REQUESTS));
+        }
+        entry.push(now);
+    }
+
     let db = state.db.lock().await;
+    // Opportunistically clean up expired sessions
+    let _ = db::cleanup_expired_sessions(&db);
     match db::authenticate_user(&db, &body.username, &body.password) {
         Ok(user) => {
+            // Clear rate limit on successful login
+            {
+                let mut attempts = LOGIN_ATTEMPTS.lock().await;
+                attempts.remove(&body.username);
+            }
             match db::create_session(&db, user.id) {
                 Ok(token) => Ok(json_ok(&AuthResponse {
                     token,
@@ -557,6 +812,19 @@ async fn require_auth(auth: &Option<String>, state: &AppState) -> Result<User, w
         .map_err(|e| json_error(&e, warp::http::StatusCode::UNAUTHORIZED))
 }
 
+/// SECURITY: Helper to authenticate AND verify ownership/admin access for a job.
+/// Non-admin users can only access their own jobs.
+async fn require_job_access(auth: &Option<String>, state: &AppState, job_id: i64) -> Result<(User, db::Job), warp::reply::WithStatus<warp::reply::Json>> {
+    let user = require_auth(auth, state).await?;
+    let db = state.db.lock().await;
+    let job = db::get_job(&db, job_id)
+        .map_err(|e| json_error(&e, warp::http::StatusCode::NOT_FOUND))?;
+    if user.role != "admin" && job.user_id != user.id {
+        return Err(json_error("Access denied: you can only access your own jobs", warp::http::StatusCode::FORBIDDEN));
+    }
+    Ok((user, job))
+}
+
 // ============================================================
 // Job Handlers
 // ============================================================
@@ -617,7 +885,19 @@ async fn handle_upload_msb(
         Err(e) => return Ok(e),
     };
 
-    let filename = params.get("filename").cloned().unwrap_or_else(|| "upload.msb".to_string());
+    let raw_filename = params.get("filename").cloned().unwrap_or_else(|| "upload.msb".to_string());
+
+    // SECURITY: Sanitize filename — strip path components and reject null bytes
+    let sanitized = std::path::Path::new(&raw_filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.replace('\0', ""))
+        .unwrap_or_else(|| "upload.msb".to_string());
+
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return Ok(json_error("Invalid filename", warp::http::StatusCode::BAD_REQUEST));
+    }
+    let filename = sanitized;
 
     // Save MSB file to jobs directory
     let jobs_dir = &state.config.paths.jobs_directory;
@@ -687,15 +967,12 @@ async fn handle_job_output(
     params: HashMap<String, String>,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Err(e) = require_auth(&auth, &state).await {
-        return Ok(e);
-    }
-    let db = state.db.lock().await;
-    let job = match db::get_job(&db, job_id) {
-        Ok(j) => j,
-        Err(e) => return Ok(json_error(&e, warp::http::StatusCode::NOT_FOUND)),
+    // SECURITY: Ownership check — users can only view their own job output
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
     };
-    drop(db); // Release lock before file I/O
+
 
     let output_file = match &job.output_file {
         Some(f) => f.clone(),
@@ -734,15 +1011,11 @@ async fn handle_job_progress(
     auth: Option<String>,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Err(e) = require_auth(&auth, &state).await {
-        return Ok(e);
-    }
-    let db = state.db.lock().await;
-    let job = match db::get_job(&db, job_id) {
-        Ok(j) => j,
-        Err(e) => return Ok(json_error(&e, warp::http::StatusCode::NOT_FOUND)),
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
     };
-    drop(db);
 
     let output_file = match &job.output_file {
         Some(f) => f.clone(),
@@ -1134,16 +1407,10 @@ async fn handle_list_files(
     params: HashMap<String, String>,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Err(e) = require_auth(&auth, &state).await {
-        return Ok(e);
-    }
-
-    let job = {
-        let conn = state.db.lock().await;
-        match db::get_job(&conn, job_id) {
-            Ok(j) => j,
-            Err(e) => return Ok(json_error(&e, warp::http::StatusCode::NOT_FOUND)),
-        }
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
     };
 
     let working_dir = match &job.working_directory {
@@ -1225,16 +1492,10 @@ async fn handle_download_file(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     use warp::Reply;
 
-    if let Err(e) = require_auth(&auth, &state).await {
-        return Ok(e.into_response());
-    }
-
-    let job = {
-        let conn = state.db.lock().await;
-        match db::get_job(&conn, job_id) {
-            Ok(j) => j,
-            Err(e) => return Ok(json_error(&e, warp::http::StatusCode::NOT_FOUND).into_response()),
-        }
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e.into_response()),
     };
 
     let working_dir = match &job.working_directory {
@@ -1280,11 +1541,11 @@ async fn handle_download_file(
         .unwrap_or("");
     let content_type = match ext {
         "txt" | "log" | "csv" => "text/plain",
-        "xml" => "application/xml",
+        "xml" | "pvd" => "application/xml",
         "json" => "application/json",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
-        "vtu" | "vtk" => "application/octet-stream",
+        "vtu" | "vtk" | "vtp" => "application/octet-stream",
         _ => "application/octet-stream",
     };
 
@@ -1298,12 +1559,495 @@ async fn handle_download_file(
 }
 
 // ============================================================
+// PVD Viewer Handlers
+// ============================================================
+
+/// Parse a PVD file and return timestep/variable metadata for the viewer
+async fn handle_pvd_info(
+    job_id: i64,
+    auth: Option<String>,
+    params: HashMap<String, String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
+    };
+
+    let working_dir = match &job.working_directory {
+        Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => return Ok(json_error("Job has no working directory", warp::http::StatusCode::NOT_FOUND)),
+    };
+
+    let out_dir = working_dir.join("out");
+    let pvd_path_str = params.get("path").cloned().unwrap_or_default();
+    if pvd_path_str.is_empty() {
+        return Ok(json_error("Missing 'path' parameter", warp::http::StatusCode::BAD_REQUEST));
+    }
+
+    let pvd_file = out_dir.join(&pvd_path_str);
+
+    // Security: canonicalize and verify it's within out/
+    let canonical_out = match out_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Ok(json_error("Cannot resolve output directory", warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+    };
+    let canonical_pvd = match pvd_file.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Ok(json_error("PVD file not found", warp::http::StatusCode::NOT_FOUND)),
+    };
+    if !canonical_pvd.starts_with(&canonical_out) {
+        return Ok(json_error("Access denied", warp::http::StatusCode::FORBIDDEN));
+    }
+
+    // Read and parse the PVD XML
+    let pvd_content = match tokio::fs::read_to_string(&canonical_pvd).await {
+        Ok(c) => c,
+        Err(e) => return Ok(json_error(&format!("Failed to read PVD: {}", e), warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+    };
+
+    // Parse PVD XML to extract datasets
+    let mut timestep_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> = std::collections::BTreeMap::new();
+    let mut file_extension = String::new();
+
+    for line in pvd_content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("<DataSet") {
+            continue;
+        }
+
+        // Parse attributes from the DataSet element
+        let ts = extract_xml_attr(trimmed, "timestep").unwrap_or_default();
+        let file = extract_xml_attr(trimmed, "file").unwrap_or_default();
+        let part = extract_xml_attr(trimmed, "part").unwrap_or_default();
+        let group = extract_xml_attr(trimmed, "group").unwrap_or_default();
+
+        if file.is_empty() || ts.is_empty() {
+            continue;
+        }
+
+        if file_extension.is_empty() {
+            if let Some(ext) = file.rsplit('.').next() {
+                file_extension = ext.to_lowercase();
+            }
+        }
+
+        let entry = timestep_map.entry(ts.clone()).or_insert_with(Vec::new);
+        entry.push(serde_json::json!({
+            "file": file,
+            "part": part,
+            "group": group,
+        }));
+    }
+
+    // Build sorted unique timesteps
+    let mut timesteps: Vec<serde_json::Value> = timestep_map.iter().map(|(ts, files)| {
+        let ts_val: f64 = ts.parse().unwrap_or(0.0);
+        serde_json::json!({
+            "time": ts_val,
+            "time_str": ts,
+            "files": files,
+        })
+    }).collect();
+
+    // Sort by actual numeric time value
+    timesteps.sort_by(|a, b| {
+        let ta = a["time"].as_f64().unwrap_or(0.0);
+        let tb = b["time"].as_f64().unwrap_or(0.0);
+        ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Try to get data array info from one representative file
+    let arrays_info = if let Some(first_ts) = timesteps.first() {
+        if let Some(first_file) = first_ts["files"].as_array().and_then(|a| a.first()) {
+            if let Some(file_path) = first_file["file"].as_str() {
+                // The file path in PVD is relative to the PVD file's directory
+                let pvd_dir = canonical_pvd.parent().unwrap_or(&canonical_out);
+                let data_file = pvd_dir.join(file_path);
+                get_vtk_arrays_info(&data_file).await
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(json_ok(&serde_json::json!({
+        "pvd_path": pvd_path_str,
+        "file_type": file_extension,
+        "timestep_count": timesteps.len(),
+        "timesteps": timesteps,
+        "arrays": arrays_info.unwrap_or_else(|| serde_json::json!([])),
+    })))
+}
+
+/// Scan Output directory for all loadable visual layers (slices, surfaces, STLs — skip volumes)
+async fn handle_visuals_layers(
+    job_id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
+    };
+
+    let working_dir = match &job.working_directory {
+        Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => return Ok(json_error("Job has no working directory", warp::http::StatusCode::NOT_FOUND)),
+    };
+
+    let out_dir = working_dir.join("out");
+    let output_dir = out_dir.join("Output");
+
+    if !output_dir.exists() {
+        return Ok(json_ok(&serde_json::json!({ "layers": [] })));
+    }
+
+    let mut layers = Vec::new();
+
+    // Scan for .pvd files in Output/
+    if let Ok(entries) = std::fs::read_dir(&output_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() { continue; }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "pvd" { continue; }
+
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+
+            // Skip volumes
+            if name.starts_with("Volume") { continue; }
+
+            // Read first DataSet line to determine referenced file type
+            let mut file_type = String::from("vtp");
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("<DataSet") {
+                        if let Some(fattr) = extract_xml_attr(trimmed, "file") {
+                            if let Some(ext) = fattr.rsplit('.').next() {
+                                file_type = ext.to_lowercase();
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Determine category for sorting
+            let category = if name.starts_with("Slice") && (name.contains("X_") || name.contains("Y_") || name.contains("Z_")) {
+                "slice"
+            } else if name == "BoundaryConditions" {
+                "boundary"
+            } else {
+                "surface"
+            };
+
+            let rel_path = format!("Output/{}", entry.file_name().to_string_lossy());
+            layers.push(serde_json::json!({
+                "name": name,
+                "type": "pvd",
+                "path": rel_path,
+                "file_type": file_type,
+                "category": category,
+            }));
+        }
+    }
+
+    // Scan recursively for .stl files in Output/
+    fn find_stls(dir: &std::path::Path, base: &std::path::Path, layers: &mut Vec<serde_json::Value>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    find_stls(&path, base, layers);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("stl") {
+                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    let rel_path = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().to_string();
+                    layers.push(serde_json::json!({
+                        "name": name,
+                        "type": "stl",
+                        "path": rel_path,
+                        "file_type": "stl",
+                        "category": "stl",
+                    }));
+                }
+            }
+        }
+    }
+    find_stls(&output_dir, &out_dir, &mut layers);
+
+    // Sort: slices first, then boundary, then surfaces, then STLs
+    layers.sort_by(|a, b| {
+        let order = |v: &serde_json::Value| -> u8 {
+            match v["category"].as_str().unwrap_or("") {
+                "slice" => 0,
+                "boundary" => 1,
+                "surface" => 2,
+                "stl" => 3,
+                _ => 4,
+            }
+        };
+        let oa = order(a);
+        let ob = order(b);
+        if oa != ob { return oa.cmp(&ob); }
+        let na = a["name"].as_str().unwrap_or("");
+        let nb = b["name"].as_str().unwrap_or("");
+        na.cmp(nb)
+    });
+
+    Ok(json_ok(&serde_json::json!({ "layers": layers })))
+}
+
+/// Get data array information from a VTU or VTP file using the Python helper
+async fn get_vtk_arrays_info(file_path: &std::path::Path) -> Option<serde_json::Value> {
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let info_cmd = match ext {
+        "vtu" => "info-vtu",
+        "vtp" => "info-vtp",
+        "vti" => "info-vti",
+        _ => return None,
+    };
+
+    // Find our helper script relative to the executable
+    let script_path = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join("scripts/vtu_to_vtp.py");
+
+    // Fallback: try relative to CWD
+    let script = if script_path.exists() {
+        script_path
+    } else {
+        std::path::PathBuf::from("scripts/vtu_to_vtp.py")
+    };
+
+    if !script.exists() {
+        println!("[PVD] Warning: vtu_to_vtp.py not found at {:?}", script);
+        return None;
+    }
+
+    let output = tokio::process::Command::new("python3")
+        .arg(&script)
+        .arg(info_cmd)
+        .arg(file_path)
+        .output()
+        .await
+        .ok()?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let info: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+        info.get("arrays").cloned()
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("[PVD] Array info failed: {}", stderr);
+        None
+    }
+}
+
+/// Extract an XML attribute value from a tag string (simple regex-free parser)
+fn extract_xml_attr(tag: &str, attr_name: &str) -> Option<String> {
+    let pattern = format!("{}=\"", attr_name);
+    if let Some(start) = tag.find(&pattern) {
+        let value_start = start + pattern.len();
+        if let Some(end) = tag[value_start..].find('"') {
+            return Some(tag[value_start..value_start + end].to_string());
+        }
+    }
+    None
+}
+
+/// Serve a VTK file (VTP directly, VTU after conversion to VTP)
+async fn handle_vtk_serve(
+    job_id: i64,
+    auth: Option<String>,
+    params: HashMap<String, String>,
+    state: AppState,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use warp::Reply;
+
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e.into_response()),
+    };
+
+    let working_dir = match &job.working_directory {
+        Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => return Ok(json_error("Job has no working directory", warp::http::StatusCode::NOT_FOUND).into_response()),
+    };
+
+    let out_dir = working_dir.join("out");
+    let file_path = params.get("path").cloned().unwrap_or_default();
+    if file_path.is_empty() {
+        return Ok(json_error("Missing 'path' parameter", warp::http::StatusCode::BAD_REQUEST).into_response());
+    }
+
+    let target = out_dir.join(&file_path);
+
+    // Security check
+    let canonical_out = match out_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Ok(json_error("Cannot resolve output directory", warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+    };
+    let canonical_target = match target.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Ok(json_error("File not found", warp::http::StatusCode::NOT_FOUND).into_response()),
+    };
+    if !canonical_target.starts_with(&canonical_out) {
+        return Ok(json_error("Access denied", warp::http::StatusCode::FORBIDDEN).into_response());
+    }
+    if !canonical_target.is_file() {
+        return Ok(json_error("Not a file", warp::http::StatusCode::BAD_REQUEST).into_response());
+    }
+
+    let ext = canonical_target.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let content = match ext.as_str() {
+        "vtp" => {
+            // Serve VTP directly
+            match tokio::fs::read(&canonical_target).await {
+                Ok(c) => c,
+                Err(e) => return Ok(json_error(&format!("Failed to read VTP: {}", e),
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+            }
+        },
+        "vtu" => {
+            // Convert VTU to VTP, using cache
+            let cache_path = canonical_target.with_extension("vtu.converted.vtp");
+
+            if cache_path.exists() {
+                // Use cached conversion
+                match tokio::fs::read(&cache_path).await {
+                    Ok(c) => c,
+                    Err(e) => return Ok(json_error(&format!("Failed to read cached VTP: {}", e),
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+                }
+            } else {
+                // Convert on-the-fly
+                let script_path = std::path::PathBuf::from("scripts/vtu_to_vtp.py");
+                if !script_path.exists() {
+                    return Ok(json_error("Conversion script not found", warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response());
+                }
+
+                let result = tokio::process::Command::new("python3")
+                    .arg(&script_path)
+                    .arg("convert")
+                    .arg(&canonical_target)
+                    .arg(&cache_path)
+                    .output()
+                    .await;
+
+                match result {
+                    Ok(output) if output.status.success() => {
+                        match tokio::fs::read(&cache_path).await {
+                            Ok(c) => c,
+                            Err(e) => return Ok(json_error(&format!("Failed to read converted VTP: {}", e),
+                                warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+                        }
+                    },
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Ok(json_error(&format!("VTU conversion failed: {}", stderr),
+                            warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response());
+                    },
+                    Err(e) => {
+                        return Ok(json_error(&format!("Failed to run conversion: {}", e),
+                            warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response());
+                    }
+                }
+            }
+        },
+        "vti" => {
+            // Convert VTI (ImageData) to VTP via Python VTK, using cache
+            let cache_path = canonical_target.with_extension("vti.converted.vtp");
+
+            if cache_path.exists() {
+                match tokio::fs::read(&cache_path).await {
+                    Ok(c) => c,
+                    Err(e) => return Ok(json_error(&format!("Failed to read cached VTP: {}", e),
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+                }
+            } else {
+                let script_path = std::path::PathBuf::from("scripts/vtu_to_vtp.py");
+                if !script_path.exists() {
+                    return Ok(json_error("Conversion script not found", warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response());
+                }
+
+                let result = tokio::process::Command::new("python3")
+                    .arg(&script_path)
+                    .arg("convert")
+                    .arg(&canonical_target)
+                    .arg(&cache_path)
+                    .output()
+                    .await;
+
+                match result {
+                    Ok(output) if output.status.success() => {
+                        match tokio::fs::read(&cache_path).await {
+                            Ok(c) => c,
+                            Err(e) => return Ok(json_error(&format!("Failed to read converted VTP: {}", e),
+                                warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+                        }
+                    },
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Ok(json_error(&format!("VTI conversion failed: {}", stderr),
+                            warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response());
+                    },
+                    Err(e) => {
+                        return Ok(json_error(&format!("Failed to run conversion: {}", e),
+                            warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response());
+                    }
+                }
+            }
+        },
+        "stl" => {
+            // Serve STL directly (binary mesh format)
+            match tokio::fs::read(&canonical_target).await {
+                Ok(c) => c,
+                Err(e) => return Ok(json_error(&format!("Failed to read STL: {}", e),
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR).into_response()),
+            }
+        },
+        _ => {
+            return Ok(json_error(&format!("Unsupported file type: {}", ext),
+                warp::http::StatusCode::BAD_REQUEST).into_response());
+        }
+    };
+
+    // Return with CORS-friendly headers for fetch from the browser
+    Ok(warp::reply::with_header(
+        warp::reply::with_header(
+            warp::reply::with_status(content, warp::http::StatusCode::OK),
+            "Content-Type", "application/octet-stream"
+        ),
+        "Cache-Control", "public, max-age=3600"
+    ).into_response())
+}
+
+// ============================================================
 // Version Handlers
 // ============================================================
 
 async fn handle_list_versions(
+    auth: Option<String>,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
+    // SECURITY: Require authentication to list versions (prevents information leak)
+    if let Err(e) = require_auth(&auth, &state).await {
+        return Ok(e);
+    }
     let versions = state.versions.lock().await;
     let response: Vec<VersionResponse> = versions.iter().map(|v| VersionResponse {
         version: v.version.clone(),
@@ -1627,6 +2371,21 @@ struct RestartRequest {
     /// Specific checkpoint number to restart from. If None, uses --load-last.
     #[serde(default)]
     checkpoint_number: Option<i64>,
+    /// Override: GPU IDs as JSON array string, e.g. "[0,2]"
+    #[serde(default)]
+    gpu_ids: Option<String>,
+    /// Override: M-Star version to use
+    #[serde(default)]
+    mstar_version: Option<String>,
+    /// Override: Job priority
+    #[serde(default)]
+    priority: Option<i32>,
+    /// Override: Whether to enable unified memory
+    #[serde(default)]
+    unified_memory: Option<bool>,
+    /// Override: Path to copy results to
+    #[serde(default)]
+    copy_to_path: Option<String>,
 }
 
 async fn handle_restart_job(
@@ -1635,9 +2394,11 @@ async fn handle_restart_job(
     body: RestartRequest,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Err(e) = require_auth(&auth, &state).await {
-        return Ok(e);
-    }
+    // SECURITY: Ownership check — only job owner or admin can restart
+    let (_user, _job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
+    };
 
     // Build restart_options JSON that includes checkpoint_number if specified
     let opts = {
@@ -1654,7 +2415,16 @@ async fn handle_restart_job(
     let opts_str = serde_json::to_string(&opts).unwrap_or_else(|_| "{}".to_string());
 
     let db = state.db.lock().await;
-    match db::create_restart_job(&db, job_id, Some(&opts_str)) {
+    match db::create_restart_job(
+        &db,
+        job_id,
+        Some(&opts_str),
+        body.gpu_ids.as_deref(),
+        body.mstar_version.as_deref(),
+        body.priority,
+        body.unified_memory,
+        body.copy_to_path.as_deref(),
+    ) {
         Ok(new_id) => {
             let cp_msg = match body.checkpoint_number {
                 Some(n) => format!(" from checkpoint {}", n),
@@ -1680,9 +2450,11 @@ async fn handle_archive_job(
     auth: Option<String>,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Err(e) = require_auth(&auth, &state).await {
-        return Ok(e);
-    }
+    // SECURITY: Ownership check — only job owner or admin can archive
+    let (_user, _job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
+    };
 
     let db = state.db.lock().await;
     match db::archive_job(&db, job_id) {
@@ -1698,8 +2470,13 @@ async fn handle_archive_all_failed(
     auth: Option<String>,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Err(e) = require_auth(&auth, &state).await {
-        return Ok(e);
+    // SECURITY: Only admins can bulk-archive all failed jobs
+    let user = match require_auth(&auth, &state).await {
+        Ok(u) => u,
+        Err(e) => return Ok(e),
+    };
+    if user.role != "admin" {
+        return Ok(json_error("Admin access required for bulk archive", warp::http::StatusCode::FORBIDDEN));
     }
 
     let db = state.db.lock().await;
@@ -1724,16 +2501,11 @@ async fn handle_list_checkpoints(
     auth: Option<String>,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Err(e) = require_auth(&auth, &state).await {
-        return Ok(e);
-    }
-
-    let db = state.db.lock().await;
-    let job = match db::get_job(&db, job_id) {
-        Ok(j) => j,
-        Err(e) => return Ok(json_error(&e, warp::http::StatusCode::NOT_FOUND)),
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
     };
-    drop(db);
 
     let work_dir = match &job.working_directory {
         Some(d) => d.clone(),
@@ -1793,16 +2565,11 @@ async fn handle_list_stats_files(
     auth: Option<String>,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Err(e) = require_auth(&auth, &state).await {
-        return Ok(e);
-    }
-
-    let db = state.db.lock().await;
-    let job = match db::get_job(&db, job_id) {
-        Ok(j) => j,
-        Err(e) => return Ok(json_error(&e, warp::http::StatusCode::NOT_FOUND)),
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
     };
-    drop(db);
 
     let work_dir = match &job.working_directory {
         Some(d) => d.clone(),
@@ -1878,9 +2645,11 @@ async fn handle_get_stats_file(
     auth: Option<String>,
     state: AppState,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    if let Err(e) = require_auth(&auth, &state).await {
-        return Ok(e);
-    }
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
+    };
 
     // Sanitize filename — prevent directory traversal
     let safe_filename = std::path::Path::new(&filename)
@@ -1890,13 +2659,6 @@ async fn handle_get_stats_file(
     if safe_filename.is_empty() || safe_filename.contains("..") {
         return Ok(json_error("Invalid filename", warp::http::StatusCode::BAD_REQUEST));
     }
-
-    let db = state.db.lock().await;
-    let job = match db::get_job(&db, job_id) {
-        Ok(j) => j,
-        Err(e) => return Ok(json_error(&e, warp::http::StatusCode::NOT_FOUND)),
-    };
-    drop(db);
 
     let work_dir = match &job.working_directory {
         Some(d) => d.clone(),
@@ -2016,16 +2778,22 @@ async fn handle_browse(
                     // Skip hidden files/directories
                     if name.starts_with('.') { continue; }
 
-                    let file_type = entry.file_type().unwrap_or_else(|_| {
-                        std::fs::metadata(entry.path()).unwrap().file_type()
-                    });
+                    let file_type = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(_) => match std::fs::metadata(entry.path()) {
+                            Ok(m) => m.file_type(),
+                            Err(_) => continue, // Skip unreadable entries (e.g., dangling symlinks)
+                        },
+                    };
                     let is_dir = file_type.is_dir();
                     let is_msb = !is_dir && (name.to_lowercase().ends_with(".msb"));
+                    let is_pvsm = !is_dir && (name.to_lowercase().ends_with(".pvsm"));
 
                     // Filter based on mode
                     let include = match mode.as_str() {
                         "dirs" => is_dir,
                         "msb" => is_dir || is_msb,
+                        "pvsm" => is_dir || is_pvsm,
                         _ => true, // "all" — show everything
                     };
 
@@ -2042,6 +2810,7 @@ async fn handle_browse(
                         "path": entry.path().to_str().unwrap_or(""),
                         "is_dir": is_dir,
                         "is_msb": is_msb,
+                        "is_pvsm": is_pvsm,
                         "size": size,
                     }));
                 }
@@ -2134,5 +2903,1712 @@ async fn handle_mkdir(
             &format!("Failed to create directory: {}", e),
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
         )),
+    }
+}
+
+// ============================================================
+// Render Job Handlers
+// ============================================================
+
+#[derive(Deserialize)]
+struct RenderRequest {
+    /// ID of the completed simulation job to render (optional if source_path given)
+    #[serde(default)]
+    source_job_id: Option<i64>,
+    /// Direct path to simulation data directory (alternative to source_job_id)
+    #[serde(default)]
+    source_path: Option<String>,
+    /// Name for the render job
+    #[serde(default)]
+    name: Option<String>,
+    /// Path to the .pvsm state file (absolute path or relative to source dir)
+    state_file: String,
+    /// M-Star version to use for pvpython (determines which ParaView binary)
+    #[serde(default = "default_render_version")]
+    mstar_version: String,
+    /// GPU ID to use for rendering
+    #[serde(default)]
+    gpu_id: i32,
+    /// Resolution as [width, height], or null for state file resolution
+    #[serde(default)]
+    resolution: Option<Vec<i32>>,
+    /// Framerate (default: 25)
+    #[serde(default = "default_fps")]
+    fps: i32,
+    /// Video quality CRF value 0-51 (default: 23)
+    #[serde(default = "default_crf")]
+    video_quality: i32,
+    /// Use transparent background
+    #[serde(default)]
+    transparent: bool,
+    /// PNG compression 0-9
+    #[serde(default)]
+    compression: i32,
+    /// Render each view as separate file
+    #[serde(default)]
+    separate_views: bool,
+    /// Scale fonts with resolution
+    #[serde(default)]
+    scale_fonts: bool,
+    /// Generate MP4 video from frames
+    #[serde(default = "default_true_bool")]
+    generate_video: bool,
+}
+
+fn default_render_version() -> String { "latest".to_string() }
+fn default_fps() -> i32 { 25 }
+fn default_crf() -> i32 { 23 }
+fn default_true_bool() -> bool { true }
+
+async fn handle_render_submit(
+    auth: Option<String>,
+    body: RenderRequest,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // SECURITY: Authenticate user
+    let user = match require_auth(&auth, &state).await {
+        Ok(u) => u,
+        Err(e) => return Ok(e),
+    };
+
+    // Determine source: either from a job ID or a direct path
+    let (source_work_dir, source_job_id_for_db, source_name, source_label) = if let Some(job_id) = body.source_job_id {
+        // Source from a job
+        let source_job = {
+            let db = state.db.lock().await;
+            match db::get_job(&db, job_id) {
+                Ok(j) => j,
+                Err(e) => return Ok(json_error(&format!("Source job not found: {}", e), warp::http::StatusCode::NOT_FOUND)),
+            }
+        };
+
+        // SECURITY: Verify the user owns the source job (or is admin)
+        if user.role != "admin" && source_job.user_id != user.id {
+            return Ok(json_error("Access denied: you can only render your own jobs", warp::http::StatusCode::FORBIDDEN));
+        }
+
+        let work_dir = match &source_job.working_directory {
+            Some(d) => d.clone(),
+            None => return Ok(json_error("Source job has no working directory", warp::http::StatusCode::BAD_REQUEST)),
+        };
+
+        let label = source_job.msb_filename.clone();
+        (work_dir, Some(job_id), source_job.name.clone(), label)
+    } else if let Some(ref path_str) = body.source_path {
+        // Source from a direct network path
+        // SECURITY: Validate the path is under the data root
+        let browse_root = state.config.paths.data_root.to_str().unwrap_or("/");
+        let canonical = match std::fs::canonicalize(path_str) {
+            Ok(p) => p,
+            Err(_) => return Ok(json_error("Source path not found", warp::http::StatusCode::BAD_REQUEST)),
+        };
+        if !canonical.starts_with(browse_root) {
+            return Ok(json_error(&format!("Source path must be under {}", browse_root), warp::http::StatusCode::FORBIDDEN));
+        }
+        if !canonical.is_dir() {
+            return Ok(json_error("Source path must be a directory", warp::http::StatusCode::BAD_REQUEST));
+        }
+
+        let dir_name = canonical.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+        let label = canonical.to_str().unwrap_or(path_str).to_string();
+        (canonical.to_str().unwrap_or("").to_string(), None, dir_name, label)
+    } else {
+        return Ok(json_error("Either source_job_id or source_path is required", warp::http::StatusCode::BAD_REQUEST));
+    };
+
+    // Validate source has output data
+    let out_dir = std::path::Path::new(&source_work_dir).join("out");
+    if !out_dir.is_dir() {
+        return Ok(json_error("Source has no output data (out/ directory missing)", warp::http::StatusCode::BAD_REQUEST));
+    }
+
+    // Validate and resolve state file path
+    // SECURITY: For job-based sources, state file must be under job dir
+    //           For path-based sources, state file can be absolute (must be under data root)
+    let state_file_path = {
+        let raw = std::path::Path::new(&body.state_file);
+        let resolved = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            std::path::Path::new(&source_work_dir).join(raw)
+        };
+
+        match std::fs::canonicalize(&resolved) {
+            Ok(canonical) => {
+                // For job-based sources, ensure state file is under the job's working directory
+                if body.source_job_id.is_some() {
+                    let work_dir_canonical = match std::fs::canonicalize(&source_work_dir) {
+                        Ok(c) => c,
+                        Err(e) => return Ok(json_error(&format!("Cannot resolve working directory: {}", e), warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+                    };
+                    if !canonical.starts_with(&work_dir_canonical) {
+                        return Ok(json_error("State file must be within the job's working directory", warp::http::StatusCode::FORBIDDEN));
+                    }
+                } else {
+                    // For path-based sources, ensure state file is under data root
+                    let browse_root = state.config.paths.data_root.to_str().unwrap_or("/");
+                    if !canonical.starts_with(browse_root) {
+                        return Ok(json_error("State file must be under the data root", warp::http::StatusCode::FORBIDDEN));
+                    }
+                }
+                canonical
+            }
+            Err(e) => return Ok(json_error(&format!("State file not found: {}", e), warp::http::StatusCode::BAD_REQUEST)),
+        }
+    };
+
+    if !state_file_path.extension().map_or(false, |ext| ext == "pvsm") {
+        return Ok(json_error("State file must have .pvsm extension", warp::http::StatusCode::BAD_REQUEST));
+    }
+
+    // Validate render parameters
+    if body.fps < 1 || body.fps > 120 {
+        return Ok(json_error("FPS must be between 1 and 120", warp::http::StatusCode::BAD_REQUEST));
+    }
+    if body.video_quality < 0 || body.video_quality > 51 {
+        return Ok(json_error("Video quality (CRF) must be between 0 and 51", warp::http::StatusCode::BAD_REQUEST));
+    }
+    if body.compression < 0 || body.compression > 9 {
+        return Ok(json_error("Compression must be between 0 and 9", warp::http::StatusCode::BAD_REQUEST));
+    }
+    if body.gpu_id < 0 {
+        return Ok(json_error("GPU ID must be non-negative", warp::http::StatusCode::BAD_REQUEST));
+    }
+    if let Some(ref res) = body.resolution {
+        if res.len() != 2 || res[0] <= 0 || res[1] <= 0 {
+            return Ok(json_error("Resolution must be [width, height] with positive values", warp::http::StatusCode::BAD_REQUEST));
+        }
+    }
+
+    // Build render name
+    let render_name = body.name.clone().unwrap_or_else(|| {
+        format!("Render: {}", source_name)
+    });
+
+    // Build render options JSON for storage and later use by the queue daemon
+    let render_options = serde_json::json!({
+        "state_file": state_file_path.to_str().unwrap_or(""),
+        "source_work_dir": source_work_dir,
+        "gpu_id": body.gpu_id,
+        "resolution": body.resolution,
+        "fps": body.fps,
+        "video_quality": body.video_quality,
+        "transparent": body.transparent,
+        "compression": body.compression,
+        "separate_views": body.separate_views,
+        "scale_fonts": body.scale_fonts,
+        "generate_video": body.generate_video,
+        "render_name": render_name.replace(" ", "_").replace("/", "_"),
+    });
+    let render_options_str = serde_json::to_string(&render_options)
+        .unwrap_or_else(|_| "{}".to_string());
+
+    // GPU IDs as JSON array
+    let gpu_ids_str = format!("[{}]", body.gpu_id);
+
+    let db = state.db.lock().await;
+    match db::create_render_job(
+        &db,
+        user.id,
+        &render_name,
+        source_job_id_for_db,
+        &source_label,
+        &body.mstar_version,
+        &gpu_ids_str,
+        &render_options_str,
+    ) {
+        Ok(job_id) => Ok(json_ok(&serde_json::json!({
+            "message": "Render job created",
+            "job_id": job_id,
+            "source_job_id": source_job_id_for_db,
+        }))),
+        Err(e) => Ok(json_error(&e, warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+    }
+}
+
+async fn handle_render_status(
+    job_id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
+    };
+
+    // Verify this is a render job
+    if job.job_type != "render" {
+        return Ok(json_error("Not a render job", warp::http::StatusCode::BAD_REQUEST));
+    }
+
+    // Read render_status.json from the render output directory
+    let work_dir = match &job.working_directory {
+        Some(d) => d.clone(),
+        None => {
+            // Job hasn't started yet — return queued status
+            return Ok(json_ok(&serde_json::json!({
+                "job_status": job.status,
+                "state": "queued",
+                "current_frame": 0,
+                "total_frames": 0,
+                "percent": 0,
+                "elapsed_seconds": 0,
+                "eta_seconds": 0,
+                "error": null,
+                "video_file": null,
+            })));
+        }
+    };
+
+    let status_file = std::path::Path::new(&work_dir).join("render_status.json");
+
+    // IMPORTANT: The DB job status is the authoritative source of truth.
+    // The render_status.json file may be stale (e.g., process crashed at frame 13/40
+    // and never updated the file). We always overlay the DB status onto the response.
+    let db_status = &job.status;
+    let db_error = &job.error_message;
+
+    match tokio::fs::read_to_string(&status_file).await {
+        Ok(content) => {
+            match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(mut status) => {
+                    // Overlay the authoritative DB status
+                    if let Some(obj) = status.as_object_mut() {
+                        obj.insert("job_status".to_string(), serde_json::json!(db_status));
+
+                        // If the DB says the job failed, override the file's state
+                        if db_status == "failed" {
+                            obj.insert("state".to_string(), serde_json::json!("failed"));
+                            if let Some(err) = db_error {
+                                obj.insert("error".to_string(), serde_json::json!(err));
+                            }
+                        } else if db_status == "completed" {
+                            obj.insert("state".to_string(), serde_json::json!("completed"));
+                        }
+                    }
+                    Ok(json_ok(&status))
+                }
+                Err(_) => Ok(json_ok(&serde_json::json!({
+                    "job_status": db_status,
+                    "state": if db_status == "failed" { "failed" } else { "unknown" },
+                    "error": db_error.as_deref().unwrap_or("Invalid status file format"),
+                }))),
+            }
+        }
+        Err(_) => {
+            // Status file doesn't exist yet — job may be starting or may have failed
+            // before writing the file
+            Ok(json_ok(&serde_json::json!({
+                "job_status": db_status,
+                "state": db_status,
+                "current_frame": 0,
+                "total_frames": 0,
+                "percent": 0,
+                "error": db_error,
+            })))
+        }
+    }
+}
+
+async fn handle_upload_state_file(
+    job_id: i64,
+    auth: Option<String>,
+    form: warp::multipart::FormData,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    use futures::TryStreamExt;
+    use bytes::Buf;
+
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
+    };
+
+    let work_dir = match &job.working_directory {
+        Some(d) => d.clone(),
+        None => return Ok(json_error("Job has no working directory", warp::http::StatusCode::BAD_REQUEST)),
+    };
+
+    // Create state_files subdirectory
+    let states_dir = std::path::Path::new(&work_dir).join("state_files");
+    if let Err(e) = tokio::fs::create_dir_all(&states_dir).await {
+        return Ok(json_error(&format!("Failed to create state files directory: {}", e),
+                             warp::http::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    let mut parts = form;
+    let mut uploaded_files = Vec::new();
+
+    while let Ok(Some(mut part)) = parts.try_next().await {
+        let raw_filename = part.filename()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "state.pvsm".to_string());
+
+        // SECURITY: Sanitize filename — strip path components, allow only safe chars
+        let safe_filename = {
+            let basename = std::path::Path::new(&raw_filename)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("state.pvsm");
+
+            // Only allow alphanumeric, dash, underscore, dot
+            let sanitized: String = basename.chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+                .collect();
+
+            // Ensure .pvsm extension
+            if !sanitized.ends_with(".pvsm") {
+                format!("{}.pvsm", sanitized)
+            } else {
+                sanitized
+            }
+        };
+
+        // Read file data from part stream
+        let mut file_data = Vec::new();
+        while let Some(Ok(mut chunk)) = part.data().await {
+            while chunk.has_remaining() {
+                let bytes = chunk.chunk();
+                file_data.extend_from_slice(bytes);
+                let len = bytes.len();
+                chunk.advance(len);
+            }
+        }
+
+        // Size validation (max 500 MB)
+        if file_data.len() > 500 * 1024 * 1024 {
+            return Ok(json_error("State file too large (max 500 MB)", warp::http::StatusCode::BAD_REQUEST));
+        }
+
+        let dest_path = states_dir.join(&safe_filename);
+        if let Err(e) = tokio::fs::write(&dest_path, &file_data).await {
+            return Ok(json_error(&format!("Failed to write state file: {}", e),
+                                 warp::http::StatusCode::INTERNAL_SERVER_ERROR));
+        }
+
+        uploaded_files.push(serde_json::json!({
+            "filename": safe_filename,
+            "size": file_data.len(),
+            "path": dest_path.to_str().unwrap_or(""),
+        }));
+    }
+
+    if uploaded_files.is_empty() {
+        return Ok(json_error("No files uploaded", warp::http::StatusCode::BAD_REQUEST));
+    }
+
+    Ok(json_ok(&serde_json::json!({
+        "message": format!("Uploaded {} state file(s)", uploaded_files.len()),
+        "files": uploaded_files,
+    })))
+}
+
+async fn handle_list_state_files(
+    job_id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // SECURITY: Ownership check
+    let (_user, job) = match require_job_access(&auth, &state, job_id).await {
+        Ok(r) => r,
+        Err(e) => return Ok(e),
+    };
+
+    let work_dir = match &job.working_directory {
+        Some(d) => d.clone(),
+        None => return Ok(json_ok(&serde_json::json!({ "state_files": [] }))),
+    };
+
+    let states_dir = std::path::Path::new(&work_dir).join("state_files");
+
+    let mut state_files = Vec::new();
+
+    if states_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&states_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "pvsm") {
+                    let filename = path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                    state_files.push(serde_json::json!({
+                        "filename": filename,
+                        "path": path.to_str().unwrap_or(""),
+                        "size": size,
+                    }));
+                }
+            }
+        }
+    }
+
+    // Also check out/Output for any .pvsm files that may have been generated by the solver
+    let output_dir = std::path::Path::new(&work_dir).join("out").join("Output");
+    if output_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&output_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "pvsm") {
+                    let filename = path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                    state_files.push(serde_json::json!({
+                        "filename": filename,
+                        "path": path.to_str().unwrap_or(""),
+                        "size": size,
+                        "source": "output",
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(json_ok(&serde_json::json!({
+        "state_files": state_files,
+    })))
+}
+
+// ============================================================
+// AI Training Handlers
+// ============================================================
+
+/// GET /api/ai/datasets — list datasets for the authenticated user
+async fn handle_ai_list_datasets(
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    // Admins see all; users see their own
+    let user_filter = if user.role == "admin" { None } else { Some(user.id) };
+    let datasets = ai_training::list_datasets(&db, user_filter);
+
+    Ok(json_ok(&serde_json::json!({ "datasets": datasets })))
+}
+
+/// POST /api/ai/datasets — create a new AI dataset
+async fn handle_ai_create_dataset(
+    auth: Option<String>,
+    body: CreateAiDatasetRequest,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    // Validate sweep_root path against data_root + jobs_directory
+    let mut training_roots = state.config.ai_training.allowed_training_roots.clone();
+    // Also allow paths under the jobs directory (where sweeps are stored)
+    if let Some(jobs_dir) = state.config.paths.jobs_directory.to_str() {
+        training_roots.push(jobs_dir.to_string());
+    }
+    if let Err(e) = ai_training::validate_training_path(
+        &body.sweep_root,
+        &state.config.paths.data_root,
+        &training_roots,
+    ) {
+        return Ok(json_error(&format!("Invalid sweep root: {}", e), warp::http::StatusCode::BAD_REQUEST));
+    }
+
+    let config_json = body.config.map(|v| v.to_string());
+
+    let dataset_id = match ai_training::create_dataset(
+        &db,
+        user.id,
+        &body.name,
+        &body.sweep_root,
+        "",  // dataset_mode is now empty — inventory scan determines what's available
+        config_json.as_deref(),
+    ) {
+        Ok(id) => id,
+        Err(e) => return Ok(json_error(&e, warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+    };
+
+    // Drop the DB lock before spawning background scan
+    drop(db);
+
+    // Trigger background scan
+    let scan_root = body.sweep_root.clone();
+    let scan_db = state.db.clone();
+    tokio::spawn(async move {
+        run_dataset_scan(scan_db, dataset_id, &scan_root).await;
+    });
+
+    Ok(json_ok(&serde_json::json!({
+        "id": dataset_id,
+        "message": "Dataset created — scanning output data",
+        "status": "scanning"
+    })))
+}
+
+/// GET /api/ai/datasets/:id — get a single dataset
+async fn handle_ai_get_dataset(
+    id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let datasets = ai_training::list_datasets(&db, None);
+    match datasets.into_iter().find(|d| d.id == id) {
+        Some(ds) => {
+            if user.role != "admin" && ds.user_id != user.id {
+                return Ok(json_error("Forbidden", warp::http::StatusCode::FORBIDDEN));
+            }
+            Ok(json_ok(&ds))
+        }
+        None => Ok(json_error("Dataset not found", warp::http::StatusCode::NOT_FOUND)),
+    }
+}
+
+/// POST /api/ai/datasets/:id/rescan — re-scan dataset inventory
+async fn handle_ai_rescan_dataset(
+    id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let datasets = ai_training::list_datasets(&db, None);
+    let ds = match datasets.into_iter().find(|d| d.id == id) {
+        Some(ds) => {
+            if user.role != "admin" && ds.user_id != user.id {
+                return Ok(json_error("Forbidden", warp::http::StatusCode::FORBIDDEN));
+            }
+            ds
+        }
+        None => return Ok(json_error("Dataset not found", warp::http::StatusCode::NOT_FOUND)),
+    };
+
+    // Set status to scanning
+    let _ = ai_training::update_dataset_status(&db, id, "scanning", None, None, None);
+    drop(db);
+
+    // Trigger background scan
+    let scan_root = ds.sweep_root.clone();
+    let scan_db = state.db.clone();
+    tokio::spawn(async move {
+        run_dataset_scan(scan_db, id, &scan_root).await;
+    });
+
+    Ok(json_ok(&serde_json::json!({
+        "id": id,
+        "message": "Re-scanning dataset",
+        "status": "scanning"
+    })))
+}
+
+/// GET /api/ai/training-jobs — list training jobs
+async fn handle_ai_list_training_jobs(
+    auth: Option<String>,
+    params: HashMap<String, String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let user_filter = if user.role == "admin" { None } else { Some(user.id) };
+    let status_filter = params.get("status").map(|s| s.as_str());
+    let jobs = ai_training::list_training_jobs(&db, user_filter, status_filter);
+
+    Ok(json_ok(&serde_json::json!({ "training_jobs": jobs })))
+}
+
+/// POST /api/ai/training-jobs — create and queue a training job
+async fn handle_ai_create_training_job(
+    auth: Option<String>,
+    body: CreateAiTrainingJobRequest,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    // Validate model family
+    let valid_families = ["fno", "mlp", "gnn"];
+    if !valid_families.contains(&body.model_family.as_str()) {
+        return Ok(json_error(
+            &format!("Invalid model_family: '{}'. Valid: {:?}", body.model_family, valid_families),
+            warp::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    // Check concurrent training limit
+    let running = ai_training::list_training_jobs(&db, None, Some("running"));
+    let max = state.config.ai_training.max_concurrent_training_jobs;
+    if running.len() >= max {
+        return Ok(json_error(
+            &format!("Maximum concurrent training jobs ({}) reached", max),
+            warp::http::StatusCode::TOO_MANY_REQUESTS,
+        ));
+    }
+
+    let run_name = body.run_name.unwrap_or_else(|| {
+        format!("run_{}_{}", body.model_family, chrono::Utc::now().format("%Y%m%d_%H%M%S"))
+    });
+
+    let gpu_ids_json = match &body.gpu_ids {
+        Some(ids) => serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string()),
+        None => "[]".to_string(),
+    };
+
+    let config_json = body.config.map(|v| v.to_string());
+
+    match ai_training::create_training_job(
+        &db,
+        body.dataset_id,
+        user.id,
+        &run_name,
+        &body.model_family,
+        &gpu_ids_json,
+        config_json.as_deref(),
+    ) {
+        Ok(id) => Ok(json_ok(&serde_json::json!({
+            "id": id,
+            "run_name": run_name,
+            "message": "Training job queued",
+        }))),
+        Err(e) => Ok(json_error(&e, warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+    }
+}
+
+/// GET /api/ai/training-jobs/:id — get a single training job
+async fn handle_ai_get_training_job(
+    id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let jobs = ai_training::list_training_jobs(&db, None, None);
+    match jobs.into_iter().find(|j| j.id == id) {
+        Some(job) => {
+            if user.role != "admin" && job.user_id != user.id {
+                return Ok(json_error("Forbidden", warp::http::StatusCode::FORBIDDEN));
+            }
+            Ok(json_ok(&job))
+        }
+        None => Ok(json_error("Training job not found", warp::http::StatusCode::NOT_FOUND)),
+    }
+}
+
+/// POST /api/ai/training-jobs/:id/cancel — cancel a running training job
+async fn handle_ai_cancel_training_job(
+    id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    // Find the job
+    let jobs = ai_training::list_training_jobs(&db, None, None);
+    let job = match jobs.into_iter().find(|j| j.id == id) {
+        Some(j) => j,
+        None => return Ok(json_error("Training job not found", warp::http::StatusCode::NOT_FOUND)),
+    };
+
+    // Auth check
+    if user.role != "admin" && job.user_id != user.id {
+        return Ok(json_error("Forbidden", warp::http::StatusCode::FORBIDDEN));
+    }
+
+    // Can only cancel queued/running jobs
+    if job.status != "queued" && job.status != "running" && job.status != "preflight" {
+        return Ok(json_error(
+            &format!("Cannot cancel a {} job", job.status),
+            warp::http::StatusCode::CONFLICT,
+        ));
+    }
+
+    // Kill the process if running
+    if let Some(pid) = job.pid {
+        let _ = ai_training::cancel_training_process(pid as u32);
+    }
+
+    // Release GPUs
+    let _ = ai_training::release_training_gpus(&db, id);
+
+    // Update status
+    if let Err(e) = ai_training::update_training_job_status(
+        &db, id, "cancelled", None, Some("Cancelled by user"),
+    ) {
+        return Ok(json_error(&e, warp::http::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    Ok(json_ok(&ApiSuccess { message: "Training job cancelled".to_string() }))
+}
+
+/// GET /api/ai/config — return AI training configuration (enabled, defaults)
+async fn handle_ai_config(
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let _user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let cfg = &state.config.ai_training;
+    Ok(json_ok(&serde_json::json!({
+        "enabled": cfg.enabled,
+        "container_mode": cfg.container_mode,
+        "default_model_family": cfg.default_model_family,
+        "default_dataset_format": cfg.default_dataset_format,
+        "default_batch_size": cfg.default_batch_size,
+        "default_epochs": cfg.default_epochs,
+        "default_learning_rate": cfg.default_learning_rate,
+        "checkpoint_interval_epochs": cfg.checkpoint_interval_epochs,
+        "max_concurrent_training_jobs": cfg.max_concurrent_training_jobs,
+        "gpu_selection_policy": cfg.gpu_selection_policy,
+    })))
+}
+
+/// POST /api/ai/preflight — run preflight checks for a training config
+async fn handle_ai_preflight(
+    auth: Option<String>,
+    body: serde_json::Value,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let _user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    // Run preflight via the mstar-ai CLI
+    let cfg = &state.config.ai_training;
+    let config_str = body.to_string();
+
+    let mut cmd = if cfg.container_mode {
+        let mut c = std::process::Command::new("docker");
+        c.arg("run").arg("--rm")
+         .arg(&cfg.container_image)
+         .arg("mstar-ai").arg("preflight")
+         .arg("--config-json").arg(&config_str);
+        c
+    } else {
+        let mut c = std::process::Command::new(&cfg.python_executable);
+        c.arg("-m").arg("mstar_ai.cli").arg("preflight")
+         .arg("--config-json").arg(&config_str);
+        c
+    };
+
+    cmd.stdout(std::process::Stdio::piped())
+       .stderr(std::process::Stdio::piped());
+
+    match cmd.output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Try to parse as JSON
+            match serde_json::from_str::<serde_json::Value>(&stdout) {
+                Ok(result) => Ok(json_ok(&result)),
+                Err(_) => Ok(json_ok(&serde_json::json!({
+                    "status": if output.status.success() { "ok" } else { "error" },
+                    "output": stdout.trim(),
+                }))),
+            }
+        }
+        Err(e) => Ok(json_error(
+            &format!("Failed to run preflight: {}", e),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
+// ============================================================
+// Sweep Detection & Batch Submit
+// ============================================================
+
+/// POST /api/sweep/detect — detect sweeps in an MSB file using sweep_inspector.py
+///
+/// Body: { "msb_path": "/path/to/file.msb", "mstar_version": "4.4.23" }
+/// Returns: { "sweeps": [...], "error": null }
+async fn handle_sweep_detect(
+    auth: Option<String>,
+    body: serde_json::Value,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let _user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+    drop(db);
+
+    let msb_path = match body.get("msb_path").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return Ok(json_error("msb_path required", warp::http::StatusCode::BAD_REQUEST)),
+    };
+
+    let mstar_version = body.get("mstar_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("latest")
+        .to_string();
+
+    // Resolve M-Star version to directory path
+    let mstar_dir = resolve_mstar_dir(&state.config.paths.mstar_install_dir, &mstar_version);
+    let mstar_dir = match mstar_dir {
+        Some(d) => d,
+        None => return Ok(json_error(
+            &format!("M-Star version '{}' not found", mstar_version),
+            warp::http::StatusCode::BAD_REQUEST,
+        )),
+    };
+
+    // SECURITY: Validate MSB path is under allowed directories
+    let msb_canonical = match std::fs::canonicalize(&msb_path) {
+        Ok(p) => p,
+        Err(_) => return Ok(json_error(
+            &format!("MSB file not found: {}", msb_path),
+            warp::http::StatusCode::BAD_REQUEST,
+        )),
+    };
+
+    let data_root = &state.config.paths.data_root;
+    let queue_dir = &state.config.paths.queue_directory;
+    if !msb_canonical.starts_with(data_root) && !msb_canonical.starts_with(queue_dir) {
+        return Ok(json_error(
+            "MSB path is outside allowed directories",
+            warp::http::StatusCode::FORBIDDEN,
+        ));
+    }
+
+    // Find the sweep_inspector.py script (deployed to working directory, e.g. /opt/mstar_queue)
+    let sweep_script = std::env::current_dir()
+        .map(|d| d.join("sweep_inspector.py"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("sweep_inspector.py"));
+
+    // Run sweep_inspector.py detect
+    let mstar_lib = mstar_dir.join("lib");
+    let mstar_bin = mstar_dir.join("bin");
+    let python = "python3";
+
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(python)
+            .arg(sweep_script.to_str().unwrap_or("sweep_inspector.py"))
+            .arg("detect")
+            .arg(&msb_path)
+            .env("MSTAR_DIR", mstar_dir.to_str().unwrap_or(""))
+            .env("PYTHONPATH", format!("{}:{}",
+                mstar_lib.display(),
+                std::env::var("PYTHONPATH").unwrap_or_default()))
+            .env("LD_LIBRARY_PATH", format!("{}:{}:{}",
+                mstar_lib.display(),
+                mstar_bin.display(),
+                std::env::var("LD_LIBRARY_PATH").unwrap_or_default()))
+            .env("PATH", format!("{}:{}",
+                mstar_bin.display(),
+                std::env::var("PATH").unwrap_or_default()))
+            .env("HOME", std::env::var("HOME").unwrap_or_else(|_| "/opt/mstar_queue".to_string()))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+    }).await;
+
+    match output {
+        Ok(Ok(result)) => {
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+
+            if !result.status.success() {
+                return Ok(json_error(
+                    &format!("Sweep detection failed: {}", stderr.trim()),
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ));
+            }
+
+            // Try parsing the entire stdout as JSON first
+            let parse_result = serde_json::from_str::<serde_json::Value>(&stdout)
+                .or_else(|_| {
+                    // Fallback: M-Star native output may leak before the JSON.
+                    // Find the first '{' and try parsing from there.
+                    if let Some(start) = stdout.find('{') {
+                        serde_json::from_str::<serde_json::Value>(&stdout[start..])
+                    } else {
+                        Err(serde_json::from_str::<serde_json::Value>("!").unwrap_err())
+                    }
+                });
+
+            match parse_result {
+                Ok(sweep_data) => Ok(json_ok(&sweep_data)),
+                Err(e) => Ok(json_error(
+                    &format!("Failed to parse sweep data: {}", e),
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                )),
+            }
+        }
+        Ok(Err(e)) => Ok(json_error(
+            &format!("Failed to run sweep inspector: {}", e),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+        Err(e) => Ok(json_error(
+            &format!("Sweep detection task failed: {}", e),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
+/// POST /api/sweep/submit — submit a parameter sweep as a batch of jobs
+///
+/// Body: {
+///   "msb_path": "/path/to/file.msb",
+///   "sweep_index": 0,
+///   "mstar_version": "4.4.23",
+///   "cases": ["LX_75", "LX_100"],
+///   "gpu_pool": [0, 1, 2, 3],
+///   "gpus_per_case": 2,
+///   "max_concurrent": 2,
+///   "priority": 0,
+///   "unified_memory": false,
+///   "copy_to_path": "",
+///   "sweep_name": "Resolution Sweep"
+/// }
+async fn handle_sweep_submit(
+    auth: Option<String>,
+    body: serde_json::Value,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+    let user_id = user.id;
+    let _username = user.username.clone();
+    drop(db);
+
+    // Parse required fields
+    let msb_path = match body.get("msb_path").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return Ok(json_error("msb_path required", warp::http::StatusCode::BAD_REQUEST)),
+    };
+
+    let sweep_index = body.get("sweep_index").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let cases: Vec<String> = match body.get("cases").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+        None => return Ok(json_error("cases array required", warp::http::StatusCode::BAD_REQUEST)),
+    };
+
+    if cases.is_empty() {
+        return Ok(json_error("At least one case must be selected", warp::http::StatusCode::BAD_REQUEST));
+    }
+
+    let gpu_pool: Vec<i64> = body.get("gpu_pool")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+
+    let gpus_per_case = body.get("gpus_per_case").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let max_concurrent = body.get("max_concurrent").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let mstar_version = body.get("mstar_version").and_then(|v| v.as_str()).unwrap_or("latest").to_string();
+    let priority = body.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let unified_memory = body.get("unified_memory").and_then(|v| v.as_bool()).unwrap_or(false);
+    let copy_to = body.get("copy_to_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let sweep_name = body.get("sweep_name").and_then(|v| v.as_str()).unwrap_or("Sweep").to_string();
+
+    // Validate GPU pool and allocation
+    if gpu_pool.is_empty() {
+        return Ok(json_error("gpu_pool required", warp::http::StatusCode::BAD_REQUEST));
+    }
+    if gpus_per_case == 0 || gpus_per_case > gpu_pool.len() {
+        return Ok(json_error(
+            &format!("gpus_per_case ({}) must be 1..{}", gpus_per_case, gpu_pool.len()),
+            warp::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    // SECURITY: validate MSB path
+    let msb_canonical = match std::fs::canonicalize(&msb_path) {
+        Ok(p) => p,
+        Err(_) => return Ok(json_error("MSB file not found", warp::http::StatusCode::BAD_REQUEST)),
+    };
+    let data_root = &state.config.paths.data_root;
+    let queue_dir = &state.config.paths.queue_directory;
+    if !msb_canonical.starts_with(data_root) && !msb_canonical.starts_with(queue_dir) {
+        return Ok(json_error("MSB path outside allowed directories", warp::http::StatusCode::FORBIDDEN));
+    }
+
+    // ---- NEW: Create unified sweep directory via export_for_queue ----
+
+    // Build sweep root path: jobs_directory/sweeps/{sweep_name}_{timestamp}
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let safe_name: String = sweep_name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let sweep_dir_name = format!("{}_{}", safe_name, timestamp);
+    let sweep_root = state.config.paths.jobs_directory
+        .join("sweeps")
+        .join(&sweep_dir_name);
+
+    // Ensure parent directory exists
+    let sweep_parent = sweep_root.parent().unwrap_or(&sweep_root);
+    if let Err(e) = tokio::fs::create_dir_all(sweep_parent).await {
+        return Ok(json_error(
+            &format!("Failed to create sweep directory: {}", e),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+
+    // Resolve M-Star version for the export
+    let install_dir = &state.config.paths.mstar_install_dir;
+    let mstar_dir = match resolve_mstar_dir(install_dir, &mstar_version) {
+        Some(d) => d,
+        None => return Ok(json_error(
+            &format!("M-Star version '{}' not found", mstar_version),
+            warp::http::StatusCode::BAD_REQUEST,
+        )),
+    };
+
+    // Run sweep_inspector.py export_for_queue
+    let sweep_script = std::env::current_dir()
+        .map(|d| d.join("sweep_inspector.py"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("sweep_inspector.py"));
+
+    let mstar_lib = mstar_dir.join("lib");
+    let mstar_bin = mstar_dir.join("bin");
+    let sweep_root_str = sweep_root.to_str().unwrap_or("").to_string();
+    let msb_path_clone = msb_path.clone();
+    let mstar_version_clone = mstar_version.clone();
+
+    println!("[SWEEP] Exporting sweep to: {}", sweep_root_str);
+
+    let export_output = tokio::time::timeout(
+        std::time::Duration::from_secs(300), // 5 min timeout for export
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new("python3")
+                .arg(sweep_script.to_str().unwrap_or("sweep_inspector.py"))
+                .arg("export_for_queue")
+                .arg(&msb_path_clone)
+                .arg(sweep_index.to_string())
+                .arg(&sweep_root_str)
+                .env("MSTAR_DIR", mstar_dir.to_str().unwrap_or(""))
+                .env("MSTAR_VERSION", &mstar_version_clone)
+                .env("PYTHONPATH", format!("{}:{}",
+                    mstar_lib.display(),
+                    std::env::var("PYTHONPATH").unwrap_or_default()))
+                .env("LD_LIBRARY_PATH", format!("{}:{}:{}",
+                    mstar_lib.display(),
+                    mstar_bin.display(),
+                    std::env::var("LD_LIBRARY_PATH").unwrap_or_default()))
+                .env("PATH", format!("{}:{}",
+                    mstar_bin.display(),
+                    std::env::var("PATH").unwrap_or_default()))
+                .env("HOME", std::env::var("HOME").unwrap_or_else(|_| "/opt/mstar_queue".to_string()))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+        })
+    ).await;
+
+    let export_result: serde_json::Value = match export_output {
+        Ok(Ok(Ok(result))) => {
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            let stderr_str = String::from_utf8_lossy(&result.stderr);
+
+            if !result.status.success() {
+                return Ok(json_error(
+                    &format!("Sweep export failed: {}", stderr_str.trim()),
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ));
+            }
+
+            // Parse JSON with fallback for native output contamination
+            serde_json::from_str::<serde_json::Value>(&stdout)
+                .or_else(|_| {
+                    if let Some(start) = stdout.find('{') {
+                        serde_json::from_str::<serde_json::Value>(&stdout[start..])
+                    } else {
+                        Err(serde_json::from_str::<serde_json::Value>("!").unwrap_err())
+                    }
+                })
+                .unwrap_or_else(|e| serde_json::json!({"error": format!("Failed to parse export output: {}", e)}))
+        }
+        Ok(Ok(Err(e))) => return Ok(json_error(&format!("Failed to run export: {}", e), warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+        Ok(Err(e)) => return Ok(json_error(&format!("Export task failed: {}", e), warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
+        Err(_) => return Ok(json_error("Sweep export timed out (5 min)", warp::http::StatusCode::GATEWAY_TIMEOUT)),
+    };
+
+    // Check for export errors
+    if let Some(err) = export_result.get("error").and_then(|v| v.as_str()) {
+        return Ok(json_error(&format!("Sweep export failed: {}", err), warp::http::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    let exported_cases = export_result.get("cases")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let sweep_root_path = export_result.get("sweep_root")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    println!("[SWEEP] Export complete: {} cases to {}", exported_cases.len(), sweep_root_path);
+
+    // ---- Create jobs with working_directory pointing into case subdirs ----
+
+    let sweep_group_id = format!("sweep-{}", db::generate_token()[..16].to_string());
+
+    let sweep_config = serde_json::json!({
+        "sweep_name": sweep_name,
+        "sweep_index": sweep_index,
+        "gpus_per_case": gpus_per_case,
+        "max_concurrent": max_concurrent,
+        "gpu_pool": gpu_pool,
+        "total_cases": cases.len(),
+        "msb_source": msb_path,
+        "sweep_root": sweep_root_path,
+    }).to_string();
+
+    let mut created_jobs = Vec::new();
+    let msb_filename = std::path::Path::new(&msb_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sweep.msb")
+        .to_string();
+
+    for (i, case_name) in cases.iter().enumerate() {
+        // Round-robin GPU assignment
+        let start_idx = (i * gpus_per_case) % gpu_pool.len();
+        let case_gpus: Vec<i64> = (0..gpus_per_case)
+            .map(|j| gpu_pool[(start_idx + j) % gpu_pool.len()])
+            .collect();
+        let gpu_ids_str = serde_json::to_string(&case_gpus).unwrap_or_else(|_| "[]".to_string());
+
+        let job_name = format!("{} — {}", sweep_name, case_name);
+
+        // Find this case's exported directory and MSB
+        let case_dir = exported_cases.iter()
+            .find(|c| c.get("name").and_then(|v| v.as_str()) == Some(case_name))
+            .and_then(|c| c.get("directory").and_then(|v| v.as_str()))
+            .map(|s| s.to_string());
+
+        let case_msb = exported_cases.iter()
+            .find(|c| c.get("name").and_then(|v| v.as_str()) == Some(case_name))
+            .and_then(|c| c.get("msb_file").and_then(|v| v.as_str()))
+            .map(|s| std::path::Path::new(s).file_name().and_then(|n| n.to_str()).unwrap_or(&msb_filename).to_string())
+            .unwrap_or_else(|| msb_filename.clone());
+
+        let db = state.db.lock().await;
+        let copy_to_ref = copy_to.as_deref();
+        let result = db::create_sweep_job(
+            &db, user_id, &job_name, &case_msb, &mstar_version, &gpu_ids_str,
+            unified_memory, priority, copy_to_ref,
+            &sweep_group_id, case_name, &sweep_config,
+        );
+
+        match result {
+            Ok(job_id) => {
+                // Set working_directory to the case subdirectory (already created by export)
+                if let Some(ref cd) = case_dir {
+                    let _ = db.execute(
+                        "UPDATE jobs SET working_directory = ?2 WHERE id = ?1",
+                        rusqlite::params![job_id, cd],
+                    );
+                }
+                drop(db);
+
+                created_jobs.push(serde_json::json!({
+                    "job_id": job_id,
+                    "case_name": case_name,
+                    "gpu_ids": case_gpus,
+                    "working_directory": case_dir,
+                }));
+            }
+            Err(e) => {
+                drop(db);
+                created_jobs.push(serde_json::json!({
+                    "case_name": case_name,
+                    "error": e,
+                }));
+            }
+        }
+    }
+
+    // ---- Auto-create AI dataset from the sweep directory ----
+    let dataset_id = {
+        let db = state.db.lock().await;
+        let config_json = serde_json::json!({
+            "sweep_group_id": sweep_group_id,
+            "sweep_name": sweep_name,
+            "source_msb": msb_path,
+            "mstar_version": mstar_version,
+            "sweep_root": sweep_root_path,
+            "total_cases": cases.len(),
+            "auto_created": true,
+        }).to_string();
+
+        let dataset_name = format!("{}", sweep_name);
+        match crate::ai_training::create_dataset(
+            &db, user_id, &dataset_name, &sweep_root_path,
+            "stats_table", Some(&config_json),
+        ) {
+            Ok(id) => {
+                // Set to 'pending' — will flip to 'ready' when all sweep jobs complete
+                let manifest = format!("{}/sweep_manifest.json", sweep_root_path);
+                let _ = crate::ai_training::update_dataset_status(
+                    &db, id, "pending", Some(&manifest), None,
+                    Some(&format!("{{\"status_info\": \"Waiting for {} sweep cases to complete\"}}", cases.len())),
+                );
+                Some(id)
+            }
+            Err(e) => {
+                eprintln!("[SWEEP] Warning: failed to auto-create dataset: {}", e);
+                None
+            }
+        }
+    };
+
+    let total_created = created_jobs.iter().filter(|j| j.get("job_id").is_some()).count();
+    println!("[SWEEP] Created sweep group {} with {} jobs ({}), sweep_root={}, dataset_id={:?}",
+        sweep_group_id, total_created, sweep_name, sweep_root_path, dataset_id);
+
+    Ok(json_ok(&serde_json::json!({
+        "sweep_group_id": sweep_group_id,
+        "jobs": created_jobs,
+        "total_created": total_created,
+        "sweep_name": sweep_name,
+        "sweep_root": sweep_root_path,
+        "dataset_id": dataset_id,
+    })))
+}
+
+/// POST /api/sweep/:group_id/create-dataset
+/// Creates an AI training dataset from a completed sweep group.
+async fn handle_sweep_create_dataset(
+    sweep_group_id: String,
+    auth: Option<String>,
+    body: serde_json::Value,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let conn = state.db.lock().await;
+    let user = match db::validate_session(&conn, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let dataset_name = body.get("name").and_then(|v| v.as_str()).unwrap_or("Sweep Dataset");
+
+    // Get all jobs in this sweep group
+    let sweep_jobs = crate::db::list_sweep_jobs(&conn, &sweep_group_id)
+        .map_err(|_| warp::reject::reject())?;
+
+    if sweep_jobs.is_empty() {
+        return Ok(json_error("No jobs found for this sweep group", warp::http::StatusCode::NOT_FOUND));
+    }
+
+    // Count completed vs total
+    let completed: Vec<_> = sweep_jobs.iter().filter(|j| j.status == "completed").collect();
+    let total = sweep_jobs.len();
+
+    if completed.is_empty() {
+        return Ok(json_error(
+            "No completed jobs in this sweep group",
+            warp::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    // Determine sweep_root from the first completed job's working directory parent
+    let sweep_root = completed.first()
+        .and_then(|j| j.working_directory.as_deref())
+        .map(|wd| {
+            std::path::Path::new(wd)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| wd.to_string())
+        })
+        .unwrap_or_else(|| "/simulations".to_string());
+
+    // Store provenance in config
+    let config_json = serde_json::json!({
+        "sweep_group_id": sweep_group_id,
+        "total_sweep_jobs": total,
+        "completed_jobs": completed.len(),
+        "source_msb": completed.first().map(|j| &j.msb_filename),
+        "mstar_version": completed.first().map(|j| &j.mstar_version),
+    }).to_string();
+
+    // Create the AI dataset
+    let dataset_id = crate::ai_training::create_dataset(
+        &conn,
+        user.id,
+        dataset_name,
+        &sweep_root,
+        "",  // No mode — inventory scan determines what's available
+        Some(&config_json),
+    ).map_err(|e| {
+        eprintln!("[SWEEP->DATASET] Failed to create dataset: {}", e);
+        warp::reject::reject()
+    })?;
+
+    // config_json is already set via create_dataset INSERT above
+
+    // Create dataset cases from completed job working directories
+    let mut cases_added = 0;
+    for job in &completed {
+        if let Some(wd) = job.working_directory.as_deref() {
+            if std::path::Path::new(wd).exists() {
+                let case_name = job.sweep_case_name.as_deref().unwrap_or(&job.name);
+                let _ = conn.execute(
+                    "INSERT INTO ai_dataset_cases (dataset_id, case_name, case_directory, status, config_json)
+                     VALUES (?1, ?2, ?3, 'ready', ?4)",
+                    rusqlite::params![
+                        dataset_id,
+                        case_name,
+                        wd,
+                        serde_json::json!({
+                            "job_id": job.id,
+                            "sweep_case_name": job.sweep_case_name,
+                            "mstar_version": job.mstar_version,
+                        }).to_string(),
+                    ],
+                );
+                cases_added += 1;
+            }
+        }
+    }
+
+    let warnings = if completed.len() < total {
+        Some(format!("{} of {} jobs completed — {} skipped (failed/running/queued)",
+            completed.len(), total, total - completed.len()))
+    } else {
+        None
+    };
+
+    // Don't set status to 'ready' yet — the background scan will set it
+    // Just store the warnings for now
+    if let Some(ref w) = warnings {
+        let _ = crate::ai_training::update_dataset_status(
+            &conn, dataset_id, "scanning", None, None, Some(w), 
+        );
+    }
+
+    println!("[SWEEP->DATASET] Created dataset {} from sweep group {} ({} cases)",
+        dataset_id, sweep_group_id, cases_added);
+
+    // Drop the DB lock before spawning background scan
+    drop(conn);
+
+    // Trigger background scan to populate inventory
+    let scan_root_clone = sweep_root.clone();
+    let scan_db = state.db.clone();
+    tokio::spawn(async move {
+        run_dataset_scan(scan_db, dataset_id, &scan_root_clone).await;
+    });
+
+    Ok(json_ok(&serde_json::json!({
+        "dataset_id": dataset_id,
+        "cases_added": cases_added,
+        "total_jobs": total,
+        "completed_jobs": completed.len(),
+        "warnings": warnings,
+        "status": "scanning",
+    })))
+}
+
+/// Resolve an M-Star version string (e.g. "4.4.23" or "latest") to the actual
+/// installation directory path.
+fn resolve_mstar_dir(install_dir: &std::path::Path, version: &str) -> Option<std::path::PathBuf> {
+    if version == "latest" {
+        // Try the symlink first
+        let latest = install_dir.join("mstarcfd-latest");
+        if latest.exists() {
+            return Some(std::fs::canonicalize(&latest).ok()?);
+        }
+        // Fall back to discovering versions and picking the highest
+        let versions = crate::mstar_versions::discover_versions(install_dir);
+        versions.first().map(|v| install_dir.join(format!("mstarcfd-{}", v.version)))
+    } else {
+        let dir = install_dir.join(format!("mstarcfd-{}", version));
+        if dir.is_dir() { Some(dir) } else { None }
+    }
+}
+
+/// Run the dataset scanner against a sweep root and store the inventory.
+/// Called in a background task after dataset creation.
+async fn run_dataset_scan(db: crate::DbHandle, dataset_id: i64, sweep_root: &str) {
+    println!("[DATASET-SCAN] Starting scan for dataset {} at {}", dataset_id, sweep_root);
+
+    let scanner_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // Try to find the scanner script relative to the executable or in known locations
+    let scanner_script = [
+        scanner_path.join("dataset_scanner.py"),
+        std::path::PathBuf::from("/opt/mstar_queue/dataset_scanner.py"),
+        std::path::PathBuf::from("dataset_scanner.py"),
+    ]
+    .iter()
+    .find(|p| p.exists())
+    .cloned();
+
+    let script = match scanner_script {
+        Some(s) => s,
+        None => {
+            eprintln!("[DATASET-SCAN] dataset_scanner.py not found");
+            let conn = db.lock().await;
+            let _ = ai_training::update_dataset_status(
+                &conn, dataset_id, "error", None, None,
+                Some("Scanner script not found"),
+            );
+            return;
+        }
+    };
+
+    // Run the scanner
+    let output = tokio::process::Command::new("python3")
+        .arg(&script)
+        .arg("scan")
+        .arg(sweep_root)
+        .output()
+        .await;
+
+    match output {
+        Ok(result) => {
+            if !result.status.success() {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                eprintln!("[DATASET-SCAN] Scanner failed for dataset {}: {}", dataset_id, stderr);
+                let conn = db.lock().await;
+                let _ = ai_training::update_dataset_status(
+                    &conn, dataset_id, "error", None, None,
+                    Some(&format!("Scan failed: {}", stderr.chars().take(500).collect::<String>())),
+                );
+                return;
+            }
+
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            match serde_json::from_str::<serde_json::Value>(&stdout) {
+                Ok(inventory) => {
+                    // Build enriched stats inventory — include validation + sizes
+                    let mut stats_inv = inventory.get("stats_inventory")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    // Embed validation and sizes into the stats inventory blob
+                    if let Some(v) = inventory.get("validation") {
+                        stats_inv["validation"] = v.clone();
+                    }
+                    if let Some(v) = inventory.get("total_data_bytes") {
+                        stats_inv["total_data_bytes"] = v.clone();
+                    }
+                    if let Some(v) = inventory.get("total_data_human") {
+                        stats_inv["total_data_human"] = v.clone();
+                    }
+                    if let Some(v) = inventory.get("total_stats_bytes") {
+                        stats_inv["total_stats_bytes"] = v.clone();
+                    }
+                    if let Some(v) = inventory.get("total_pvd_bytes") {
+                        stats_inv["total_pvd_bytes"] = v.clone();
+                    }
+
+                    let stats_inv_str = stats_inv.to_string();
+                    let pvd_inv = inventory.get("pvd_inventory")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "{}".to_string());
+                    let cases = inventory.get("cases")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "[]".to_string());
+                    let sweep_params = inventory.get("sweep_parameters")
+                        .map(|v| v.to_string());
+                    let num_cases = inventory.get("num_cases")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let num_with_output = inventory.get("num_cases_with_output")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let warnings = inventory.get("warnings")
+                        .map(|v| v.to_string());
+
+                    // Determine dataset status from validation
+                    let validation_status = inventory.get("validation")
+                        .and_then(|v| v.get("status"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ready");
+
+                    let conn = db.lock().await;
+                    match ai_training::update_dataset_inventory(
+                        &conn,
+                        dataset_id,
+                        &stats_inv_str,
+                        &pvd_inv,
+                        &cases,
+                        sweep_params.as_deref(),
+                        num_cases,
+                        num_with_output,
+                        warnings.as_deref(),
+                    ) {
+                        Ok(()) => {
+                            // Set status based on validation
+                            let ds_status = match validation_status {
+                                "pass" => "ready",
+                                "warn" => "warnings",
+                                "fail" => "error",
+                                _ => "ready",
+                            };
+                            let _ = ai_training::update_dataset_status(
+                                &conn, dataset_id, ds_status, None, None, None,
+                            );
+                            println!("[DATASET-SCAN] Dataset {} scan complete: {} cases, {} with output, validation={}",
+                                dataset_id, num_cases, num_with_output, validation_status);
+                        }
+                        Err(e) => {
+                            eprintln!("[DATASET-SCAN] Failed to store inventory for dataset {}: {}", dataset_id, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[DATASET-SCAN] Failed to parse scanner output for dataset {}: {}", dataset_id, e);
+                    let conn = db.lock().await;
+                    let _ = ai_training::update_dataset_status(
+                        &conn, dataset_id, "error", None, None,
+                        Some(&format!("Parse error: {}", e)),
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[DATASET-SCAN] Failed to run scanner for dataset {}: {}", dataset_id, e);
+            let conn = db.lock().await;
+            let _ = ai_training::update_dataset_status(
+                &conn, dataset_id, "error", None, None,
+                Some(&format!("Spawn error: {}", e)),
+            );
+        }
     }
 }

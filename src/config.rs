@@ -19,6 +19,9 @@ pub struct Config {
     /// Security settings
     #[serde(default)]
     pub security: SecurityConfig,
+    /// AI training integration settings
+    #[serde(default)]
+    pub ai_training: AiTrainingConfig,
 }
 
 /// Paths for log files, executables, and directories
@@ -180,6 +183,109 @@ impl Default for QueueConfig {
     }
 }
 
+/// AI Training integration configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiTrainingConfig {
+    /// Master switch to enable/disable AI training features
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to Python executable with PhysicsNeMo installed
+    #[serde(default = "default_python_executable")]
+    pub python_executable: String,
+    /// Use NVIDIA container instead of local Python
+    #[serde(default)]
+    pub container_mode: bool,
+    /// Container image for PhysicsNeMo
+    #[serde(default = "default_container_image")]
+    pub container_image: String,
+    /// Root directory for cached/converted datasets (under data_root)
+    #[serde(default = "default_cache_root")]
+    pub cache_root: String,
+    /// Root directory for training artifacts (under data_root)
+    #[serde(default = "default_artifact_root")]
+    pub artifact_root: String,
+    /// Maximum concurrent training jobs
+    #[serde(default = "default_max_training_jobs")]
+    pub max_concurrent_training_jobs: usize,
+    /// GPU selection policy: "least_utilized" or "explicit"
+    #[serde(default = "default_gpu_policy")]
+    pub gpu_selection_policy: String,
+    /// Additional allowed directories for training data (beyond data_root)
+    #[serde(default)]
+    pub allowed_training_roots: Vec<String>,
+    /// Default dataset output format: npz, zarr, hdf5, torch
+    #[serde(default = "default_dataset_format")]
+    pub default_dataset_format: String,
+    /// Default model family: fno, mlp, gnn
+    #[serde(default = "default_model_family")]
+    pub default_model_family: String,
+    /// Default training batch size
+    #[serde(default = "default_batch_size")]
+    pub default_batch_size: u32,
+    /// Default training epochs
+    #[serde(default = "default_epochs")]
+    pub default_epochs: u32,
+    /// Default learning rate
+    #[serde(default = "default_learning_rate")]
+    pub default_learning_rate: f64,
+    /// Checkpoint save interval in epochs
+    #[serde(default = "default_checkpoint_interval")]
+    pub checkpoint_interval_epochs: u32,
+    /// Whether to allow custom Python entrypoints (security risk)
+    #[serde(default)]
+    pub allow_custom_entrypoints: bool,
+    /// Directories allowed for custom entrypoints (if enabled)
+    #[serde(default)]
+    pub custom_entrypoint_roots: Vec<String>,
+    /// Minimum free GPU VRAM (MB) for preflight checks
+    #[serde(default = "default_min_vram")]
+    pub min_gpu_free_vram_mb: u32,
+    /// Minimum free disk space (GB) for preflight checks
+    #[serde(default = "default_min_disk")]
+    pub min_disk_free_gb: u32,
+}
+
+fn default_python_executable() -> String { "python3".to_string() }
+fn default_container_image() -> String { "nvcr.io/nvidia/physicsnemo:latest".to_string() }
+fn default_cache_root() -> String { "ai_cache".to_string() }
+fn default_artifact_root() -> String { "ai_artifacts".to_string() }
+fn default_max_training_jobs() -> usize { 2 }
+fn default_gpu_policy() -> String { "least_utilized".to_string() }
+fn default_dataset_format() -> String { "npz".to_string() }
+fn default_model_family() -> String { "fno".to_string() }
+fn default_batch_size() -> u32 { 8 }
+fn default_epochs() -> u32 { 100 }
+fn default_learning_rate() -> f64 { 0.001 }
+fn default_checkpoint_interval() -> u32 { 10 }
+fn default_min_vram() -> u32 { 2048 }
+fn default_min_disk() -> u32 { 10 }
+
+impl Default for AiTrainingConfig {
+    fn default() -> Self {
+        AiTrainingConfig {
+            enabled: false,
+            python_executable: default_python_executable(),
+            container_mode: false,
+            container_image: default_container_image(),
+            cache_root: default_cache_root(),
+            artifact_root: default_artifact_root(),
+            max_concurrent_training_jobs: default_max_training_jobs(),
+            gpu_selection_policy: default_gpu_policy(),
+            allowed_training_roots: Vec::new(),
+            default_dataset_format: default_dataset_format(),
+            default_model_family: default_model_family(),
+            default_batch_size: default_batch_size(),
+            default_epochs: default_epochs(),
+            default_learning_rate: default_learning_rate(),
+            checkpoint_interval_epochs: default_checkpoint_interval(),
+            allow_custom_entrypoints: false,
+            custom_entrypoint_roots: Vec::new(),
+            min_gpu_free_vram_mb: default_min_vram(),
+            min_disk_free_gb: default_min_disk(),
+        }
+    }
+}
+
 impl Config {
     /// Load configuration from config.toml in the current working directory
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
@@ -241,6 +347,32 @@ impl Config {
         // Queue validation
         if self.queue.max_concurrent_jobs == 0 {
             return Err("Max concurrent jobs must be at least 1".to_string());
+        }
+
+        // AI training validation (only when enabled)
+        if self.ai_training.enabled {
+            if self.ai_training.python_executable.is_empty() && !self.ai_training.container_mode {
+                return Err("AI training: python_executable cannot be empty when container_mode is false".to_string());
+            }
+            if self.ai_training.container_mode && self.ai_training.container_image.is_empty() {
+                return Err("AI training: container_image cannot be empty when container_mode is true".to_string());
+            }
+            if self.ai_training.max_concurrent_training_jobs == 0 {
+                return Err("AI training: max_concurrent_training_jobs must be at least 1".to_string());
+            }
+            let valid_formats = ["npz", "zarr", "hdf5", "torch"];
+            if !valid_formats.contains(&self.ai_training.default_dataset_format.as_str()) {
+                return Err(format!("AI training: invalid default_dataset_format '{}'. Valid: {:?}",
+                    self.ai_training.default_dataset_format, valid_formats));
+            }
+            let valid_families = ["fno", "mlp", "gnn"];
+            if !valid_families.contains(&self.ai_training.default_model_family.as_str()) {
+                return Err(format!("AI training: invalid default_model_family '{}'. Valid: {:?}",
+                    self.ai_training.default_model_family, valid_families));
+            }
+            if self.ai_training.default_learning_rate <= 0.0 {
+                return Err("AI training: default_learning_rate must be positive".to_string());
+            }
         }
 
         Ok(())

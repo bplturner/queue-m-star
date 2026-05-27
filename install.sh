@@ -624,7 +624,7 @@ SupplementaryGroups=video render
 # This is REQUIRED for OpenMPI (session dirs), CUDA, and python3 temp files.
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=false
 PrivateTmp=true
 ReadWritePaths=${rw_paths}
 

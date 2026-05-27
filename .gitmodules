@@ -1,0 +1,3 @@
+[submodule "python/ai_training"]
+	path = python/ai_training
+	url = https://github.com/bplturner/queue-m-star-private.git

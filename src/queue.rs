@@ -112,7 +112,9 @@ pub async fn run_queue_manager(
         // Systemd watchdog heartbeat — tells systemd "I'm still alive"
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
 
-        // Check for queued jobs
+        // ============================================================
+        // 1. Process simulation / render jobs
+        // ============================================================
         let next_job = {
             let conn = db.lock().await;
             db::get_next_queued_job(&conn).unwrap_or(None)
@@ -132,17 +134,111 @@ pub async fn run_queue_manager(
             };
 
             if gpus_available && running_count < config.queue.max_concurrent_jobs {
-                println!("[QUEUE] Launching job {} ({})", job.id, job.name);
+                // Sweep concurrency control: if this job belongs to a sweep group,
+                // check max_concurrent limit for the group before launching.
+                let sweep_ok = if let Some(ref group_id) = job.sweep_group_id {
+                    let conn = db.lock().await;
+                    let active = db::count_active_sweep_jobs(&conn, group_id).unwrap_or(0);
+                    // Parse max_concurrent from sweep_config JSON
+                    let max_conc: usize = job.sweep_config.as_deref()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                        .and_then(|v| v.get("max_concurrent").and_then(|n| n.as_u64()))
+                        .unwrap_or(1) as usize;
+                    (active as usize) < max_conc
+                } else {
+                    true // Non-sweep jobs always pass this check
+                };
+
+                if sweep_ok {
+
+                let job_id = job.id;
+                let job_name = job.name.clone();
+                println!("[QUEUE] Launching job {} ({})", job_id, job_name);
+
+                // BUG 11 FIX: Atomically mark job as "launching" to prevent the
+                // next poll cycle from picking up the same job while we're still
+                // doing async setup (version resolution, MSB unpack, etc.).
+                {
+                    let conn = db.lock().await;
+                    let _ = conn.execute(
+                        "UPDATE jobs SET status = 'launching' WHERE id = ?1 AND status = 'queued'",
+                        rusqlite::params![job_id],
+                    );
+                }
 
                 let db_clone = db.clone();
                 let versions_clone = versions.clone();
                 let config_clone = config.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = launch_job(db_clone, versions_clone, config_clone, job).await {
-                        eprintln!("[QUEUE] Failed to launch job: {}", e);
+                    // BUG 3/4/5 FIX: If launch_job returns Err, the job would remain
+                    // stuck forever. We now call fail_job on any error return.
+                    if let Err(e) = launch_job(db_clone.clone(), versions_clone, config_clone, job).await {
+                        eprintln!("[QUEUE] Failed to launch job {}: {}", job_id, e);
+                        let conn = db_clone.lock().await;
+                        // fail_job checks status IN ('running', 'queued') — add 'launching'
+                        let _ = conn.execute(
+                            "UPDATE jobs SET status = 'failed', completed_at = datetime('now'), pid = NULL,
+                             error_message = ?2
+                             WHERE id = ?1 AND status IN ('queued', 'running', 'launching')",
+                            rusqlite::params![job_id, format!("Launch failed: {}", e)],
+                        );
+                        // Release any GPU reservations that might have been partially created
+                        let _ = conn.execute(
+                            "DELETE FROM gpu_reservations WHERE job_id = ?1",
+                            rusqlite::params![job_id],
+                        );
                     }
                 });
+                } // end if sweep_ok
+            } // end if gpus_available
+        } // end if let Some(job)
+
+        // ============================================================
+        // 2. Process AI training jobs (if enabled)
+        // ============================================================
+        if config.ai_training.enabled {
+            let next_training_job = {
+                let conn = db.lock().await;
+                crate::ai_training::get_next_queued_training_job(&conn)
+            };
+
+            if let Some(tj) = next_training_job {
+                // Check concurrent training limit
+                let running_training = {
+                    let conn = db.lock().await;
+                    crate::ai_training::list_training_jobs(&conn, None, Some("running")).len()
+                };
+
+                if running_training < config.ai_training.max_concurrent_training_jobs {
+                    // Parse and check GPU availability
+                    let requested_gpus: Vec<i32> = serde_json::from_str(&tj.gpu_ids).unwrap_or_default();
+                    let gpus_ok = if requested_gpus.is_empty() {
+                        true // Auto GPU selection will happen in launch
+                    } else {
+                        check_gpus_available(&db, &requested_gpus).await
+                    };
+
+                    if gpus_ok {
+                        let tj_id = tj.id;
+                        println!("[QUEUE] Launching AI training job {} ({})", tj_id, tj.run_name);
+
+                        // Mark as preflight to prevent re-pickup
+                        {
+                            let conn = db.lock().await;
+                            let _ = crate::ai_training::update_training_job_status(
+                                &conn, tj_id, "preflight", None, None,
+                            );
+                        }
+
+                        let db_clone = db.clone();
+                        let config_clone = config.clone();
+
+                        tokio::spawn(async move {
+                            launch_training_job(db_clone, config_clone, tj).await;
+                        });
+                    }
+                }
             }
         }
 
@@ -195,39 +291,22 @@ async fn launch_job(
     config: Config,
     job: Job,
 ) -> Result<(), String> {
+    // Dispatch render jobs to specialized handler
+    if job.job_type == "render" {
+        return launch_render_job(db, versions, config, job).await;
+    }
+
     // Resolve M-Star version
-    // For checkpoint restarts: use the exact version from the original run to avoid
-    // incompatible checkpoint formats. For new jobs: resolve normally.
+    // For restart jobs: job.mstar_version already contains the correct version
+    // (either user-overridden or inherited from original job via create_restart_job).
+    // For new jobs: use the version selected at submission time.
     let is_restart = job.restart_from_job_id.is_some();
-    let version_to_resolve = if is_restart {
-        // Use the resolved version from the original job if available
-        let orig_resolved = {
-            let conn = db.lock().await;
-            if let Some(orig_id) = job.restart_from_job_id {
-                db::get_job(&conn, orig_id)
-                    .ok()
-                    .and_then(|j| j.resolved_version)
-            } else {
-                None
-            }
-        };
-        orig_resolved.unwrap_or_else(|| job.mstar_version.clone())
-    } else {
-        job.mstar_version.clone()
-    };
+    let version_to_resolve = job.mstar_version.clone();
 
     let versions_lock = versions.lock().await;
     let version = resolve_version(&versions_lock, &version_to_resolve)
         .ok_or_else(|| {
-            if is_restart {
-                format!(
-                    "M-Star version '{}' (from original job) is no longer installed. \
-                     Cannot restart with a different version — checkpoint files may be incompatible.",
-                    version_to_resolve
-                )
-            } else {
-                format!("M-Star version '{}' not found", version_to_resolve)
-            }
+            format!("M-Star version '{}' not found or not installed", version_to_resolve)
         })?
         .clone();
     drop(versions_lock);
@@ -253,6 +332,14 @@ async fn launch_job(
                 .ok_or_else(|| format!("Original job {} has no working directory", original_id))?
         };
         std::path::PathBuf::from(orig_dir)
+    } else if let Some(ref wd) = job.working_directory {
+        // Job already has a working directory set (e.g., sweep export case subdir)
+        let dir = std::path::PathBuf::from(wd);
+        if !dir.exists() {
+            tokio::fs::create_dir_all(&dir).await
+                .map_err(|e| format!("Failed to create pre-set working dir: {}", e))?;
+        }
+        dir
     } else {
         let dir = config.paths.jobs_directory.join(format!("job_{}", job.id));
         tokio::fs::create_dir_all(&dir).await
@@ -264,18 +351,56 @@ async fn launch_job(
 
     if !is_restart {
         // Normal job: check MSB and run unpack_msb.py
-        let msb_path = job_dir.join(&job.msb_filename);
+        let mut msb_path = job_dir.join(&job.msb_filename);
         if !msb_path.exists() {
-            let queue_msb = config.paths.queue_directory.join(&job.msb_filename);
-            if queue_msb.exists() {
-                tokio::fs::copy(&queue_msb, &msb_path).await
-                    .map_err(|e| format!("Failed to copy MSB from queue: {}", e))?;
-            } else {
-                let err = format!("MSB file not found: {}", msb_path.display());
-                let conn = db.lock().await;
-                let _ = db::fail_job(&conn, job.id, &err);
-                return Err(err);
+            // For sweep exports: the MSB filename may differ from what's in the DB.
+            // Scan the working directory for any .msb file.
+            let mut found_msb = false;
+            if let Ok(mut entries) = tokio::fs::read_dir(&job_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.to_lowercase().ends_with(".msb") {
+                        msb_path = entry.path();
+                        found_msb = true;
+                        // Update msb_filename in DB to match the actual file
+                        if name != job.msb_filename {
+                            let conn = db.lock().await;
+                            let _ = conn.execute(
+                                "UPDATE jobs SET msb_filename = ?2 WHERE id = ?1",
+                                rusqlite::params![job.id, &name],
+                            );
+                            drop(conn);
+                            println!("[QUEUE] Job {} — resolved MSB filename: {} -> {}", job.id, job.msb_filename, name);
+                        }
+                        break;
+                    }
+                }
             }
+
+            if !found_msb {
+                // Last resort: check the queue directory
+                let queue_msb = config.paths.queue_directory.join(&job.msb_filename);
+                if queue_msb.exists() {
+                    msb_path = job_dir.join(&job.msb_filename);
+                    tokio::fs::copy(&queue_msb, &msb_path).await
+                        .map_err(|e| format!("Failed to copy MSB from queue: {}", e))?;
+                } else {
+                    let err = format!("MSB file not found: {} (also checked working dir for any .msb)", msb_path.display());
+                    let conn = db.lock().await;
+                    let _ = db::fail_job(&conn, job.id, &err);
+                    return Err(err);
+                }
+            }
+        }
+
+        // Safety net: reject empty MSB files before wasting GPU time
+        let msb_meta = tokio::fs::metadata(&msb_path).await
+            .map_err(|e| format!("Failed to stat MSB: {}", e))?;
+        if msb_meta.len() == 0 {
+            let err = format!("MSB file is empty (0 bytes): {}", msb_path.display());
+            let conn = db.lock().await;
+            let _ = db::fail_job(&conn, job.id, &err);
+            return Err(err);
         }
 
         println!("[QUEUE] Running unpack_msb.py for job {}", job.id);
@@ -312,10 +437,15 @@ async fn launch_job(
     // Determine checkpoint restart mode
     let checkpoint: Option<i64> = if is_restart {
         // Check if a specific checkpoint number was requested in restart_options
-        job.restart_options.as_ref()
+        let cp_val = job.restart_options.as_ref()
             .and_then(|opts| serde_json::from_str::<serde_json::Value>(opts).ok())
-            .and_then(|v| v.get("checkpoint_number").and_then(|n| n.as_i64()))
-            .or(Some(-1))  // Default to --load-last for restarts
+            .and_then(|v| v.get("checkpoint_number").and_then(|n| n.as_i64()));
+
+        match cp_val {
+            Some(0) => None,      // Explicit fresh start — use --force
+            Some(n) => Some(n),   // Specific checkpoint or -1 for --load-last
+            None => Some(-1),     // No preference — default to --load-last
+        }
     } else {
         None  // Fresh run — will use --force
     };
@@ -375,6 +505,7 @@ async fn launch_job(
     let job_copy_to = job.copy_to_path.clone();
     let job_working_dir = Some(job_dir_str.clone());
     let data_root = config.paths.data_root.to_str().unwrap_or("/").to_string();
+    let job_sweep_group_id = job.sweep_group_id.clone();
 
     tokio::spawn(async move {
         match child.wait().await {
@@ -383,6 +514,12 @@ async fn launch_job(
                 if status.success() {
                     println!("[QUEUE] Job {} completed successfully", job_id);
                     let _ = db::complete_job(&conn, job_id);
+
+                    // Check if this was a sweep job and all siblings are now complete
+                    if let Some(ref sgid) = job_sweep_group_id {
+                        check_sweep_dataset_completion(&conn, sgid);
+                    }
+
                     drop(conn); // Release lock before file I/O
                     // Auto-copy results if copy_to_path is set
                     if let Some(ref copy_to) = job_copy_to {
@@ -397,6 +534,216 @@ async fn launch_job(
             Err(e) => {
                 let conn = db_clone.lock().await;
                 let _ = db::fail_job(&conn, job_id, &format!("Process error: {}", e));
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Launch a render job — invokes pvpython with render_job.py and a config JSON.
+///
+/// Uses the M-Star version-bundled pvpython from {install_dir}/post/bin/pvpython
+/// with fallback to the system-wide ParaView installation.
+async fn launch_render_job(
+    db: DbHandle,
+    versions: VersionList,
+    _config: Config,
+    job: Job,
+) -> Result<(), String> {
+    println!("[QUEUE] Launching RENDER job {}", job.id);
+
+    // Parse render options from restart_options JSON
+    let render_opts: serde_json::Value = job.restart_options.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let source_work_dir = render_opts.get("source_work_dir")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Render job missing source_work_dir in options".to_string())?
+        .to_string();
+
+    let state_file = render_opts.get("state_file")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Render job missing state_file in options".to_string())?
+        .to_string();
+
+    // SECURITY: Validate state file exists and is within expected directory
+    if !Path::new(&state_file).exists() {
+        let err = format!("State file not found: {}", state_file);
+        let conn = db.lock().await;
+        let _ = db::fail_job(&conn, job.id, &err);
+        return Err(err);
+    }
+
+    // Resolve pvpython binary — for rendering, prefer system ParaView (has --mesa launcher
+    // for headless GPU rendering). Fall back to version-bundled pvpython if system not found.
+    let (pvpython_path, use_mesa_flag) = {
+        let system_pv = std::path::PathBuf::from(
+            "/opt/ParaView-6.0.1-MPI-Linux-Python3.12-x86_64/bin/pvpython"
+        );
+        if system_pv.exists() {
+            println!("[QUEUE] Using system pvpython (with --mesa support): {}", system_pv.display());
+            (system_pv, true)
+        } else {
+            // Fallback to version-bundled pvpython (no --mesa launcher)
+            let version_to_resolve = job.mstar_version.clone();
+            let versions_lock = versions.lock().await;
+            let version_pvpython = resolve_version(&versions_lock, &version_to_resolve)
+                .map(|v| v.install_dir.join("post").join("bin").join("pvpython"));
+            drop(versions_lock);
+
+            match version_pvpython {
+                Some(ref p) if p.exists() => {
+                    println!("[QUEUE] Using version-bundled pvpython (no --mesa): {}", p.display());
+                    (p.clone(), false)
+                }
+                _ => {
+                    let err = "No pvpython binary found (neither system-wide nor version-bundled)".to_string();
+                    let conn = db.lock().await;
+                    let _ = db::fail_job(&conn, job.id, &err);
+                    return Err(err);
+                }
+            }
+        }
+    };
+
+    // Create render output directory
+    let render_dir = std::path::Path::new(&source_work_dir).join("renders");
+    tokio::fs::create_dir_all(&render_dir).await
+        .map_err(|e| format!("Failed to create renders directory: {}", e))?;
+
+    let render_dir_str = render_dir.to_str().unwrap_or("").to_string();
+    let render_name = render_opts.get("render_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("render")
+        .to_string();
+
+    // Build the config.json for render_job.py
+    let status_file_path = render_dir.join("render_status.json");
+    let render_config = serde_json::json!({
+        "case_path": source_work_dir,
+        "state_file": state_file,
+        "output_dir": render_dir_str,
+        "status_file": status_file_path.to_str().unwrap_or(""),
+        "resolution": render_opts.get("resolution"),
+        "fps": render_opts.get("fps").and_then(|v| v.as_i64()).unwrap_or(25),
+        "video_quality": render_opts.get("video_quality").and_then(|v| v.as_i64()).unwrap_or(23),
+        "transparent": render_opts.get("transparent").and_then(|v| v.as_bool()).unwrap_or(false),
+        "compression": render_opts.get("compression").and_then(|v| v.as_i64()).unwrap_or(0),
+        "separate_views": render_opts.get("separate_views").and_then(|v| v.as_bool()).unwrap_or(false),
+        "scale_fonts": render_opts.get("scale_fonts").and_then(|v| v.as_bool()).unwrap_or(false),
+        "generate_video": render_opts.get("generate_video").and_then(|v| v.as_bool()).unwrap_or(true),
+        "gpu_id": render_opts.get("gpu_id").and_then(|v| v.as_i64()).unwrap_or(0),
+        "render_name": render_name,
+    });
+
+    // Write config JSON to render directory
+    let config_path = render_dir.join("render_config.json");
+    let config_json_str = serde_json::to_string_pretty(&render_config)
+        .map_err(|e| format!("Failed to serialize render config: {}", e))?;
+    tokio::fs::write(&config_path, &config_json_str).await
+        .map_err(|e| format!("Failed to write render config: {}", e))?;
+
+    // Locate render_job.py script
+    let render_script = std::env::current_dir()
+        .map(|d| d.join("render_job.py"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("render_job.py"));
+
+    if !render_script.exists() {
+        let err = format!("render_job.py not found at: {}", render_script.display());
+        let conn = db.lock().await;
+        let _ = db::fail_job(&conn, job.id, &err);
+        return Err(err);
+    }
+
+    // Create output log file
+    let output_filename = format!("output_render_{}.txt", job.id);
+    let output_path = render_dir.join(&output_filename);
+    let output_path_str = output_path.to_str().unwrap_or("").to_string();
+
+    let output_file = std::fs::File::create(&output_path)
+        .map_err(|e| format!("Failed to create output file: {}", e))?;
+    let stderr_file = output_file.try_clone()
+        .map_err(|e| format!("Failed to clone output file: {}", e))?;
+
+    // Resolve the mstar.sh env script for the version (if available)
+    // Only source this when using the version-bundled pvpython — sourcing it with
+    // the system ParaView can cause LD_LIBRARY_PATH conflicts
+    let env_source = if !use_mesa_flag {
+        let version_to_resolve = job.mstar_version.clone();
+        let versions_lock = versions.lock().await;
+        let src = resolve_version(&versions_lock, &version_to_resolve)
+            .map(|v| format!("source \"{}\" && ", v.env_script.display()))
+            .unwrap_or_default();
+        drop(versions_lock);
+        src
+    } else {
+        String::new()
+    };
+
+    // Set CUDA_VISIBLE_DEVICES before pvpython so VisRTX only initializes the selected GPU
+    let gpu_id = render_opts.get("gpu_id").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    // --mesa flag only works with the system ParaView launcher (not the raw pvpython-real)
+    let mesa_flag = if use_mesa_flag { "--mesa " } else { "" };
+
+    let command = format!(
+        "CUDA_VISIBLE_DEVICES={} {}\"{}\" {}--force-offscreen-rendering \"{}\" \"{}\"",
+        gpu_id,
+        env_source,
+        pvpython_path.display(),
+        mesa_flag,
+        render_script.display(),
+        config_path.display(),
+    );
+
+    println!("[QUEUE] Render command for job {}: {}", job.id, command);
+
+    // Launch pvpython
+    let mut child = TokioCommand::new("bash")
+        .arg("-c")
+        .arg(&command)
+        .current_dir(&source_work_dir)
+        .env("CUDA_VISIBLE_DEVICES", gpu_id.to_string())
+        .stdout(Stdio::from(output_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|e| format!("Failed to spawn pvpython: {}", e))?;
+
+    let pid = child.id().unwrap_or(0);
+
+    // Update DB: mark as running, set working directory to render output dir
+    {
+        let conn = db.lock().await;
+        if let Err(e) = db::start_job(&conn, job.id, pid, &render_dir_str, &output_path_str) {
+            eprintln!("[QUEUE] Failed to update render job status: {}", e);
+        }
+    }
+
+    println!("[QUEUE] Render job {} started with PID {} on GPU {}", job.id, pid,
+             render_opts.get("gpu_id").and_then(|v| v.as_i64()).unwrap_or(0));
+
+    // Wait for process completion
+    let db_clone = db.clone();
+    let job_id = job.id;
+
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) => {
+                let conn = db_clone.lock().await;
+                if status.success() {
+                    println!("[QUEUE] Render job {} completed successfully", job_id);
+                    let _ = db::complete_job(&conn, job_id);
+                } else {
+                    let err = format!("Render process exited with status: {}", status);
+                    println!("[QUEUE] Render job {} failed: {}", job_id, err);
+                    let _ = db::fail_job(&conn, job_id, &err);
+                }
+            }
+            Err(e) => {
+                let conn = db_clone.lock().await;
+                let _ = db::fail_job(&conn, job_id, &format!("Render process error: {}", e));
             }
         }
     });
@@ -736,6 +1083,288 @@ async fn copy_results_to_destination(
         }
         Err(e) => {
             eprintln!("[COPY] Job {} — failed to run cp: {}", job_id, e);
+        }
+    }
+}
+
+// ============================================================
+// AI Training Job Launcher
+// ============================================================
+
+/// Launch a queued AI training job:
+/// 1. Create artifact directory
+/// 2. Write training config JSON
+/// 3. Reserve GPUs
+/// 4. Spawn mstar-ai CLI process
+/// 5. Monitor until completion/failure
+/// 6. Release GPUs and update DB
+async fn launch_training_job(
+    db: DbHandle,
+    config: Config,
+    job: crate::ai_training::AiTrainingJob,
+) {
+    let job_id = job.id;
+    let ai_config = &config.ai_training;
+    let data_root = &config.paths.data_root;
+
+    // 1. Create artifact directory
+    let artifact_dir = std::path::Path::new(&ai_config.artifact_root)
+        .join(format!("training_job_{}", job_id));
+
+    if let Err(e) = tokio::fs::create_dir_all(&artifact_dir).await {
+        let msg = format!("Failed to create artifact directory: {}", e);
+        eprintln!("[AI] Training job {} — {}", job_id, msg);
+        let conn = db.lock().await;
+        let _ = crate::ai_training::update_training_job_status(&conn, job_id, "failed", None, Some(&msg));
+        return;
+    }
+
+    // 2. Build training config JSON
+    // Fetch dataset while holding the lock, then drop the lock before processing
+    let dataset_opt = {
+        let conn = db.lock().await;
+        let datasets = crate::ai_training::list_datasets(&conn, None);
+        datasets.into_iter().find(|d| d.id == job.dataset_id)
+    }; // conn dropped here — safe to re-lock below
+
+    let training_config = match dataset_opt {
+        Some(ds) => {
+            // Merge user config overrides with defaults
+            let mut cfg = serde_json::json!({
+                "dataset_id": ds.id,
+                "sweep_root": ds.sweep_root,
+                "dataset_mode": ds.dataset_mode,
+                "model_family": job.model_family,
+                "run_name": job.run_name,
+                "output_dir": artifact_dir.to_str().unwrap_or(""),
+                "batch_size": ai_config.default_batch_size,
+                "epochs": ai_config.default_epochs,
+                "learning_rate": ai_config.default_learning_rate,
+            });
+
+            // Apply user-supplied config overrides
+            if let Some(ref user_config) = job.config_json {
+                if let Ok(overrides) = serde_json::from_str::<serde_json::Value>(user_config) {
+                    if let (Some(base), Some(ovr)) = (cfg.as_object_mut(), overrides.as_object()) {
+                        for (k, v) in ovr {
+                            base.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+
+            // Set manifest path if available
+            if let Some(ref manifest) = ds.manifest_path {
+                if let Some(obj) = cfg.as_object_mut() {
+                    obj.insert("manifest_path".to_string(), serde_json::json!(manifest));
+                }
+            }
+
+            cfg
+        }
+        None => {
+            let msg = format!("Dataset {} not found", job.dataset_id);
+            eprintln!("[AI] Training job {} — {}", job_id, msg);
+            let conn = db.lock().await;
+            let _ = crate::ai_training::update_training_job_status(&conn, job_id, "failed", None, Some(&msg));
+            return;
+        }
+    };
+
+    // Write config to disk
+    let config_path = artifact_dir.join("training_config.json");
+    let config_str = serde_json::to_string_pretty(&training_config).unwrap_or_default();
+    if let Err(e) = tokio::fs::write(&config_path, &config_str).await {
+        let msg = format!("Failed to write training config: {}", e);
+        eprintln!("[AI] Training job {} — {}", job_id, msg);
+        let conn = db.lock().await;
+        let _ = crate::ai_training::update_training_job_status(&conn, job_id, "failed", None, Some(&msg));
+        return;
+    }
+
+    // 3. Reserve GPUs
+    let gpu_ids: Vec<i32> = serde_json::from_str(&job.gpu_ids).unwrap_or_default();
+    if !gpu_ids.is_empty() {
+        let conn = db.lock().await;
+        if let Err(e) = crate::ai_training::reserve_gpus_for_training(&conn, job_id, &gpu_ids) {
+            eprintln!("[AI] Training job {} — GPU reservation failed: {}", job_id, e);
+            let _ = crate::ai_training::update_training_job_status(&conn, job_id, "failed", None, Some(&e));
+            return;
+        }
+    }
+
+    // 4. Spawn training process
+    let log_path = artifact_dir.join(format!("training_{}.log", job_id));
+    let spawn_result = crate::ai_training::spawn_training_process(
+        ai_config,
+        &config_path,
+        data_root,
+        &log_path,
+    );
+
+    let mut child = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("Failed to spawn training process: {}", e);
+            eprintln!("[AI] Training job {} — {}", job_id, msg);
+            let conn = db.lock().await;
+            let _ = crate::ai_training::release_training_gpus(&conn, job_id);
+            let _ = crate::ai_training::update_training_job_status(&conn, job_id, "failed", None, Some(&msg));
+            return;
+        }
+    };
+
+    let pid = child.id();
+
+    // 5. Update DB to running
+    {
+        let conn = db.lock().await;
+        let _ = crate::ai_training::update_training_job_status(
+            &conn, job_id, "running", Some(pid as i64), None,
+        );
+        // Store artifact directory
+        let _ = conn.execute(
+            "UPDATE ai_training_jobs SET artifact_directory = ?2 WHERE id = ?1",
+            rusqlite::params![job_id, artifact_dir.to_str().unwrap_or("")],
+        );
+    }
+
+    println!("[AI] Training job {} started — PID={}, GPUs={:?}, artifact_dir={}",
+        job_id, pid, gpu_ids, artifact_dir.display());
+
+    // 6. Monitor process in background (non-blocking)
+    // child.wait() is std::process::Child::wait() which is blocking — must use
+    // spawn_blocking to avoid stalling the tokio runtime for hours/days.
+    let db_clone = db.clone();
+    tokio::spawn(async move {
+        let exit_status = tokio::task::spawn_blocking(move || {
+            child.wait()
+        }).await;
+
+        let conn = db_clone.lock().await;
+
+        // Check current status: if the job was already cancelled by the user,
+        // don't overwrite "cancelled" with "failed" (cancel/monitor race).
+        let current_status = {
+            let jobs = crate::ai_training::list_training_jobs(&conn, None, None);
+            jobs.into_iter().find(|j| j.id == job_id).map(|j| j.status)
+        };
+        let already_terminal = matches!(
+            current_status.as_deref(),
+            Some("cancelled") | Some("completed") | Some("failed")
+        );
+
+        // Always release GPUs (idempotent DELETE)
+        let _ = crate::ai_training::release_training_gpus(&conn, job_id);
+
+        if already_terminal {
+            println!("[AI] Training job {} — process exited but status already '{}', skipping update",
+                job_id, current_status.unwrap_or_default());
+            return;
+        }
+
+        match exit_status {
+            Ok(Ok(status)) => {
+                if status.success() {
+                    println!("[AI] Training job {} completed successfully", job_id);
+                    let _ = crate::ai_training::update_training_job_status(
+                        &conn, job_id, "completed", None, None,
+                    );
+                } else {
+                    let msg = format!("Training process exited with status: {}", status);
+                    println!("[AI] Training job {} failed: {}", job_id, msg);
+                    let _ = crate::ai_training::update_training_job_status(
+                        &conn, job_id, "failed", None, Some(&msg),
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                let msg = format!("Failed to wait for training process: {}", e);
+                eprintln!("[AI] Training job {} — {}", job_id, msg);
+                let _ = crate::ai_training::update_training_job_status(
+                    &conn, job_id, "failed", None, Some(&msg),
+                );
+            }
+            Err(e) => {
+                let msg = format!("Training monitor task panicked: {}", e);
+                eprintln!("[AI] Training job {} — {}", job_id, msg);
+                let _ = crate::ai_training::update_training_job_status(
+                    &conn, job_id, "failed", None, Some(&msg),
+                );
+            }
+        }
+    });
+}
+
+/// Check if all jobs in a sweep group are complete. If so, update the
+/// auto-created ai_dataset from 'pending' to 'ready'.
+/// If the sweep jobs have copy_to_path set, update the dataset's sweep_root
+/// to point to the copy destination (since that's where the data lives long-term).
+fn check_sweep_dataset_completion(conn: &rusqlite::Connection, sweep_group_id: &str) {
+    // Count remaining active jobs in this sweep group
+    let active_count = match crate::db::count_active_sweep_jobs(conn, sweep_group_id) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    if active_count > 0 {
+        return; // Still running jobs
+    }
+
+    // Check if there are any queued jobs left
+    let queued: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE sweep_group_id = ?1 AND status = 'queued'",
+        rusqlite::params![sweep_group_id],
+        |row| row.get(0),
+    ).unwrap_or(1);
+
+    if queued > 0 {
+        return; // Still queued jobs
+    }
+
+    // All jobs are done (completed or failed).
+    // Check if sweep jobs have a copy_to_path — if so, the dataset should point there
+    let copy_to_path: Option<String> = conn.query_row(
+        "SELECT copy_to_path FROM jobs WHERE sweep_group_id = ?1 AND copy_to_path IS NOT NULL AND copy_to_path != '' LIMIT 1",
+        rusqlite::params![sweep_group_id],
+        |row| row.get(0),
+    ).ok();
+
+    // If copy_to_path was set, the sweep root for the dataset should be updated
+    // to the copy destination's parent (copy_to_path is per-case, the parent is the sweep root)
+    if let Some(ref ctp) = copy_to_path {
+        let copy_parent = std::path::Path::new(ctp)
+            .parent()
+            .map(|p| p.to_str().unwrap_or(""))
+            .unwrap_or("");
+
+        if !copy_parent.is_empty() {
+            let _ = conn.execute(
+                "UPDATE ai_datasets SET sweep_root = ?2, status = 'ready',
+                 warnings_json = COALESCE(warnings_json, 'All sweep cases complete — dataset updated to copy destination'),
+                 updated_at = datetime('now')
+                 WHERE status = 'pending' AND config_json LIKE ?1",
+                rusqlite::params![format!("%{}%", sweep_group_id), copy_parent],
+            );
+            println!("[SWEEP] All jobs in group {} complete — dataset updated to copy destination: {}", sweep_group_id, copy_parent);
+            return;
+        }
+    }
+
+    // No copy_to_path — just mark as ready with the original sweep_root
+    let dataset_update = conn.execute(
+        "UPDATE ai_datasets SET status = 'ready', warnings_json = COALESCE(warnings_json, 'All sweep cases complete'),
+         updated_at = datetime('now')
+         WHERE status = 'pending' AND config_json LIKE ?1",
+        rusqlite::params![format!("%{}%", sweep_group_id)],
+    );
+
+    match dataset_update {
+        Ok(n) if n > 0 => {
+            println!("[SWEEP] All jobs in group {} complete — dataset marked as ready", sweep_group_id);
+        }
+        _ => {
+            // No pending dataset found — that's OK if it was already marked or doesn't exist
         }
     }
 }

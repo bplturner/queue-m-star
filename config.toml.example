@@ -41,3 +41,28 @@ startup_delay_secs = 10                # Wait for NFS/GPUs before processing que
 # Security configuration
 [security]
 allowed_email_domain = ""              # Restrict registration to a domain (e.g. "mycompany.com"). Empty = allow all.
+
+# AI Training integration (PhysicsNeMo)
+# Uncomment [ai_training] and set enabled = true to activate.
+# Requires: Python 3.9+ with mstar-ai-training package installed.
+# For GPU training: PyTorch + CUDA + nvidia-physicsnemo
+# [ai_training]
+# enabled = false                                             # Master switch for AI training features
+# python_executable = "python3"                               # Path to Python with PhysicsNeMo (or venv path)
+# container_mode = false                                      # Use NVIDIA NGC container instead of local Python
+# container_image = "nvcr.io/nvidia/physicsnemo:latest"       # Container image (when container_mode = true)
+# cache_root = "ai_cache"                                     # Directory for cached datasets (relative to data_root)
+# artifact_root = "ai_artifacts"                              # Directory for training artifacts (relative to data_root)
+# max_concurrent_training_jobs = 2                            # Max simultaneous training jobs
+# gpu_selection_policy = "least_utilized"                     # GPU selection: "least_utilized" or "explicit"
+# allowed_training_roots = []                                 # Additional allowed data roots (empty = data_root only)
+# default_dataset_format = "npz"                              # Output format: npz, zarr, hdf5, torch
+# default_model_family = "fno"                                # Default model: fno, mlp, gnn
+# default_batch_size = 8                                      # Default training batch size
+# default_epochs = 100                                        # Default training epochs
+# default_learning_rate = 0.001                               # Default learning rate
+# checkpoint_interval_epochs = 10                             # Save checkpoint every N epochs
+# allow_custom_entrypoints = false                            # SECURITY: allow user-specified Python modules
+# custom_entrypoint_roots = []                                # Allowed directories for custom modules (if enabled)
+# min_gpu_free_vram_mb = 2048                                 # Preflight: minimum free GPU VRAM (MB)
+# min_disk_free_gb = 10                                       # Preflight: minimum free disk space (GB)
