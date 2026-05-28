@@ -1133,7 +1133,7 @@ async fn launch_training_job(
             let mut cfg = serde_json::json!({
                 "dataset_id": ds.id,
                 "sweep_root": ds.sweep_root,
-                "dataset_mode": ds.dataset_mode,
+                "dataset_mode": if ds.dataset_mode.is_empty() { "time_averaged_2d" } else { &ds.dataset_mode },
                 "model_family": job.model_family,
                 "run_name": job.run_name,
                 "output_dir": artifact_dir.to_str().unwrap_or(""),
