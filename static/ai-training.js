@@ -1081,25 +1081,16 @@ function renderTraining(container) {
                     const res = await aiApi.get(`/ai/training-jobs/${jobId}/log`);
                     const logText = res?.log || res?.message || 'No log available';
 
-                    // Create modal overlay
-                    const overlay = document.createElement('div');
-                    overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;padding:24px;';
-                    overlay.innerHTML = `
-                        <div style="background:var(--surface-1);border-radius:12px;width:100%;max-width:900px;max-height:85vh;display:flex;flex-direction:column;border:1px solid var(--border);">
-                            <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
-                                <h3 style="margin:0;font-size:16px;">Training Log — Job #${jobId}</h3>
-                                <button id="ai-log-close" style="background:none;border:none;color:var(--text-secondary);font-size:22px;cursor:pointer;padding:4px 8px;">✕</button>
-                            </div>
-                            <pre style="flex:1;overflow:auto;padding:16px 20px;margin:0;font-family:'JetBrains Mono',Consolas,monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all;color:var(--text-primary);background:var(--surface-0);">${escHtml(logText)}</pre>
-                        </div>`;
-                    document.body.appendChild(overlay);
+                    // Use the shared #output-modal (same as simulation job viewer)
+                    const modal = document.getElementById('output-modal');
+                    const title = document.getElementById('output-modal-title');
+                    const modalBody = document.querySelector('.modal-body');
+                    const modalFooter = document.querySelector('.modal-footer');
 
-                    // Close handlers
-                    overlay.querySelector('#ai-log-close').addEventListener('click', () => overlay.remove());
-                    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
-                    document.addEventListener('keydown', function esc(e) {
-                        if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', esc); }
-                    });
+                    title.textContent = `Training Log — Job #${jobId}`;
+                    modalBody.innerHTML = `<pre class="output-content" style="max-height:600px;white-space:pre-wrap;word-break:break-all;">${escHtml(logText)}</pre>`;
+                    modalFooter.innerHTML = '';
+                    modal.style.display = 'flex';
                 } catch (e) {
                     showToast('Failed to fetch log', 'error');
                 }

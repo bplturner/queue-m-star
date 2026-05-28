@@ -543,10 +543,29 @@ pub fn spawn_training_process(
         .map(|d| d.join("python").join("ai_training"))
         .unwrap_or_else(|_| std::path::PathBuf::from("/opt/mstar_queue/python/ai_training"));
 
-    let pythonpath = match std::env::var("PYTHONPATH") {
-        Ok(existing) => format!("{}:{}", ai_training_dir.display(), existing),
-        Err(_) => ai_training_dir.display().to_string(),
+    // Discover Python site-packages paths (torch etc. may be in user or system site-packages)
+    // Run a quick python3 command to get sys.path — this handles venvs, user installs, etc.
+    let extra_paths = {
+        let output = std::process::Command::new(&config.python_executable)
+            .arg("-c")
+            .arg("import sys; print(':'.join(p for p in sys.path if p))")
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
+            _ => String::new(),
+        }
     };
+
+    let mut pythonpath_parts = vec![ai_training_dir.display().to_string()];
+    if !extra_paths.is_empty() {
+        pythonpath_parts.push(extra_paths);
+    }
+    if let Ok(existing) = std::env::var("PYTHONPATH") {
+        pythonpath_parts.push(existing);
+    }
+    let pythonpath = pythonpath_parts.join(":");
 
     cmd.stdout(Stdio::from(log_file))
        .stderr(Stdio::from(log_stderr))
