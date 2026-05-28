@@ -1200,6 +1200,7 @@ async fn launch_training_job(
         &config_path,
         data_root,
         &log_path,
+        &gpu_ids,
     );
 
     let mut child = match spawn_result {

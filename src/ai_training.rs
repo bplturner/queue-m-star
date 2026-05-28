@@ -523,6 +523,7 @@ pub fn spawn_training_process(
     config_path: &Path,
     data_root: &Path,
     log_path: &Path,
+    gpu_ids: &[i32],
 ) -> Result<Child, String> {
     let log_file = std::fs::File::create(log_path)
         .map_err(|e| format!("Failed to create log file {:?}: {}", log_path, e))?;
@@ -571,6 +572,22 @@ pub fn spawn_training_process(
        .stderr(Stdio::from(log_stderr))
        .stdin(Stdio::null())
        .env("PYTHONPATH", &pythonpath);
+
+    // CRITICAL: Restrict training to only the user-selected GPUs.
+    // Without this, PyTorch/PhysicsNeMo will see ALL GPUs and potentially
+    // interfere with running simulation jobs on other GPUs.
+    if !gpu_ids.is_empty() {
+        let cuda_devices = gpu_ids.iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("[AI] Setting CUDA_VISIBLE_DEVICES={}", cuda_devices);
+        cmd.env("CUDA_VISIBLE_DEVICES", &cuda_devices);
+    } else {
+        // Safety: if no GPUs specified, default to GPU 0 only
+        println!("[AI] WARNING: No GPU IDs specified, defaulting to GPU 0");
+        cmd.env("CUDA_VISIBLE_DEVICES", "0");
+    }
 
     let child = cmd
         .spawn()

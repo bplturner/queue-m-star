@@ -100,6 +100,9 @@ echo -e "\n${YELLOW}[3/5] Running training (1 epoch, batch_size=2)...${NC}"
 LOG_FILE="$OUTPUT_DIR/training_test.log"
 
 # This is exactly what spawn_training_process does
+# Restrict to GPU 0 only (backend sets CUDA_VISIBLE_DEVICES from user-selected GPUs)
+export CUDA_VISIBLE_DEVICES=0
+echo "  CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 if python3 -m mstar_ai.cli train --config "$OUTPUT_DIR/training_config.json" 2>&1 | tee "$LOG_FILE"; then
     TRAIN_EXIT=0
 else
