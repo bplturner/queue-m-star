@@ -216,7 +216,7 @@ pub struct AiTrainingConfig {
     /// Default dataset output format: npz, zarr, hdf5, torch
     #[serde(default = "default_dataset_format")]
     pub default_dataset_format: String,
-    /// Default model family: fno, mlp, gnn
+    /// Default model family: fno, unet, mlp
     #[serde(default = "default_model_family")]
     pub default_model_family: String,
     /// Default training batch size
@@ -365,7 +365,7 @@ impl Config {
                 return Err(format!("AI training: invalid default_dataset_format '{}'. Valid: {:?}",
                     self.ai_training.default_dataset_format, valid_formats));
             }
-            let valid_families = ["fno", "mlp", "gnn"];
+            let valid_families = ["fno", "unet", "mlp"];
             if !valid_families.contains(&self.ai_training.default_model_family.as_str()) {
                 return Err(format!("AI training: invalid default_model_family '{}'. Valid: {:?}",
                     self.ai_training.default_model_family, valid_families));

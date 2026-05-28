@@ -3603,7 +3603,7 @@ async fn handle_ai_create_training_job(
     };
 
     // Validate model family
-    let valid_families = ["fno", "mlp", "gnn"];
+    let valid_families = ["fno", "unet", "mlp"];
     if !valid_families.contains(&body.model_family.as_str()) {
         return Ok(json_error(
             &format!("Invalid model_family: '{}'. Valid: {:?}", body.model_family, valid_families),
