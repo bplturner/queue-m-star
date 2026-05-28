@@ -1008,6 +1008,7 @@ function renderTraining(container) {
                                 <td class="text-sm text-muted">${formatTime(j.submitted_at)}</td>
                                 <td>
                                     ${isActive ? `<button class="btn btn-danger btn-sm" data-cancel-job="${j.id}">Cancel</button>` : ''}
+                                    ${j.status === 'completed' ? `<button class="btn btn-secondary btn-sm" style="margin-left:4px;" data-infer-job="${j.id}" title="Run inference with this model">Infer</button>` : ''}
                                     ${j.failure_reason ? `<div class="ai-job-detail ai-job-error" title="${escHtml(j.failure_reason)}">${escHtml(truncate(j.failure_reason, 80))}</div>` : ''}
                                 </td>
                             </tr>`;
@@ -1037,6 +1038,35 @@ function renderTraining(container) {
                     btn.disabled = false;
                     btn.textContent = 'Cancel';
                 }
+            });
+        });
+
+        // Inference buttons
+        el.querySelectorAll('[data-infer-job]').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const jobId = btn.dataset.inferJob;
+                const paramsStr = prompt(
+                    'Enter input parameters as JSON (e.g. {"RPM": 75.0}):',
+                    '{}'
+                );
+                if (paramsStr === null) return;
+
+                btn.disabled = true;
+                btn.textContent = 'Running...';
+                try {
+                    const res = await aiApi.post(`/ai/training-jobs/${jobId}/infer`, {
+                        input_params: JSON.parse(paramsStr),
+                    });
+                    if (res && !res.error) {
+                        showToast(`Inference complete — output: ${res.output_dir || 'saved'}`, 'success');
+                    } else {
+                        showToast(res?.error || 'Inference failed', 'error');
+                    }
+                } catch (e) {
+                    showToast('Invalid JSON or network error', 'error');
+                }
+                btn.disabled = false;
+                btn.textContent = 'Infer';
             });
         });
     }
@@ -1381,9 +1411,10 @@ function renderTraining(container) {
                                     <label class="form-label">Model Family</label>
                                     <select class="form-select" id="ai-tj-model">
                                         <option value="fno">FNO (Fourier Neural Operator)</option>
+                                        <option value="unet">U-Net (Encoder-Decoder)</option>
                                         <option value="mlp">MLP (Multi-Layer Perceptron)</option>
-                                        <option value="gnn">GNN (Graph Neural Network)</option>
                                     </select>
+                                    <div id="ai-tj-model-note" style="font-size:11px;color:var(--text-muted);margin-top:4px;"></div>
                                 </div>
                             </div>
                             <div class="form-group" style="margin-bottom:0;">
@@ -1474,6 +1505,18 @@ function renderTraining(container) {
             advancedOpen = !advancedOpen;
             advancedBody.style.display = advancedOpen ? 'block' : 'none';
             advancedChevron.style.transform = advancedOpen ? 'rotate(0deg)' : 'rotate(-90deg)';
+        });
+
+        // ---- Model family note ----
+        const modelSelect = document.getElementById('ai-tj-model');
+        const modelNote = document.getElementById('ai-tj-model-note');
+        const modelNotes = {
+            fno: '',
+            unet: 'Best for 2D/3D spatial field prediction. Uses PhysicsNeMo Pix2Pix when available.',
+            mlp: 'For scalar-to-scalar regression (stats_table datasets only).',
+        };
+        modelSelect.addEventListener('change', () => {
+            modelNote.textContent = modelNotes[modelSelect.value] || '';
         });
 
         // ---- GPU grid ----
