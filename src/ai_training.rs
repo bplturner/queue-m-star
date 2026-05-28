@@ -537,9 +537,21 @@ pub fn spawn_training_process(
         data_root,
     )?;
 
+    // Set PYTHONPATH so mstar_ai is importable even when running as systemd service
+    // The ai_training package is deployed to {cwd}/python/ai_training/
+    let ai_training_dir = std::env::current_dir()
+        .map(|d| d.join("python").join("ai_training"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/opt/mstar_queue/python/ai_training"));
+
+    let pythonpath = match std::env::var("PYTHONPATH") {
+        Ok(existing) => format!("{}:{}", ai_training_dir.display(), existing),
+        Err(_) => ai_training_dir.display().to_string(),
+    };
+
     cmd.stdout(Stdio::from(log_file))
        .stderr(Stdio::from(log_stderr))
-       .stdin(Stdio::null());
+       .stdin(Stdio::null())
+       .env("PYTHONPATH", &pythonpath);
 
     let child = cmd
         .spawn()

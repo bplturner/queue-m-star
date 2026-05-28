@@ -1008,6 +1008,7 @@ function renderTraining(container) {
                                 <td class="text-sm text-muted">${formatTime(j.submitted_at)}</td>
                                 <td>
                                     ${isActive ? `<button class="btn btn-danger btn-sm" data-cancel-job="${j.id}">Cancel</button>` : ''}
+                                    <button class="btn btn-sm" style="margin-left:4px;background:var(--surface-2);color:var(--text-secondary);" data-view-log="${j.id}" title="View training log">Log</button>
                                     ${j.status === 'completed' ? `<button class="btn btn-secondary btn-sm" style="margin-left:4px;" data-infer-job="${j.id}" title="Run inference with this model">Infer</button>` : ''}
                                     ${j.failure_reason ? `<div class="ai-job-detail ai-job-error" title="${escHtml(j.failure_reason)}">${escHtml(truncate(j.failure_reason, 80))}</div>` : ''}
                                 </td>
@@ -1067,6 +1068,43 @@ function renderTraining(container) {
                 }
                 btn.disabled = false;
                 btn.textContent = 'Infer';
+            });
+        });
+
+        // View Log buttons
+        el.querySelectorAll('[data-view-log]').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const jobId = btn.dataset.viewLog;
+                btn.disabled = true;
+                btn.textContent = '...';
+                try {
+                    const res = await aiApi.get(`/ai/training-jobs/${jobId}/log`);
+                    const logText = res?.log || res?.message || 'No log available';
+
+                    // Create modal overlay
+                    const overlay = document.createElement('div');
+                    overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;padding:24px;';
+                    overlay.innerHTML = `
+                        <div style="background:var(--surface-1);border-radius:12px;width:100%;max-width:900px;max-height:85vh;display:flex;flex-direction:column;border:1px solid var(--border);">
+                            <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);">
+                                <h3 style="margin:0;font-size:16px;">Training Log — Job #${jobId}</h3>
+                                <button id="ai-log-close" style="background:none;border:none;color:var(--text-secondary);font-size:22px;cursor:pointer;padding:4px 8px;">✕</button>
+                            </div>
+                            <pre style="flex:1;overflow:auto;padding:16px 20px;margin:0;font-family:'JetBrains Mono',Consolas,monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all;color:var(--text-primary);background:var(--surface-0);">${escHtml(logText)}</pre>
+                        </div>`;
+                    document.body.appendChild(overlay);
+
+                    // Close handlers
+                    overlay.querySelector('#ai-log-close').addEventListener('click', () => overlay.remove());
+                    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+                    document.addEventListener('keydown', function esc(e) {
+                        if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', esc); }
+                    });
+                } catch (e) {
+                    showToast('Failed to fetch log', 'error');
+                }
+                btn.disabled = false;
+                btn.textContent = 'Log';
             });
         });
     }

@@ -600,6 +600,16 @@ pub fn api_routes(
         .and(with_state(state.clone()))
         .and_then(handle_ai_cancel_training_job);
 
+    // GET /api/ai/training-jobs/:id/log — raw training log
+    let ai_training_jobs_log = api.and(warp::path("ai")).and(warp::path("training-jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("log"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_training_log);
+
     // GET /api/ai/config  (return enabled status + defaults)
     let ai_training_config = api.and(warp::path("ai")).and(warp::path("config")).and(warp::path::end())
         .and(warp::get())
@@ -692,6 +702,7 @@ pub fn api_routes(
         .or(ai_training_jobs_create)
         .or(ai_training_jobs_get)
         .or(ai_training_jobs_cancel)
+        .or(ai_training_jobs_log)
         .or(ai_training_config)
         .or(ai_preflight)
         // Sweep routes
@@ -3742,6 +3753,103 @@ async fn handle_ai_cancel_training_job(
     Ok(json_ok(&ApiSuccess { message: "Training job cancelled".to_string() }))
 }
 
+/// GET /api/ai/training-jobs/:id/log — raw training log
+async fn handle_ai_training_log(
+    id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    // Find the job
+    let jobs = ai_training::list_training_jobs(&db, None, None);
+    let job = match jobs.into_iter().find(|j| j.id == id) {
+        Some(j) => j,
+        None => return Ok(json_error("Training job not found", warp::http::StatusCode::NOT_FOUND)),
+    };
+
+    // Auth check
+    if user.role != "admin" && job.user_id != user.id {
+        return Ok(json_error("Forbidden", warp::http::StatusCode::FORBIDDEN));
+    }
+    drop(db);
+
+    // Find the log file
+    let log_path = match &job.artifact_directory {
+        Some(dir) => {
+            let p = std::path::Path::new(dir).join(format!("training_{}.log", id));
+            if p.exists() {
+                p
+            } else {
+                // Fallback: check for any .log file in the directory
+                let fallback = std::path::Path::new(dir);
+                if fallback.is_dir() {
+                    let mut log_file = None;
+                    if let Ok(entries) = std::fs::read_dir(fallback) {
+                        for entry in entries.flatten() {
+                            if entry.path().extension().map_or(false, |e| e == "log") {
+                                log_file = Some(entry.path());
+                                break;
+                            }
+                        }
+                    }
+                    match log_file {
+                        Some(f) => f,
+                        None => return Ok(json_ok(&serde_json::json!({
+                            "log": "",
+                            "message": "No log file found in artifact directory"
+                        }))),
+                    }
+                } else {
+                    return Ok(json_ok(&serde_json::json!({
+                        "log": "",
+                        "message": "Artifact directory not found"
+                    })));
+                }
+            }
+        }
+        None => return Ok(json_ok(&serde_json::json!({
+            "log": "",
+            "message": "No artifact directory for this job"
+        }))),
+    };
+
+    // Read the log file (cap at 200KB to prevent huge responses)
+    match tokio::fs::read_to_string(&log_path).await {
+        Ok(content) => {
+            let max_len = 200 * 1024; // 200KB
+            let truncated = content.len() > max_len;
+            let log_content = if truncated {
+                format!("... [truncated, showing last {} bytes] ...\n{}", max_len, &content[content.len() - max_len..])
+            } else {
+                content
+            };
+            Ok(json_ok(&serde_json::json!({
+                "log": log_content,
+                "log_path": log_path.to_str().unwrap_or(""),
+                "truncated": truncated,
+            })))
+        }
+        Err(e) => Ok(json_ok(&serde_json::json!({
+            "log": "",
+            "message": format!("Failed to read log file: {}", e),
+        }))),
+    }
+}
+
 /// GET /api/ai/config — return AI training configuration (enabled, defaults)
 async fn handle_ai_config(
     auth: Option<String>,
@@ -3812,8 +3920,18 @@ async fn handle_ai_preflight(
         c
     };
 
+    // Set PYTHONPATH so mstar_ai is importable
+    let ai_training_dir = std::env::current_dir()
+        .map(|d| d.join("python").join("ai_training"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/opt/mstar_queue/python/ai_training"));
+    let pythonpath = match std::env::var("PYTHONPATH") {
+        Ok(existing) => format!("{}:{}", ai_training_dir.display(), existing),
+        Err(_) => ai_training_dir.display().to_string(),
+    };
+
     cmd.stdout(std::process::Stdio::piped())
-       .stderr(std::process::Stdio::piped());
+       .stderr(std::process::Stdio::piped())
+       .env("PYTHONPATH", &pythonpath);
 
     match cmd.output() {
         Ok(output) => {
