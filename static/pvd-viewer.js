@@ -84,7 +84,6 @@
         overlay.innerHTML =
             '<div class="pvd-viewer-header">' +
             '  <div class="pvd-viewer-title">' +
-            '    <div class="pvd-icon">\uD83D\uDD2C</div>' +
             '    <span>Loading PVD Viewer...</span>' +
             '  </div>' +
             '  <button class="pvd-viewer-close" id="pvd-close-btn">&times;</button>' +
@@ -247,7 +246,7 @@
             '<div class="pvd-timestep-group">' +
             '  <span class="pvd-controls-label">Time</span>' +
             '  <input type="range" class="pvd-timestep-slider" id="pvd-ts-slider" min="0" max="' + lastIdx + '" value="' + lastIdx + '" step="1">' +
-            '  <span class="pvd-timestep-value" id="pvd-ts-display">' + formatTime(ts[lastIdx].time) + ' s</span>' +
+            '  <span class="pvd-timestep-value" id="pvd-ts-display">' + _timestepLabel(ts[lastIdx]) + '</span>' +
             '  <div class="pvd-transport-spinner" id="pvd-transport-spinner" style="display:none;"></div>' +
             '</div>';
 
@@ -389,7 +388,7 @@
 
         // Update display
         var display = document.getElementById('pvd-ts-display');
-        if (display) display.textContent = formatTime(ts.time) + ' s';
+        if (display) display.textContent = _timestepLabel(ts);
 
         // Show spinner on transport controls
         showTransportSpinner();
@@ -402,16 +401,26 @@
         var files = ts.files || [];
         var loadPromises = files.map(function(fileInfo) {
             var filePath = fileInfo.file;
-            // Path in PVD is relative to PVD file's parent directory
-            var pvdDir = st.pvdPath.substring(0, st.pvdPath.lastIndexOf('/') + 1);
-            var fullPath = pvdDir + filePath;
+            var fetchUrl;
 
-            return fetch('/api/jobs/' + st.jobId + '/files/vtk-serve?path=' + encodeURIComponent(fullPath), {
+            if (st.aiMode) {
+                // AI artifact mode: file paths in PVD are relative to PVD parent dir
+                var pvdDir = st.pvdPath.substring(0, st.pvdPath.lastIndexOf('/') + 1);
+                var absFilePath = pvdDir + filePath;
+                fetchUrl = '/api/ai/artifacts/vtk-serve?path=' + encodeURIComponent(absFilePath);
+            } else {
+                // Normal mode: paths relative to job's output directory
+                var pvdDir = st.pvdPath.substring(0, st.pvdPath.lastIndexOf('/') + 1);
+                var fullPath = pvdDir + filePath;
+                fetchUrl = '/api/jobs/' + st.jobId + '/files/vtk-serve?path=' + encodeURIComponent(fullPath);
+            }
+
+            return fetch(fetchUrl, {
                 headers: { 'Authorization': 'Bearer ' + getToken() }
             })
             .then(function(response) {
                 if (!response.ok) {
-                    console.warn('[PVD] Failed to load ' + fullPath + ': ' + response.status);
+                    console.warn('[PVD] Failed to load ' + filePath + ': ' + response.status);
                     return null;
                 }
                 return response.arrayBuffer();
@@ -456,6 +465,9 @@
 
                 var actor = st.vtkClasses.vtkActor.newInstance();
                 actor.setMapper(mapper);
+                // Disable backface culling so flat slices are visible from either side
+                actor.getProperty().setBackfaceCulling(false);
+                actor.getProperty().setFrontfaceCulling(false);
 
                 return { actor: actor, polydata: polydata };
             })
@@ -1362,10 +1374,14 @@
 
     // Helpers
     function formatTime(t) {
-        if (typeof t !== 'number') return String(t);
-        if (Math.abs(t) < 0.001) return t.toExponential(3);
-        if (Math.abs(t) >= 1000) return t.toExponential(3);
+        if (typeof t !== 'number' || isNaN(t)) return '0';
         return t.toFixed(4);
+    }
+
+    /** Get a display label for a PVD timestep. Uses label if available, otherwise time. */
+    function _timestepLabel(ts) {
+        if (ts && ts.label) return ts.label;
+        return formatTime(ts ? ts.time : 0) + ' s';
     }
 
     function escapeHtml(str) {
@@ -2613,10 +2629,73 @@
         mlState.renderWindow.render();
     }
 
+    /**
+     * Open the PVD viewer for an AI prediction result (absolute path)
+     */
+    function openAiPvdViewer(absPath) {
+        // Show loading overlay
+        var overlay = document.createElement('div');
+        overlay.className = 'pvd-viewer-overlay';
+        overlay.id = 'pvd-viewer-overlay';
+        overlay.innerHTML =
+            '<div class="pvd-viewer-header">' +
+            '  <div class="pvd-viewer-title">' +
+            '    <div class="pvd-loading-text">Loading prediction...</div>' +
+            '    <span>Loading AI Prediction...</span>' +
+            '  </div>' +
+            '  <button class="pvd-viewer-close" id="pvd-close-btn">&times;</button>' +
+            '</div>' +
+            '<div class="pvd-controls pvd-controls-top" id="pvd-controls-top" style="display:none;"></div>' +
+            '<div class="pvd-canvas-container" id="pvd-canvas-container">' +
+            '  <div class="pvd-loading-overlay" id="pvd-loading">' +
+            '    <div class="spinner"></div>' +
+            '    <div class="pvd-loading-text">Loading prediction...</div>' +
+            '  </div>' +
+            '</div>' +
+            '<div class="pvd-controls" id="pvd-controls" style="display:none;"></div>';
+        document.body.appendChild(overlay);
+
+        document.getElementById('pvd-close-btn').addEventListener('click', closePvdViewer);
+
+        var vtkClasses = getVtkClasses();
+        if (!vtkClasses) {
+            showViewerError('vtk.js library failed to load.');
+            return;
+        }
+
+        // Fetch PVD info from AI artifacts endpoint
+        fetch('/api/ai/artifacts/pvd-info?path=' + encodeURIComponent(absPath), {
+            headers: { 'Authorization': 'Bearer ' + getToken() }
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(pvdInfo) {
+            if (pvdInfo.error) {
+                showViewerError(pvdInfo.error);
+                return;
+            }
+            if (!pvdInfo.timesteps || pvdInfo.timesteps.length === 0) {
+                showViewerError('No timesteps found in prediction PVD');
+                return;
+            }
+            var fname = absPath.split('/').pop();
+            overlay.querySelector('.pvd-viewer-title span').textContent = fname;
+
+            // Use jobId = -1 as sentinel for AI mode
+            initializeViewer(vtkClasses, -1, absPath, pvdInfo);
+            // Mark AI mode on viewerState
+            if (viewerState) viewerState.aiMode = true;
+        })
+        .catch(function(err) {
+            console.error('[PVD Viewer] AI init error:', err);
+            showViewerError('Failed to load prediction: ' + err.message);
+        });
+    }
+
     // Expose globally for scripts.js
     window._pvdViewer = {
         openPvdViewer: openPvdViewer,
         closePvdViewer: closePvdViewer,
-        openMultiLayerViewer: openMultiLayerViewer
+        openMultiLayerViewer: openMultiLayerViewer,
+        openAiPvdViewer: openAiPvdViewer
     };
 })();

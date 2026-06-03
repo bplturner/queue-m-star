@@ -90,9 +90,11 @@ function renderTraining(container) {
             empty:     'var(--text-muted, #6b7280)',
             scanned:   'var(--accent-green, #10b981)',
             no_output: 'var(--accent-red, #ef4444)',
+            preparing: 'var(--accent-cyan, #06b6d4)',
+            prepared:  'var(--accent-purple, #8b5cf6)',
         };
         const c = colors[status] || 'var(--text-muted)';
-        const isAnimated = status === 'running' || status === 'preflight' || status === 'launching' || status === 'scanning';
+        const isAnimated = status === 'running' || status === 'preflight' || status === 'launching' || status === 'scanning' || status === 'preparing';
         return `<span class="badge" style="background:${c}22;color:${c};border:1px solid ${c}33;">
             <span class="badge-dot" style="background:${c};${isAnimated ? 'animation:pulse-dot 1.5s infinite;' : ''}"></span>
             ${escHtml(status)}
@@ -122,6 +124,7 @@ function renderTraining(container) {
     let selectedGpus = new Set();
     let pollTimer = null;
     let currentView = 'dashboard'; // 'dashboard' | 'create-dataset' | 'new-training'
+    let lastActiveTab = 'datasets'; // 'datasets' | 'training-jobs' — remembers which tab to show
 
     // Inject page-specific styles once
     const styleEl = document.createElement('style');
@@ -163,12 +166,20 @@ function renderTraining(container) {
     // ============================================================
     // VIEW NAVIGATION
     // ============================================================
-    function showView(view) {
+    function showView(view, resumeOpts) {
         currentView = view;
-        if (view === 'dashboard') renderDashboard();
+        if (view === 'dashboard') {
+            // resumeOpts may carry { tab: 'datasets' | 'training-jobs' }
+            if (resumeOpts && resumeOpts.tab) lastActiveTab = resumeOpts.tab;
+            renderDashboard();
+        }
         else if (view === 'create-dataset') renderCreateDataset();
-        else if (view === 'new-training') renderNewTraining();
+        else if (view === 'new-training') renderNewTraining(resumeOpts);
+        else if (view === 'prepare-dataset') renderPrepareDataset(resumeOpts);
     }
+
+    // Expose showView so the metrics modal can navigate here
+    window._aiTrainingModule = { showView };
 
     // ============================================================
     // VIEW 1: DASHBOARD
@@ -205,15 +216,15 @@ function renderTraining(container) {
             </div>
 
             <div class="ai-tabs">
-                <div class="ai-tab active" data-panel="datasets">Datasets</div>
-                <div class="ai-tab" data-panel="training-jobs">Training Jobs</div>
+                <div class="ai-tab${lastActiveTab === 'datasets' ? ' active' : ''}" data-panel="datasets">Datasets</div>
+                <div class="ai-tab${lastActiveTab === 'training-jobs' ? ' active' : ''}" data-panel="training-jobs">Training Jobs</div>
             </div>
 
-            <div class="ai-panel active" id="panel-datasets">
+            <div class="ai-panel${lastActiveTab === 'datasets' ? ' active' : ''}" id="panel-datasets">
                 <div class="card"><div id="ai-datasets-table"></div></div>
             </div>
 
-            <div class="ai-panel" id="panel-training-jobs">
+            <div class="ai-panel${lastActiveTab === 'training-jobs' ? ' active' : ''}" id="panel-training-jobs">
                 <div class="card"><div id="ai-training-table"></div></div>
             </div>
         `;
@@ -225,6 +236,7 @@ function renderTraining(container) {
                 wrapper.querySelectorAll('.ai-tab').forEach(t => t.classList.remove('active'));
                 wrapper.querySelectorAll('.ai-panel').forEach(p => p.classList.remove('active'));
                 tab.classList.add('active');
+                lastActiveTab = tab.dataset.panel;
                 const panel = document.getElementById('panel-' + tab.dataset.panel);
                 if (panel) panel.classList.add('active');
             });
@@ -306,10 +318,13 @@ function renderTraining(container) {
                                 <td class="text-sm">${dataInfo}</td>
                                 <td>${statusBadge(ds.status)}</td>
                                 <td class="text-sm text-muted">${formatTime(ds.created_at)}</td>
-                                <td>
+                                <td style="display:flex;gap:4px;">
                                     <button class="btn btn-secondary" style="padding:4px 10px;font-size:11px;" onclick="event.stopPropagation(); window._aiShowDatasetDetail && window._aiShowDatasetDetail(${ds.id})">
                                         View
                                     </button>
+                                    ${(ds.status === 'scanned' || ds.status === 'ready' || ds.status === 'prepared' || ds.status === 'warnings') ? `<button class="btn" style="padding:4px 10px;font-size:11px;background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.25);" onclick="event.stopPropagation(); window._aiTrainingModule.showView('prepare-dataset', {datasetId: ${ds.id}, datasetName: '${escHtml(ds.name)}', sweepRoot: '${escHtml(ds.sweep_root)}'})">
+                                        Prepare
+                                    </button>` : ''}
                                 </td>
                             </tr>`;
                         }).join('')}
@@ -400,6 +415,9 @@ function renderTraining(container) {
         const checks = validation.checks || [];
         const trainReady = validation.training_ready || {};
         const totalDataHuman = stats.total_data_human || '—';
+
+        let sweepParams = [];
+        try { sweepParams = ds.sweep_parameters_json ? (typeof ds.sweep_parameters_json === 'string' ? JSON.parse(ds.sweep_parameters_json) : ds.sweep_parameters_json) : []; } catch {}
 
         const numCases = ds.num_cases || cases.length || 0;
         const casesWithOutput = cases.filter(c => c.status === 'scanned').map(c => c.name);
@@ -499,25 +517,25 @@ function renderTraining(container) {
             <!-- Tabbed content -->
             <div class="card">
                 <div style="display:flex;border-bottom:1px solid var(--border-color);padding:0 16px;flex-wrap:wrap;">
-                    <button class="ai-ds-tab active" data-tab="stats" style="padding:10px 16px;background:none;border:none;color:var(--text-primary);cursor:pointer;border-bottom:2px solid transparent;font-size:13px;font-weight:500;">
-                        📊 Stats (${physicsStats.length})
+                    <button class="ai-ds-tab active" data-tab="cases" style="padding:10px 16px;background:none;border:none;color:var(--text-primary);cursor:pointer;border-bottom:2px solid transparent;font-size:13px;font-weight:500;">
+                        Cases (${cases.length})
+                    </button>
+                    <button class="ai-ds-tab" data-tab="stats" style="padding:10px 16px;background:none;border:none;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-size:13px;font-weight:500;">
+                        Stats (${physicsStats.length})
                     </button>
                     <button class="ai-ds-tab" data-tab="slices2d" style="padding:10px 16px;background:none;border:none;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-size:13px;font-weight:500;">
-                        🔲 2D Slices (${slices2d.length})
+                        2D Slices (${slices2d.length})
                     </button>
                     <button class="ai-ds-tab" data-tab="volumes3d" style="padding:10px 16px;background:none;border:none;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-size:13px;font-weight:500;">
-                        📦 3D / Bodies (${volumes3d.length + slicesBody.length})
-                    </button>
-                    <button class="ai-ds-tab" data-tab="cases" style="padding:10px 16px;background:none;border:none;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-size:13px;font-weight:500;">
-                        📁 Cases (${cases.length})
+                        3D / Bodies (${volumes3d.length + slicesBody.length})
                     </button>
                     <button class="ai-ds-tab" data-tab="matrix" style="padding:10px 16px;background:none;border:none;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-size:13px;font-weight:500;">
-                        🔀 Consistency
+                        Consistency
                     </button>
                 </div>
 
                 <div id="ai-ds-tab-content" style="padding:16px;">
-                    ${renderStatsTab(physicsStats, numCases, casesWithOutput)}
+                    ${renderCasesTab(cases, physicsStats, pvd, sweepParams)}
                 </div>
             </div>
         `;
@@ -536,10 +554,10 @@ function renderTraining(container) {
 
                 const content = el.querySelector('#ai-ds-tab-content');
                 switch (tab.dataset.tab) {
+                    case 'cases': content.innerHTML = renderCasesTab(cases, physicsStats, pvd, sweepParams); break;
                     case 'stats': content.innerHTML = renderStatsTab(physicsStats, numCases, casesWithOutput); break;
                     case 'slices2d': content.innerHTML = renderSlices2dTab(slices2d, numCases, casesWithOutput); break;
                     case 'volumes3d': content.innerHTML = renderVolumes3dTab(volumes3d, slicesBody, numCases, casesWithOutput); break;
-                    case 'cases': content.innerHTML = renderCasesTab(cases, physicsStats, pvd); break;
                     case 'matrix': content.innerHTML = renderMatrixTab(physicsStats, pvd, cases); break;
                 }
             });
@@ -563,7 +581,7 @@ function renderTraining(container) {
         }
 
         // Back button
-        el.querySelector('#ai-ds-back').addEventListener('click', () => showView('dashboard'));
+        el.querySelector('#ai-ds-back').addEventListener('click', () => showView('dashboard', { tab: 'datasets' }));
 
         // Rescan button
         el.querySelector('#ai-ds-rescan').addEventListener('click', async () => {
@@ -841,7 +859,7 @@ function renderTraining(container) {
             </div>`;
     }
 
-    function renderCasesTab(cases, physicsStats, pvd) {
+    function renderCasesTab(cases, physicsStats, pvd, sweepParams) {
         if (!cases.length) return '<div class="text-muted" style="text-align:center;padding:24px;">No cases found</div>';
 
         const allPvds = [
@@ -854,11 +872,27 @@ function renderTraining(container) {
         const totalStats = physicsStats.length;
         const totalPvds = allPvds.length;
 
+        // Collect parameter keys from sweep params or from per-case data
+        const paramKeys = [];
+        const paramKeySet = new Set();
+        if (Array.isArray(sweepParams) && sweepParams.length > 0) {
+            for (const sp of sweepParams) {
+                const pname = typeof sp === 'string' ? sp : (sp.name || sp);
+                if (!paramKeySet.has(pname)) { paramKeySet.add(pname); paramKeys.push(pname); }
+            }
+        }
+        // Also check per-case parameters for any keys not in sweep params
+        for (const c of cases) {
+            for (const k of Object.keys(c.parameters || {})) {
+                if (!paramKeySet.has(k)) { paramKeySet.add(k); paramKeys.push(k); }
+            }
+        }
+
         return `
             <div class="table-container">
                 <table class="data-table" style="font-size:12px;">
                     <thead><tr>
-                        <th>Case Name</th><th>Status</th><th>Time Range</th><th>Stats</th><th>2D</th><th>3D</th><th>Completeness</th><th>Directory</th>
+                        <th>Case Name</th>${paramKeys.map(k => `<th style="color:var(--accent-blue,#3b82f6);">${escHtml(k)}</th>`).join('')}<th>Status</th><th>Time Range</th><th>Stats</th><th>2D</th><th>3D</th><th>Completeness</th><th>Directory</th>
                     </tr></thead>
                     <tbody>
                         ${cases.map(c => {
@@ -866,7 +900,7 @@ function renderTraining(container) {
                             const statsCount = (c.stats_files || []).length;
                             const pvdCats = c.pvd_categories || {};
                             const sliceCount = (pvdCats.slices_2d || 0) + (pvdCats.other || 0);
-                            const volCount = (pvdCats.volumes_3d || 0) + (pvdCats.slices_body || 0);
+                            const volCount = (pvdCats.volumes_3d || 0) + (pvdCats.slices_body || 0) + (pvdCats.boundary_conditions || 0);
 
                             // Completeness: does this case have all common stats and PVDs?
                             const hasAllStats = statsCount >= totalStats;
@@ -877,9 +911,18 @@ function renderTraining(container) {
                                 else completeness = `<span style="color:#f59e0b;" title="Some data missing">⚠ Partial</span>`;
                             }
 
+                            // Parameter value cells
+                            const paramCells = paramKeys.map(k => {
+                                const v = (c.parameters || {})[k];
+                                if (v === undefined) return '<td class="text-mono" style="color:var(--text-muted);">—</td>';
+                                const display = typeof v === 'number' ? v.toLocaleString(undefined, {maximumFractionDigits: 4}) : String(v);
+                                return `<td class="text-mono" style="font-weight:600;color:var(--accent-blue,#3b82f6);">${escHtml(display)}</td>`;
+                            }).join('');
+
                             return `
                             <tr>
                                 <td style="font-weight:500;">${escHtml(c.name)}</td>
+                                ${paramCells}
                                 <td>${statusBadge(c.status || 'unknown')}</td>
                                 <td class="text-mono" style="white-space:nowrap;">${timeStr}</td>
                                 <td class="text-mono">${statsCount}</td>
@@ -966,6 +1009,244 @@ function renderTraining(container) {
             </div>`;
     }
 
+    function _openJobDetailModal(j) {
+        // Remove any existing modal
+        const old = document.getElementById('ai-job-detail-modal');
+        if (old) old.remove();
+        // Also close any standalone metrics overlay
+        if (window._aiTrainingMetrics) window._aiTrainingMetrics.closeTrainingMetrics();
+
+        const isActive = ['queued', 'running', 'preflight', 'launching'].includes(j.status);
+        const isComplete = j.status === 'completed';
+        const hasMetrics = j.status === 'running' || isComplete;
+
+        const elapsed = j.started_at && !j.completed_at
+            ? formatDuration((Date.now() - new Date(j.started_at + 'Z').getTime()) / 1000)
+            : (j.started_at && j.completed_at
+                ? formatDuration((new Date(j.completed_at + 'Z') - new Date(j.started_at + 'Z')) / 1000)
+                : '—');
+        const gpuDisplay = j.gpu_ids ? formatGpuList(j.gpu_ids) : 'auto';
+
+        let inferParams = [];
+        try { const cfg = JSON.parse(j.config_json || '{}'); inferParams = cfg.selected_input_params || []; } catch {}
+
+        const modal = document.createElement('div');
+        modal.id = 'ai-job-detail-modal';
+        modal.style.cssText = 'position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);';
+
+        const actionBtnStyle = 'display:flex;align-items:center;gap:8px;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;border:1px solid;width:100%;text-align:left;';
+
+        modal.innerHTML = `
+            <div class="ai-job-modal-inner" style="background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:12px;padding:0;min-width:520px;max-width:900px;width:60vw;max-height:85vh;box-shadow:0 20px 60px rgba(0,0,0,0.4);overflow:hidden;display:flex;flex-direction:column;">
+                <!-- Header (always visible) -->
+                <div style="padding:16px 24px;border-bottom:1px solid var(--border-color);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;">
+                    <div style="display:flex;align-items:center;gap:12px;">
+                        <button class="ai-jm-back btn-icon" style="display:none;color:var(--text-muted);font-size:16px;padding:4px;" title="Back to overview">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+                        </button>
+                        <div>
+                            <div style="font-size:15px;font-weight:600;color:var(--text-primary);">${escHtml(j.run_name)}</div>
+                            <div style="font-size:11px;color:var(--text-muted);margin-top:1px;">Job #${j.id} · ${escHtml(j.model_family)} · ${statusBadge(j.status)}</div>
+                        </div>
+                    </div>
+                    <button class="btn-icon ai-job-detail-close" style="font-size:18px;color:var(--text-muted);">✕</button>
+                </div>
+
+                <!-- Content area (swappable) -->
+                <div class="ai-jm-content" style="flex:1;overflow-y:auto;"></div>
+            </div>`;
+
+        document.body.appendChild(modal);
+
+        const contentEl = modal.querySelector('.ai-jm-content');
+        const backBtn = modal.querySelector('.ai-jm-back');
+        let metricsTimer = null;
+
+        // Close handlers
+        const closeModal = () => {
+            if (metricsTimer) clearInterval(metricsTimer);
+            modal.remove();
+        };
+        modal.querySelector('.ai-job-detail-close').addEventListener('click', closeModal);
+        modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+
+        // Back button
+        backBtn.addEventListener('click', () => {
+            if (metricsTimer) { clearInterval(metricsTimer); metricsTimer = null; }
+            showOverview();
+        });
+
+        // ---- VIEW: Overview ----
+        function showOverview() {
+            backBtn.style.display = 'none';
+            contentEl.innerHTML = `
+                <!-- Info grid -->
+                <div style="padding:16px 24px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;border-bottom:1px solid var(--border-color);">
+                    <div>
+                        <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Dataset</div>
+                        <div style="font-size:14px;font-weight:500;margin-top:2px;font-family:var(--font-mono);">#${j.dataset_id}</div>
+                    </div>
+                    <div>
+                        <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">GPUs</div>
+                        <div style="font-size:14px;font-weight:500;margin-top:2px;font-family:var(--font-mono);">${escHtml(gpuDisplay)}</div>
+                    </div>
+                    <div>
+                        <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Duration</div>
+                        <div style="font-size:14px;font-weight:500;margin-top:2px;">${elapsed}</div>
+                    </div>
+                    <div>
+                        <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Submitted</div>
+                        <div style="font-size:13px;margin-top:2px;">${formatTime(j.submitted_at)}</div>
+                    </div>
+                    ${j.started_at ? `<div>
+                        <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Started</div>
+                        <div style="font-size:13px;margin-top:2px;">${formatTime(j.started_at)}</div>
+                    </div>` : ''}
+                    ${j.completed_at ? `<div>
+                        <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Completed</div>
+                        <div style="font-size:13px;margin-top:2px;">${formatTime(j.completed_at)}</div>
+                    </div>` : ''}
+                </div>
+
+                ${j.failure_reason ? `
+                <div style="padding:12px 24px;background:rgba(239,68,68,0.08);border-bottom:1px solid var(--border-color);">
+                    <div style="font-size:12px;color:#f87171;font-weight:500;">Error</div>
+                    <div style="font-size:12px;color:#fca5a5;margin-top:4px;font-family:var(--font-mono);white-space:pre-wrap;">${escHtml(j.failure_reason)}</div>
+                </div>` : ''}
+
+                <!-- Actions -->
+                <div style="padding:16px 24px 20px;">
+                    <div style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">Actions</div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                        <button class="ai-job-action" data-action="log" style="${actionBtnStyle}background:var(--surface-2);color:var(--text-secondary);border-color:var(--border-color);">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                            View Log
+                        </button>
+                        ${hasMetrics ? `
+                        <button class="ai-job-action" data-action="metrics" style="${actionBtnStyle}background:rgba(99,102,241,0.1);color:#818cf8;border-color:rgba(99,102,241,0.25);">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                            Metrics
+                        </button>` : ''}
+                        ${isComplete ? `
+                        <button class="ai-job-action" data-action="predict" style="${actionBtnStyle}background:rgba(245,158,11,0.1);color:#fbbf24;border-color:rgba(245,158,11,0.25);">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+                            Predict
+                        </button>
+                        <button class="ai-job-action" data-action="export" style="${actionBtnStyle}background:rgba(16,185,129,0.1);color:#34d399;border-color:rgba(16,185,129,0.25);">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                            Export ONNX
+                        </button>
+                        <button class="ai-job-action" data-action="continue" style="${actionBtnStyle}background:rgba(59,130,246,0.1);color:#60a5fa;border-color:rgba(59,130,246,0.25);">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                            Continue Training
+                        </button>
+                        <button class="ai-job-action" data-action="fork" style="${actionBtnStyle}background:rgba(139,92,246,0.1);color:#a78bfa;border-color:rgba(139,92,246,0.25);">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9"/><line x1="12" y1="12" x2="12" y2="15"/></svg>
+                            Fork / Transfer
+                        </button>
+                        <button class="ai-job-action" data-action="restart" style="${actionBtnStyle}background:rgba(245,158,11,0.1);color:#fbbf24;border-color:rgba(245,158,11,0.25);">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+                            Restart
+                        </button>` : ''}
+                        ${isActive ? `
+                        <button class="ai-job-action" data-action="cancel" style="${actionBtnStyle}background:rgba(239,68,68,0.1);color:#f87171;border-color:rgba(239,68,68,0.25);">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                            Cancel Job
+                        </button>` : ''}
+                    </div>
+                </div>`;
+
+            // Wire action buttons
+            contentEl.querySelectorAll('.ai-job-action').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    const action = btn.dataset.action;
+                    if (action === 'log') showLog();
+                    else if (action === 'metrics') showMetrics();
+                    else if (action === 'predict') showPredict();
+                    else if (action === 'export') {
+                        btn.disabled = true;
+                        btn.style.opacity = '0.6';
+                        btn.innerHTML = '<span class="spinner" style="width:14px;height:14px;"></span> Exporting…';
+                        await _doExport(j.id);
+                        btn.disabled = false;
+                        btn.style.opacity = '1';
+                        btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Export ONNX';
+                    }
+                    else if (action === 'continue') { closeModal(); _openTrainModal(j.dataset_id, j.model_family, j.run_name, j.id, 'continue'); }
+                    else if (action === 'fork') { closeModal(); _openTrainModal(j.dataset_id, j.model_family, j.run_name, j.id, 'transfer'); }
+                    else if (action === 'restart') { closeModal(); _openTrainModal(j.dataset_id, j.model_family, j.run_name, j.id, 'restart'); }
+                    else if (action === 'cancel') {
+                        if (!confirm('Cancel this training job?')) return;
+                        try {
+                            const res = await aiApi.post(`/ai/training-jobs/${j.id}/cancel`, {});
+                            showToast(res?.message || 'Job cancelled', res?.error ? 'error' : 'success');
+                            if (!res?.error) { closeModal(); loadAllData(); }
+                        } catch { showToast('Failed to cancel job', 'error'); }
+                    }
+                });
+            });
+        }
+
+        // ---- VIEW: Log ----
+        async function showLog() {
+            backBtn.style.display = '';
+            contentEl.innerHTML = `<div style="padding:24px;text-align:center;color:var(--text-muted);">Loading log…</div>`;
+            try {
+                const res = await aiApi.get(`/ai/training-jobs/${j.id}/log`);
+                const logText = res?.log || res?.message || 'No log available';
+                contentEl.innerHTML = `<pre style="margin:0;padding:16px 24px;font-size:12px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all;color:var(--text-primary);line-height:1.6;overflow-y:auto;">${escHtml(logText)}</pre>`;
+            } catch {
+                contentEl.innerHTML = `<div style="padding:24px;color:#f87171;">Failed to load log.</div>`;
+            }
+        }
+
+        // ---- VIEW: Metrics ----
+        function showMetrics() {
+            backBtn.style.display = '';
+            if (window._aiTrainingMetrics && window._aiTrainingMetrics.renderMetricsInto) {
+                // Use the embedded render method
+                metricsTimer = window._aiTrainingMetrics.renderMetricsInto(contentEl, j.id, {
+                    status: j.status,
+                    run_name: j.run_name,
+                    model_family: j.model_family,
+                });
+            } else if (window._aiTrainingMetrics) {
+                // Fallback: open standalone overlay, close this modal
+                closeModal();
+                window._aiTrainingMetrics.openTrainingMetrics(j.id, {
+                    status: j.status,
+                    run_name: j.run_name,
+                    model_family: j.model_family,
+                });
+            } else {
+                contentEl.innerHTML = `<div style="padding:24px;color:var(--text-muted);">Metrics module not loaded.</div>`;
+            }
+        }
+
+        // ---- VIEW: Predict ----
+        function showPredict() {
+            backBtn.style.display = '';
+            // Render the infer form into the content area
+            _renderInferView(contentEl, j.id, inferParams);
+        }
+
+        // Show initial overview
+        showOverview();
+    }
+
+    // Standalone export handler
+    async function _doExport(jobId) {
+        showToast('Exporting model…', 'info');
+        try {
+            const res = await aiApi.post(`/ai/training-jobs/${jobId}/export`, { formats: 'onnx,torchscript' });
+            if (res.error) {
+                showToast('Export failed: ' + res.error, 'error');
+            } else {
+                showToast('Model exported to ' + (res.output_dir || ''), 'success');
+            }
+        } catch { showToast('Export request failed', 'error'); }
+    }
+
     function renderTrainingJobs(jobs) {
         const el = document.getElementById('ai-training-table');
         if (!el) return;
@@ -983,19 +1264,18 @@ function renderTraining(container) {
             <div class="table-container">
                 <table class="data-table">
                     <thead><tr>
-                        <th>ID</th><th>Run Name</th><th>Model</th><th>Dataset</th><th>GPUs</th><th>Status</th><th>Submitted</th><th>Actions</th>
+                        <th>ID</th><th>Run Name</th><th>Model</th><th>Dataset</th><th>GPUs</th><th>Status</th><th>Submitted</th>
                     </tr></thead>
                     <tbody>
                         ${jobs.map(j => {
                             const gpuDisplay = j.gpu_ids ? formatGpuList(j.gpu_ids) : 'auto';
-                            const isActive = ['queued', 'running', 'preflight', 'launching'].includes(j.status);
                             const elapsed = j.started_at && !j.completed_at
                                 ? formatDuration((Date.now() - new Date(j.started_at + 'Z').getTime()) / 1000)
                                 : (j.started_at && j.completed_at
                                     ? formatDuration((new Date(j.completed_at + 'Z') - new Date(j.started_at + 'Z')) / 1000)
                                     : '');
                             return `
-                            <tr>
+                            <tr class="ai-job-row" data-job-id="${j.id}" style="cursor:pointer;" title="Click to open job details">
                                 <td class="text-mono">#${j.id}</td>
                                 <td style="font-weight:500;">${escHtml(j.run_name)}</td>
                                 <td><code style="font-size:11px;padding:2px 6px;background:var(--bg-tertiary);border-radius:4px;">${escHtml(j.model_family)}</code></td>
@@ -1006,97 +1286,325 @@ function renderTraining(container) {
                                     ${elapsed ? `<div class="ai-job-detail">${elapsed}</div>` : ''}
                                 </td>
                                 <td class="text-sm text-muted">${formatTime(j.submitted_at)}</td>
-                                <td>
-                                    ${isActive ? `<button class="btn btn-danger btn-sm" data-cancel-job="${j.id}">Cancel</button>` : ''}
-                                    <button class="btn btn-sm" style="margin-left:4px;background:var(--surface-2);color:var(--text-secondary);" data-view-log="${j.id}" title="View training log">Log</button>
-                                    ${j.status === 'completed' ? `<button class="btn btn-secondary btn-sm" style="margin-left:4px;" data-infer-job="${j.id}" title="Run inference with this model">Infer</button>` : ''}
-                                    ${j.failure_reason ? `<div class="ai-job-detail ai-job-error" title="${escHtml(j.failure_reason)}">${escHtml(truncate(j.failure_reason, 80))}</div>` : ''}
-                                </td>
                             </tr>`;
                         }).join('')}
                     </tbody>
                 </table>
             </div>`;
 
-        // Cancel buttons
-        el.querySelectorAll('[data-cancel-job]').forEach(btn => {
-            btn.addEventListener('click', async () => {
-                const jobId = btn.dataset.cancelJob;
-                if (!confirm(`Cancel training job #${jobId}?`)) return;
-                btn.disabled = true;
-                btn.textContent = 'Cancelling...';
-                try {
-                    const res = await aiApi.post(`/ai/training-jobs/${jobId}/cancel`, {});
-                    if (res && !res.error) {
-                        showToast(`Training job #${jobId} cancelled`, 'success');
-                        loadAllData();
-                    } else {
-                        showToast(res?.error || 'Failed to cancel', 'error');
-                        btn.disabled = false;
-                        btn.textContent = 'Cancel';
-                    }
-                } catch {
-                    btn.disabled = false;
-                    btn.textContent = 'Cancel';
-                }
+        // Click handler — open job detail modal
+        el.querySelectorAll('.ai-job-row').forEach(row => {
+            row.addEventListener('click', () => {
+                const jobId = parseInt(row.dataset.jobId, 10);
+                const job = jobs.find(j => j.id === jobId);
+                if (job) _openJobDetailModal(job);
             });
         });
+    }
 
-        // Inference buttons
-        el.querySelectorAll('[data-infer-job]').forEach(btn => {
-            btn.addEventListener('click', async () => {
-                const jobId = btn.dataset.inferJob;
-                const paramsStr = prompt(
-                    'Enter input parameters as JSON (e.g. {"RPM": 75.0}):',
-                    '{}'
-                );
-                if (paramsStr === null) return;
+    function _openInferModal(jobId, paramNames) {
+        // Standalone wrapper — creates overlay, delegates to _renderInferView
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.style.cssText = 'position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);';
+        modal.innerHTML = `<div style="background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:12px;padding:24px;min-width:420px;max-width:540px;box-shadow:0 20px 60px rgba(0,0,0,0.4);"></div>`;
+        document.body.appendChild(modal);
+        const container = modal.querySelector('div');
+        _renderInferView(container, jobId, paramNames, () => modal.remove());
+        modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+    }
 
-                btn.disabled = true;
-                btn.textContent = 'Running...';
-                try {
-                    const res = await aiApi.post(`/ai/training-jobs/${jobId}/infer`, {
-                        input_params: JSON.parse(paramsStr),
+    function _renderInferView(container, jobId, paramNames, onClose) {
+                const inputStyle = 'width:100%;padding:8px 12px;background:var(--bg-primary);border:1px solid var(--border-color);border-radius:6px;color:var(--text-primary);font-size:14px;font-family:monospace;';
+                const labelStyle = 'display:block;font-size:12px;font-weight:500;margin-bottom:4px;color:var(--text-secondary);';
+
+                // Parameter select options (for sweep)
+                const paramOpts = paramNames.map(n => `<option value="${escHtml(n)}">${escHtml(n)}</option>`).join('');
+
+                // Single-value param inputs
+                const singleInputs = paramNames.length > 0
+                    ? paramNames.map(name => `
+                        <div style="margin-bottom:12px;">
+                            <label style="${labelStyle}">${escHtml(name)}</label>
+                            <input type="number" step="any" class="ai-infer-param" data-param-name="${escHtml(name)}"
+                                style="${inputStyle}" placeholder="Enter value...">
+                        </div>
+                    `).join('')
+                    : `<div style="margin-bottom:12px;">
+                        <label style="${labelStyle}">Parameters (JSON)</label>
+                        <textarea class="ai-infer-raw-json" rows="3"
+                            style="${inputStyle}resize:vertical;"
+                            placeholder='{"RPM": 75.0}'>{}</textarea>
+                       </div>`;
+
+                container.innerHTML = `
+                    <div style="padding:20px 24px;">
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
+                            <div>
+                                <div style="font-size:16px;font-weight:600;">Run Prediction</div>
+                                <div style="font-size:12px;color:var(--text-muted);">Job #${jobId} — enter new parameter values</div>
+                            </div>
+                        </div>
+
+                        <!-- Mode tabs -->
+                        <div style="display:flex;gap:4px;margin-bottom:16px;background:var(--bg-primary);border-radius:8px;padding:3px;">
+                            <button class="ai-infer-tab btn btn-sm" data-tab="single"
+                                style="flex:1;border-radius:6px;padding:6px 12px;font-weight:600;font-size:12px;background:linear-gradient(135deg,#f59e0b,#d97706);color:white;border:none;">
+                                Single Value
+                            </button>
+                            <button class="ai-infer-tab btn btn-sm" data-tab="sweep"
+                                style="flex:1;border-radius:6px;padding:6px 12px;font-weight:600;font-size:12px;background:transparent;color:var(--text-secondary);border:none;cursor:pointer;">
+                                Sweep Range
+                            </button>
+                        </div>
+
+                        <!-- Single value panel -->
+                        <div class="ai-infer-panel" data-panel="single">
+                            ${singleInputs}
+                        </div>
+
+                        <!-- Sweep panel -->
+                        <div class="ai-infer-panel" data-panel="sweep" style="display:none;">
+                            ${paramNames.length > 0 ? `
+                            <div style="margin-bottom:12px;">
+                                <label style="${labelStyle}">Sweep Parameter</label>
+                                <select class="ai-sweep-param" style="${inputStyle}">${paramOpts}</select>
+                            </div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px;">
+                                <div>
+                                    <label style="${labelStyle}">Start</label>
+                                    <input type="number" step="any" class="ai-sweep-start" style="${inputStyle}" value="50" placeholder="50">
+                                </div>
+                                <div>
+                                    <label style="${labelStyle}">End</label>
+                                    <input type="number" step="any" class="ai-sweep-end" style="${inputStyle}" value="100" placeholder="100">
+                                </div>
+                                <div>
+                                    <label style="${labelStyle}">Step</label>
+                                    <input type="number" step="any" class="ai-sweep-step" style="${inputStyle}" value="1" placeholder="1">
+                                </div>
+                            </div>
+                            <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;" class="ai-sweep-summary">
+                                51 predictions will be generated
+                            </div>
+                            ` : '<div style="color:var(--text-muted);font-size:13px;">Sweep requires named parameters.</div>'}
+                        </div>
+
+                        <!-- Output info -->
+                        <div style="margin-bottom:12px;padding:10px 12px;border-radius:8px;background:rgba(99,102,241,0.06);border:1px solid rgba(99,102,241,0.12);font-size:11px;color:var(--text-muted);">
+                            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+                                <span style="font-weight:600;color:var(--text-secondary);">Output Info</span>
+                            </div>
+                            Results are saved under the job's <code style="font-size:10px;padding:1px 4px;background:var(--bg-primary);border-radius:3px;">inference_output/</code> directory as VTI files with a PVD index for playback.
+                            <span style="color:#f59e0b;">Re-running a sweep will overwrite previous results.</span>
+                        </div>
+
+                        <div id="ai-infer-result-${jobId}" style="display:none;margin-bottom:12px;padding:10px;border-radius:8px;font-size:12px;"></div>
+                        <div style="display:flex;gap:8px;justify-content:flex-end;">
+                            <button class="btn btn-sm ai-infer-run" style="background:linear-gradient(135deg,#f59e0b,#d97706);color:white;font-weight:600;padding:6px 20px;">
+                                Predict
+                            </button>
+                        </div>
+                    </div>`;
+
+                // Tab switching
+                let activeTab = 'single';
+                container.querySelectorAll('.ai-infer-tab').forEach(tab => {
+                    tab.addEventListener('click', () => {
+                        activeTab = tab.dataset.tab;
+                        container.querySelectorAll('.ai-infer-tab').forEach(t => {
+                            if (t.dataset.tab === activeTab) {
+                                t.style.background = 'linear-gradient(135deg,#f59e0b,#d97706)';
+                                t.style.color = 'white';
+                            } else {
+                                t.style.background = 'transparent';
+                                t.style.color = 'var(--text-secondary)';
+                            }
+                        });
+                        container.querySelectorAll('.ai-infer-panel').forEach(p => {
+                            p.style.display = p.dataset.panel === activeTab ? '' : 'none';
+                        });
                     });
-                    if (res && !res.error) {
-                        showToast(`Inference complete — output: ${res.output_dir || 'saved'}`, 'success');
-                    } else {
-                        showToast(res?.error || 'Inference failed', 'error');
+                });
+
+                // Sweep summary counter
+                const updateSweepSummary = () => {
+                    const s = parseFloat(container.querySelector('.ai-sweep-start')?.value || 0);
+                    const e = parseFloat(container.querySelector('.ai-sweep-end')?.value || 0);
+                    const st = parseFloat(container.querySelector('.ai-sweep-step')?.value || 1);
+                    const summary = container.querySelector('.ai-sweep-summary');
+                    if (summary && st > 0) {
+                        const n = Math.floor((e - s) / st) + 1;
+                        summary.textContent = `${Math.max(0, n)} predictions will be generated`;
                     }
-                } catch (e) {
-                    showToast('Invalid JSON or network error', 'error');
-                }
-                btn.disabled = false;
-                btn.textContent = 'Infer';
-            });
-        });
+                };
+                container.querySelectorAll('.ai-sweep-start,.ai-sweep-end,.ai-sweep-step').forEach(inp => {
+                    inp.addEventListener('input', updateSweepSummary);
+                });
 
-        // View Log buttons
-        el.querySelectorAll('[data-view-log]').forEach(btn => {
-            btn.addEventListener('click', async () => {
-                const jobId = btn.dataset.viewLog;
-                btn.disabled = true;
-                btn.textContent = '...';
-                try {
-                    const res = await aiApi.get(`/ai/training-jobs/${jobId}/log`);
-                    const logText = res?.log || res?.message || 'No log available';
+                // Focus first input
+                const firstInput = container.querySelector('input, textarea');
+                if (firstInput) setTimeout(() => firstInput.focus(), 50);
 
-                    // Use the shared #output-modal (same as simulation job viewer)
-                    const modal = document.getElementById('output-modal');
-                    const title = document.getElementById('output-modal-title');
-                    const modalBody = document.querySelector('.modal-body');
-                    const modalFooter = document.querySelector('.modal-footer');
+                // Run
+                container.querySelector('.ai-infer-run').addEventListener('click', async () => {
+                    const resultDiv = container.querySelector(`#ai-infer-result-${jobId}`);
+                    const runBtn = container.querySelector('.ai-infer-run');
 
-                    title.textContent = `Training Log — Job #${jobId}`;
-                    modalBody.innerHTML = `<pre class="output-content" style="max-height:600px;white-space:pre-wrap;word-break:break-all;">${escHtml(logText)}</pre>`;
-                    modalFooter.innerHTML = '';
-                    modal.style.display = 'flex';
-                } catch (e) {
-                    showToast('Failed to fetch log', 'error');
-                }
-                btn.disabled = false;
-                btn.textContent = 'Log';
-            });
+                    if (activeTab === 'sweep') {
+                        // --- SWEEP MODE ---
+                        const paramName = container.querySelector('.ai-sweep-param')?.value;
+                        const start = parseFloat(container.querySelector('.ai-sweep-start')?.value);
+                        const end = parseFloat(container.querySelector('.ai-sweep-end')?.value);
+                        const step = parseFloat(container.querySelector('.ai-sweep-step')?.value);
+
+                        if (!paramName || isNaN(start) || isNaN(end) || isNaN(step) || step <= 0) {
+                            resultDiv.style.display = '';
+                            resultDiv.style.background = 'rgba(239,68,68,0.1)';
+                            resultDiv.style.color = '#f87171';
+                            resultDiv.textContent = 'Enter valid start, end, and step values.';
+                            return;
+                        }
+
+                        const n = Math.floor((end - start) / step) + 1;
+                        runBtn.disabled = true;
+                        runBtn.innerHTML = '<span class="spinner" style="width:14px;height:14px;"></span> Sweeping...';
+                        resultDiv.style.display = '';
+                        resultDiv.style.background = 'rgba(99,102,241,0.1)';
+                        resultDiv.style.color = '#818cf8';
+                        resultDiv.textContent = `Running ${n} predictions... This may take a minute.`;
+
+                        try {
+                            const res = await aiApi.post(`/ai/training-jobs/${jobId}/infer-sweep`, {
+                                param_name: paramName, start, end, step
+                            });
+                            if (res && res.status === 'ok') {
+                                const sw = res.sweep || {};
+                                const outDir = res.output_dir || sw.output_dir || '';
+                                resultDiv.style.background = 'rgba(16,185,129,0.1)';
+                                resultDiv.style.color = '#34d399';
+                                resultDiv.innerHTML = `
+                                    <div style="margin-bottom:6px;">✓ Sweep complete! <strong>${sw.count || n}</strong> predictions generated.</div>
+                                    ${outDir ? `<div style="font-size:10px;color:var(--text-muted);word-break:break-all;">📁 ${escHtml(outDir)}</div>` : ''}
+                                `;
+
+                                if (sw.pvd_path && window._pvdViewer && window._pvdViewer.openAiPvdViewer) {
+                                    const viewBtn = document.createElement('button');
+                                    viewBtn.className = 'btn btn-sm';
+                                    viewBtn.style.cssText = 'margin-top:8px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:white;font-weight:600;padding:6px 16px;width:100%;';
+                                    viewBtn.innerHTML = '▶ Play in Viewer';
+                                    viewBtn.addEventListener('click', () => {
+                                        // Close the parent modal if it exists
+                                        const parentModal = document.getElementById('ai-job-detail-modal');
+                                        if (parentModal) parentModal.remove();
+                                        if (onClose) onClose();
+                                        window._pvdViewer.openAiPvdViewer(sw.pvd_path);
+                                    });
+                                    resultDiv.appendChild(viewBtn);
+                                }
+                                showToast(`Sweep complete: ${sw.count || n} predictions`, 'success');
+                            } else {
+                                resultDiv.style.background = 'rgba(239,68,68,0.1)';
+                                resultDiv.style.color = '#f87171';
+                                resultDiv.textContent = 'Error: ' + (res?.error || res?.message || 'Unknown error');
+                            }
+                        } catch (e) {
+                            resultDiv.style.background = 'rgba(239,68,68,0.1)';
+                            resultDiv.style.color = '#f87171';
+                            resultDiv.textContent = 'Network error: ' + e.message;
+                        }
+                        runBtn.disabled = false;
+                        runBtn.innerHTML = 'Predict';
+                        return;
+                    }
+
+                    // --- SINGLE MODE ---
+                    let inputParams = {};
+
+                    if (paramNames.length > 0) {
+                        container.querySelectorAll('.ai-infer-param').forEach(inp => {
+                            const val = parseFloat(inp.value);
+                            if (!isNaN(val)) inputParams[inp.dataset.paramName] = val;
+                        });
+                        if (Object.keys(inputParams).length === 0) {
+                            resultDiv.style.display = '';
+                            resultDiv.style.background = 'rgba(239,68,68,0.1)';
+                            resultDiv.style.color = '#f87171';
+                            resultDiv.textContent = 'Enter at least one parameter value.';
+                            return;
+                        }
+                    } else {
+                        const raw = container.querySelector('.ai-infer-raw-json');
+                        try { inputParams = JSON.parse(raw.value); } catch {
+                            resultDiv.style.display = '';
+                            resultDiv.style.background = 'rgba(239,68,68,0.1)';
+                            resultDiv.style.color = '#f87171';
+                            resultDiv.textContent = 'Invalid JSON.';
+                            return;
+                        }
+                    }
+
+                    runBtn.disabled = true;
+                    runBtn.innerHTML = '<span class="spinner" style="width:14px;height:14px;"></span> Running...';
+
+                    resultDiv.style.display = '';
+                    resultDiv.style.background = 'rgba(99,102,241,0.1)';
+                    resultDiv.style.color = '#818cf8';
+                    resultDiv.textContent = 'Running inference...';
+
+                    try {
+                        const res = await aiApi.post(`/ai/training-jobs/${jobId}/infer`, { input_params: inputParams });
+                        if (res && res.status === 'ok') {
+                            const inf = res.inference || {};
+                            const outDir = res.output_dir || inf.output_dir || '';
+                            resultDiv.style.background = 'rgba(16,185,129,0.1)';
+                            resultDiv.style.color = '#34d399';
+                            let msg = '<div style="margin-bottom:6px;">✓ Prediction complete!';
+                            if (inf.prediction_shape) msg += ` Shape: [${inf.prediction_shape.join('×')}]`;
+                            msg += '</div>';
+                            if (outDir) msg += `<div style="font-size:10px;color:var(--text-muted);word-break:break-all;">📁 ${escHtml(outDir)}</div>`;
+                            resultDiv.innerHTML = msg;
+
+                            // Add "Open in Viewer" button if PVD is available
+                            if (inf.pvd_path && window._pvdViewer && window._pvdViewer.openAiPvdViewer) {
+                                const viewBtn = document.createElement('button');
+                                viewBtn.className = 'btn btn-sm';
+                                viewBtn.style.cssText = 'margin-top:8px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:white;font-weight:600;padding:6px 16px;width:100%;';
+                                viewBtn.innerHTML = '▶ Open in Viewer';
+                                viewBtn.addEventListener('click', () => {
+                                    const parentModal = document.getElementById('ai-job-detail-modal');
+                                    if (parentModal) parentModal.remove();
+                                    if (onClose) onClose();
+                                    window._pvdViewer.openAiPvdViewer(inf.pvd_path);
+                                });
+                                resultDiv.appendChild(viewBtn);
+                            }
+                            showToast('Inference complete!', 'success');
+                        } else {
+                            resultDiv.style.background = 'rgba(239,68,68,0.1)';
+                            resultDiv.style.color = '#f87171';
+                            resultDiv.textContent = 'Error: ' + (res?.error || res?.message || 'Unknown error');
+                        }
+                    } catch (e) {
+                        resultDiv.style.background = 'rgba(239,68,68,0.1)';
+                        resultDiv.style.color = '#f87171';
+                        resultDiv.textContent = 'Network error: ' + e.message;
+                    }
+
+                    runBtn.disabled = false;
+                    runBtn.innerHTML = 'Predict';
+                });
+    }
+
+    // Wrapper for opening training modal from job detail
+    function _openTrainModal(datasetId, modelFamily, runName, sourceJobId, mode) {
+        showView('new-training', {
+            mode: mode,
+            sourceJobId: sourceJobId,
+            modelFamily: modelFamily,
+            runName: runName,
+            datasetId: datasetId,
         });
     }
 
@@ -1203,7 +1711,7 @@ function renderTraining(container) {
         container.appendChild(wrapper);
 
         // ---- Back button ----
-        document.getElementById('ai-ds-back').addEventListener('click', () => showView('dashboard'));
+        document.getElementById('ai-ds-back').addEventListener('click', () => showView('dashboard', { tab: 'datasets' }));
 
         // ---- Tab switching ----
         const tabBrowse = document.getElementById('ai-ds-tab-browse');
@@ -1272,7 +1780,7 @@ function renderTraining(container) {
                 if (entry.is_dir) {
                     const isSelected = selectedSweepRoot === entry.path;
                     html += `<div class="ai-browse-entry ${isSelected ? 'selected' : ''}" data-browse-dir="${entry.path}" data-selectable="true">
-                        <span style="font-size:18px;">📁</span>
+                        
                         <span style="flex:1;">${escHtml(entry.name)}</span>
                         <button class="btn btn-sm btn-secondary" data-select-dir="${entry.path}" style="padding:4px 10px;font-size:11px;" title="Use this folder as the sweep root">
                             Select
@@ -1377,7 +1885,7 @@ function renderTraining(container) {
                 const res = await aiApi.post('/ai/datasets', body);
                 if (res && res.id) {
                     showToast(`Dataset "${name}" created — scanning output data`, 'success');
-                    showView('dashboard');
+                    showView('dashboard', { tab: 'datasets' });
                 } else {
                     showToast(res?.error || 'Failed to create dataset', 'error');
                     btn.disabled = false;
@@ -1397,16 +1905,51 @@ function renderTraining(container) {
     // ============================================================
     // VIEW 3: NEW TRAINING JOB (full page)
     // ============================================================
-    async function renderNewTraining() {
+    async function renderNewTraining(resumeOpts) {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         selectedGpus.clear();
 
         container.innerHTML = '';
         container.appendChild(styleEl);
 
+        // Determine resume mode
+        const isResume = resumeOpts && resumeOpts.sourceJobId;
+        const isContinue = isResume && resumeOpts.mode === 'continue';
+        const isTransfer = isResume && resumeOpts.mode === 'transfer';
+        const isRestart = isResume && resumeOpts.mode === 'restart';
+
+        // If resuming, fetch the source job's config to pre-fill
+        let sourceConfig = {};
+        if (isResume) {
+            try {
+                const jobData = await aiApi.get(`/ai/training-jobs/${resumeOpts.sourceJobId}`);
+                if (jobData && jobData.config_json) {
+                    sourceConfig = typeof jobData.config_json === 'string'
+                        ? JSON.parse(jobData.config_json)
+                        : jobData.config_json;
+                }
+                // Also grab dataset_id from the job data
+                if (jobData && jobData.dataset_id) {
+                    resumeOpts.datasetId = resumeOpts.datasetId || jobData.dataset_id;
+                }
+            } catch (e) {
+                console.warn('[AI] Failed to fetch source job config:', e);
+            }
+        }
+
         // Pre-load datasets
         const dsData = await aiApi.get('/ai/datasets');
         const datasets = dsData?.datasets || [];
+
+        // Page title based on mode
+        const pageTitle = isContinue ? 'Continue Training' : isTransfer ? 'Transfer Learning' : isRestart ? 'Restart Training' : 'New Training Job';
+        const pageDesc = isContinue
+            ? `Resuming from Job #${resumeOpts.sourceJobId} — model weights will be loaded from the best checkpoint`
+            : isTransfer
+            ? `Using pretrained weights from Job #${resumeOpts.sourceJobId} — same model architecture, new training`
+            : isRestart
+            ? `Fresh start using settings from Job #${resumeOpts.sourceJobId} — all parameters are editable`
+            : 'Train a PhysicsNeMo surrogate model from simulation data';
 
         const wrapper = document.createElement('div');
         wrapper.className = 'page-enter';
@@ -1416,9 +1959,24 @@ function renderTraining(container) {
                 Back to AI Training
             </div>
             <div class="page-header">
-                <h1>New Training Job</h1>
-                <p>Train a PhysicsNeMo surrogate model from simulation data</p>
+                <h1>${pageTitle}</h1>
+                <p>${pageDesc}</p>
             </div>
+
+            ${isResume ? `
+            <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;margin-bottom:16px;border-radius:10px;background:${isContinue ? 'rgba(59,130,246,0.08)' : isRestart ? 'rgba(245,158,11,0.08)' : 'rgba(139,92,246,0.08)'};border:1px solid ${isContinue ? 'rgba(59,130,246,0.2)' : isRestart ? 'rgba(245,158,11,0.2)' : 'rgba(139,92,246,0.2)'};">
+                <span style="font-size:18px;"></span>
+                <div>
+                    <div style="font-size:13px;font-weight:600;color:var(--text-primary);">
+                        ${isContinue ? 'Continuing from' : isRestart ? 'Restarting from' : 'Pretrained from'} Job #${resumeOpts.sourceJobId}
+                    </div>
+                    <div style="font-size:11px;color:var(--text-muted);">
+                        ${escHtml(resumeOpts.runName || '')} · ${escHtml(resumeOpts.modelFamily || '')}
+                        ${isContinue ? ' · Same dataset & I/O, modify training parameters below' : isRestart ? ' · Fresh start — all settings editable' : ' · Same model architecture, select new dataset & I/O below'}
+                    </div>
+                </div>
+            </div>
+            ` : ''}
 
             <div class="ai-submit-layout">
                 <div>
@@ -1439,17 +1997,51 @@ function renderTraining(container) {
                                 <div class="form-group">
                                     <label class="form-label">Model Family</label>
                                     <select class="form-select" id="ai-tj-model">
-                                        <option value="fno">FNO (Fourier Neural Operator)</option>
-                                        <option value="unet">U-Net (Encoder-Decoder)</option>
+                                        <option value="unet" selected>U-Net (Encoder-Decoder)</option>
+                                        <option value="gnn">GNN (Graph Neural Network)</option>
                                         <option value="mlp">MLP (Multi-Layer Perceptron)</option>
                                     </select>
-                                    <div id="ai-tj-model-note" style="font-size:11px;color:var(--text-muted);margin-top:4px;"></div>
+                                    <div id="ai-tj-model-note" style="font-size:11px;color:var(--text-muted);margin-top:4px;">2D/3D structured CFD fields, slices, voxel grids, image-like field prediction</div>
                                 </div>
                             </div>
                             <div class="form-group" style="margin-bottom:0;">
                                 <label class="form-label">Run Name <span style="color:var(--text-muted);font-weight:400;">(optional — auto-generated if blank)</span></label>
-                                <input type="text" class="form-input" id="ai-tj-name" placeholder="e.g. fno_agitator_v2">
+                                <input type="text" class="form-input" id="ai-tj-name" placeholder="e.g. unet_agitator_v2">
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- Inputs & Outputs -->
+                    <div class="card" style="margin-bottom:16px;" id="ai-io-card">
+                        <div class="card-header" style="display:flex;align-items:center;">
+                            <span class="card-title">Inputs & Outputs</span>
+                            <button class="btn btn-xs" id="ai-io-view-data-btn" style="display:none;margin-left:auto;font-size:11px;padding:4px 10px;border-radius:4px;background:var(--surface-2,#1e293b);border:1px solid var(--border-color,#333);color:var(--text-secondary);cursor:pointer;" title="View all dataset contents">
+                                View Data
+                            </button>
+                        </div>
+                        <div style="padding:0 16px 16px;" id="ai-io-body">
+                            <div id="ai-io-placeholder" style="color:var(--text-muted);font-size:13px;padding:12px 0;">
+                                Select a dataset above to see available parameters and fields.
+                            </div>
+                            <!-- Mode Toggle Bar -->
+                            <div id="ai-io-mode-bar" style="display:none;margin-bottom:12px;">
+                                <div style="display:flex;gap:4px;padding:3px;border-radius:8px;background:var(--bg-tertiary,#0f1423);border:1px solid var(--border-color,#333);">
+                                    <button id="ai-io-mode-input" class="ai-io-mode-btn active" style="flex:1;padding:8px 12px;border-radius:6px;border:none;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit;transition:all 0.2s;background:var(--accent-blue,#3b82f6);color:white;">
+                                        Inputs <span id="ai-io-input-count" style="font-weight:400;opacity:0.8;"></span>
+                                    </button>
+                                    <button id="ai-io-mode-output" class="ai-io-mode-btn" style="flex:1;padding:8px 12px;border-radius:6px;border:none;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit;transition:all 0.2s;background:transparent;color:var(--text-muted);">
+                                        Outputs <span id="ai-io-output-count" style="font-weight:400;opacity:0.8;"></span>
+                                    </button>
+                                </div>
+                                <div id="ai-io-mode-hint" style="font-size:11px;color:var(--text-muted);margin-top:6px;padding:0 2px;">Click fields below to add them as <strong style="color:var(--accent-blue,#3b82f6);">inputs</strong> to the neural network.</div>
+                            </div>
+                            <!-- Unified Field List -->
+                            <div id="ai-io-field-list" style="display:none;display:flex;flex-direction:column;gap:4px;"></div>
+                            <div id="ai-io-fields-empty" style="display:none;font-size:12px;color:var(--text-muted);padding:8px 0;">No fields detected.</div>
+                            <!-- Tensor Summary -->
+                            <div id="ai-tensor-summary-section" style="display:none;margin-top:12px;"></div>
+                            <!-- Dataset info -->
+                            <div id="ai-io-ds-info" style="display:none;font-size:11px;color:var(--text-muted);margin-top:12px;padding-top:8px;border-top:1px solid var(--border-color,#333);"></div>
                         </div>
                     </div>
 
@@ -1463,32 +2055,33 @@ function renderTraining(container) {
                             <div class="ai-form-grid">
                                 <div class="form-group">
                                     <label class="form-label">Epochs</label>
-                                    <input type="number" class="form-input" id="ai-tj-epochs" value="100" min="1" max="10000">
+                                    <input type="number" class="form-input" id="ai-tj-epochs" value="500" min="1" max="10000">
                                 </div>
                                 <div class="form-group">
                                     <label class="form-label">Batch Size</label>
-                                    <input type="number" class="form-input" id="ai-tj-batch" value="8" min="1" max="4096">
+                                    <input type="number" class="form-input" id="ai-tj-batch" value="4" min="1" max="65536">
                                 </div>
                                 <div class="form-group">
                                     <label class="form-label">Learning Rate</label>
-                                    <input type="number" class="form-input" id="ai-tj-lr" value="0.001" step="0.0001" min="0.000001" max="1">
+                                    <input type="number" class="form-input" id="ai-tj-lr" value="0.0003" step="0.0001" min="0.000001" max="1">
                                 </div>
                                 <div class="form-group">
                                     <label class="form-label">Optimizer</label>
                                     <select class="form-select" id="ai-tj-optimizer">
+                                        <option value="adamw" selected>AdamW</option>
                                         <option value="adam">Adam</option>
-                                        <option value="adamw">AdamW</option>
                                         <option value="sgd">SGD</option>
                                         <option value="rmsprop">RMSProp</option>
                                     </select>
                                 </div>
                                 <div class="form-group">
-                                    <label class="form-label">LR Scheduler <span style="color:var(--text-muted);font-weight:400;">(optional)</span></label>
+                                    <label class="form-label">LR Scheduler</label>
                                     <select class="form-select" id="ai-tj-scheduler">
-                                        <option value="">None</option>
+                                        <option value="cosine" selected>Cosine Annealing</option>
                                         <option value="reduce_on_plateau">Reduce on Plateau</option>
-                                        <option value="cosine">Cosine Annealing</option>
+                                        <option value="onecycle">OneCycle</option>
                                         <option value="step">Step LR</option>
+                                        <option value="">None</option>
                                     </select>
                                 </div>
                                 <div class="form-group">
@@ -1511,10 +2104,16 @@ function renderTraining(container) {
                         <div style="font-size:11px;color:var(--text-muted);padding:6px 16px 12px;">Click GPUs to select. Leave empty for automatic assignment.</div>
                     </div>
 
+                    <!-- Training Summary -->
+                    <div class="card" style="margin-bottom:16px;" id="ai-training-summary-card">
+                        <div class="card-header"><span class="card-title">Training Summary</span></div>
+                        <div id="ai-training-summary" style="padding:8px 16px 12px;font-size:12px;color:var(--text-muted);">Select inputs and outputs above to see a summary.</div>
+                    </div>
+
                     <!-- Submit button -->
                     <button class="btn btn-primary" id="ai-tj-submit" style="width:100%;justify-content:center;padding:14px;font-size:15px;" ${!datasets.length ? 'disabled' : ''}>
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-                        Start Training
+                        ${isContinue ? 'Continue Training' : isTransfer ? 'Start Transfer Training' : isRestart ? 'Restart Training' : 'Start Training'}
                     </button>
                 </div>
             </div>
@@ -1522,7 +2121,7 @@ function renderTraining(container) {
         container.appendChild(wrapper);
 
         // ---- Back button ----
-        document.getElementById('ai-tj-back').addEventListener('click', () => showView('dashboard'));
+        document.getElementById('ai-tj-back').addEventListener('click', () => showView('dashboard', { tab: 'training-jobs' }));
 
         // ---- Advanced toggle ----
         const advancedToggle = document.getElementById('ai-advanced-toggle');
@@ -1536,17 +2135,966 @@ function renderTraining(container) {
             advancedChevron.style.transform = advancedOpen ? 'rotate(0deg)' : 'rotate(-90deg)';
         });
 
-        // ---- Model family note ----
+        // ---- Model family defaults & note ----
         const modelSelect = document.getElementById('ai-tj-model');
         const modelNote = document.getElementById('ai-tj-model-note');
-        const modelNotes = {
-            fno: '',
-            unet: 'Best for 2D/3D spatial field prediction. Uses PhysicsNeMo Pix2Pix when available.',
-            mlp: 'For scalar-to-scalar regression (stats_table datasets only).',
+        const MODEL_DEFAULTS = {
+            unet: {
+                note: '2D/3D structured CFD fields, slices, voxel grids, image-like field prediction',
+                epochs: 500, batch_size: 4, learning_rate: 0.0003,
+                optimizer: 'adamw', scheduler: 'cosine', checkpoint_interval: 10,
+            },
+            gnn: {
+                note: 'Unstructured meshes, particle neighborhoods, irregular geometry, graph-based flow fields',
+                epochs: 800, batch_size: 2, learning_rate: 0.0003,
+                optimizer: 'adamw', scheduler: 'reduce_on_plateau', checkpoint_interval: 15,
+            },
+            mlp: {
+                note: 'Low-dimensional surrogate, pointwise regression, coordinates/RPM/time → field values',
+                epochs: 500, batch_size: 8192, learning_rate: 0.001,
+                optimizer: 'adamw', scheduler: 'onecycle', checkpoint_interval: 10,
+            },
         };
+        function applyModelDefaults(family) {
+            const d = MODEL_DEFAULTS[family];
+            if (!d) return;
+            modelNote.textContent = d.note || '';
+            document.getElementById('ai-tj-epochs').value = d.epochs;
+            document.getElementById('ai-tj-batch').value = d.batch_size;
+            document.getElementById('ai-tj-lr').value = d.learning_rate;
+            document.getElementById('ai-tj-optimizer').value = d.optimizer;
+            document.getElementById('ai-tj-scheduler').value = d.scheduler;
+            document.getElementById('ai-tj-ckpt').value = d.checkpoint_interval;
+        }
         modelSelect.addEventListener('change', () => {
-            modelNote.textContent = modelNotes[modelSelect.value] || '';
+            applyModelDefaults(modelSelect.value);
         });
+
+        // ---- Resume / Transfer / Restart pre-fill ----
+        if (isResume) {
+            // Lock model family for continue/transfer (must match checkpoint),
+            // but leave editable for restart (fresh start)
+            modelSelect.value = resumeOpts.modelFamily || 'unet';
+            if (!isRestart) {
+                modelSelect.disabled = true;
+                modelSelect.style.opacity = '0.7';
+                modelSelect.title = 'Model architecture must match the source job';
+            }
+
+            // Pre-fill training config from source job
+            if (sourceConfig.epochs) document.getElementById('ai-tj-epochs').value = sourceConfig.epochs;
+            if (sourceConfig.batch_size) document.getElementById('ai-tj-batch').value = sourceConfig.batch_size;
+            if (sourceConfig.learning_rate) document.getElementById('ai-tj-lr').value = sourceConfig.learning_rate;
+            if (sourceConfig.optimizer) document.getElementById('ai-tj-optimizer').value = sourceConfig.optimizer;
+            if (sourceConfig.scheduler) document.getElementById('ai-tj-scheduler').value = sourceConfig.scheduler;
+            if (sourceConfig.checkpoint_interval) document.getElementById('ai-tj-ckpt').value = sourceConfig.checkpoint_interval;
+
+            // Auto-generate a run name
+            const suffix = isContinue ? '_cont' : isRestart ? '_restart' : '_transfer';
+            const baseName = resumeOpts.runName || `run_${resumeOpts.modelFamily}`;
+            document.getElementById('ai-tj-name').value = baseName + suffix;
+
+            // For continue and restart modes, pre-select the same dataset
+            if ((isContinue || isRestart) && resumeOpts.datasetId) {
+                const dsSelect = document.getElementById('ai-tj-dataset');
+                dsSelect.value = String(resumeOpts.datasetId);
+                // Trigger dataset load to populate I/O
+                dsSelect.dispatchEvent(new Event('change'));
+            }
+        }
+
+        // ---- I/O panel population ----
+        const datasetSelect = document.getElementById('ai-tj-dataset');
+
+        function _safeParse(jsonStr) {
+            if (!jsonStr) return null;
+            try { return JSON.parse(jsonStr); } catch { return null; }
+        }
+
+        function _isNumeric(v) {
+            if (typeof v === 'number') return true;
+            if (typeof v === 'string') return v !== '' && !isNaN(Number(v));
+            return false;
+        }
+
+        // Keywords for auto-selecting output fields
+        const _TARGET_KW = ['velocity', 'pressure', 'temperature', 'concentration',
+            'vorticity', 'tke', 'magnitude', 'torque', 'force', 'power', 'energy'];
+
+        // Store current dataset reference for View Data modal
+        let _currentDs = null;
+
+        function populateIOPanels(ds) {
+            const placeholder = document.getElementById('ai-io-placeholder');
+            const modeBar = document.getElementById('ai-io-mode-bar');
+            const fieldList = document.getElementById('ai-io-field-list');
+            const fieldsEmpty = document.getElementById('ai-io-fields-empty');
+            const dsInfo = document.getElementById('ai-io-ds-info');
+            const viewBtn = document.getElementById('ai-io-view-data-btn');
+
+            _currentDs = ds;
+            // Reset selections
+            window._ioInputs = new Set();
+            window._ioOutputs = new Set();
+            window._ioMode = 'input';
+
+            if (!ds) {
+                placeholder.style.display = '';
+                modeBar.style.display = 'none';
+                fieldList.style.display = 'none';
+                fieldsEmpty.style.display = 'none';
+                dsInfo.style.display = 'none';
+                viewBtn.style.display = 'none';
+                const tensorSec = document.getElementById('ai-tensor-summary-section');
+                if (tensorSec) tensorSec.style.display = 'none';
+                return;
+            }
+
+            placeholder.style.display = 'none';
+            viewBtn.style.display = '';
+            modeBar.style.display = '';
+            fieldList.style.display = '';
+
+            // Reset mode toggle UI
+            _setIOMode('input');
+
+            // --- Collect ALL available fields ---
+            const sweepParams = _safeParse(ds.sweep_parameters_json) || [];
+            const casesData = _safeParse(ds.cases_json) || [];
+            const pvdInv = _safeParse(ds.pvd_inventory_json) || {};
+            const statsInv = _safeParse(ds.stats_inventory_json) || {};
+            const dsMode = ds.dataset_mode || '';
+            const isStatsMode = dsMode === 'stats_table';
+            const isSpatialMode = !isStatsMode;
+
+            let html = '';
+            let hasAny = false;
+
+            // === 1. Sweep Parameters ===
+            const paramInfos = [];
+            if (Array.isArray(sweepParams) && sweepParams.length > 0) {
+                for (const sp of sweepParams) {
+                    const pname = typeof sp === 'string' ? sp : (sp.name || sp);
+                    const values = [];
+                    for (const c of casesData) {
+                        const params = c.parameters || {};
+                        if (params[pname] !== undefined) values.push(params[pname]);
+                    }
+                    const uniqueVals = [...new Set(values.map(v => String(v)))];
+                    const allNumeric = values.length > 0 && values.every(v => _isNumeric(v));
+                    const varies = uniqueVals.length > 1;
+                    paramInfos.push({ name: pname, values, uniqueVals, allNumeric, varies });
+                }
+            } else {
+                const allParamKeys = new Set();
+                for (const c of casesData) {
+                    for (const k of Object.keys(c.parameters || {})) allParamKeys.add(k);
+                }
+                for (const pname of allParamKeys) {
+                    const values = casesData.map(c => (c.parameters || {})[pname]).filter(v => v !== undefined);
+                    const uniqueVals = [...new Set(values.map(v => String(v)))];
+                    const allNumeric = values.length > 0 && values.every(v => _isNumeric(v));
+                    const varies = uniqueVals.length > 1;
+                    paramInfos.push({ name: pname, values, uniqueVals, allNumeric, varies });
+                }
+            }
+
+            if (paramInfos.length > 0) {
+                hasAny = true;
+                html += `
+                    <div class="stats-category-card">
+                        <div class="stats-category-header" onclick="this.parentNode.classList.toggle('collapsed')">
+                            <div class="stats-category-info">
+                                <span class="stats-category-title">Sweep Parameters</span>
+                                <span class="stats-category-meta">${paramInfos.length} parameter${paramInfos.length !== 1 ? 's' : ''} · ${casesData.length} cases</span>
+                            </div>
+                            <svg class="stats-section-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                        </div>
+                        <div class="stats-category-body">
+                            ${paramInfos.map(p => {
+                                const rangeStr = p.allNumeric && p.uniqueVals.length > 0
+                                    ? p.uniqueVals.sort((a,b) => Number(a)-Number(b)).join(' → ')
+                                    : '';
+                                let badge = '';
+                                if (!p.allNumeric) badge = ' ⚠';
+                                else if (!p.varies) badge = ' ≡';
+                                let title = `${p.name}`;
+                                if (rangeStr) title += `\n${rangeStr}`;
+                                if (!p.allNumeric) title += '\n⚠ Non-numeric values';
+                                else if (!p.varies) title += '\n≡ Constant across all cases';
+                                const fkey = 'param:' + p.name;
+                                return `
+                                    <button class="stats-col-btn" data-field-key="${escHtml(fkey)}" data-field-type="param" data-field-value="${escHtml(p.name)}" title="${escHtml(title)}"
+                                        onclick="_toggleIOField(this)">
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M4.93 4.93l4.24 4.24m5.66 5.66l4.24 4.24M19.07 4.93l-4.24 4.24m-5.66 5.66l-4.24 4.24M1 12h4m14 0h4M12 1v4m0 14v4"/></svg>
+                                        ${escHtml(p.name)}${badge}
+                                    </button>`;
+                            }).join('')}
+                        </div>
+                    </div>`;
+            }
+
+            // === 2. VTK Fields (ImageData) — for spatial mode ===
+            if (isSpatialMode) {
+                const discoveredFields = [];
+                const seenFields = new Set();
+                for (const [catKey, catList] of Object.entries(pvdInv)) {
+                    for (const entry of catList) {
+                        const pvdName = entry.pvd_name || catKey;
+                        const gridType = (entry.grid || {}).type || '';
+                        const isStatic = entry.is_static || false;
+                        const fields = entry.fields || [];
+                        if (gridType !== 'ImageData') continue;
+                        for (const f of fields) {
+                            const fieldName = f.name || f.display_name || '';
+                            const components = f.components || 1;
+                            const dedupeKey = `${pvdName}:${fieldName}`;
+                            if (seenFields.has(dedupeKey)) continue;
+                            seenFields.add(dedupeKey);
+                            discoveredFields.push({ fieldName, pvdName, components, isStatic, category: catKey });
+                        }
+                    }
+                }
+
+                const pvdColors = { boundary_conditions: 'amber', slices_2d: 'green', volumes_3d: 'purple' };
+                const fieldsByPvd = {};
+                for (const f of discoveredFields) {
+                    if (!fieldsByPvd[f.pvdName]) fieldsByPvd[f.pvdName] = [];
+                    fieldsByPvd[f.pvdName].push(f);
+                }
+                for (const [pvdName, fields] of Object.entries(fieldsByPvd)) {
+                    hasAny = true;
+                    const cat = fields[0].category;
+                    const isAux = cat === 'boundary_conditions';
+                    const label = isAux ? `${pvdName} (auxiliary volume)` : pvdName;
+                    html += `
+                        <div class="stats-category-card" style="margin-top:8px;">
+                            <div class="stats-category-header" onclick="this.parentNode.classList.toggle('collapsed')">
+                                <div class="stats-category-info">
+                                    <span class="stats-category-title">${escHtml(label)}</span>
+                                    <span class="stats-category-meta">${fields.length} field${fields.length !== 1 ? 's' : ''} · ${isAux ? 'static geometry' : 'time-varying'}</span>
+                                </div>
+                                <svg class="stats-section-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                            </div>
+                            <div class="stats-category-body">
+                                ${fields.map(f => {
+                                    const compLabel = f.components > 1 ? ` (${f.components}C)` : '';
+                                    const descriptor = JSON.stringify({
+                                        field_name: f.fieldName,
+                                        pvd_source: isAux ? pvdName : 'self',
+                                        transform: 'raw',
+                                        channel_name: f.fieldName,
+                                    });
+                                    const fkey = 'vtk:' + f.pvdName + ':' + f.fieldName;
+                                    return `
+                                        <button class="stats-col-btn" data-field-key="${escHtml(fkey)}" data-field-type="vtk" data-field-value='${escHtml(descriptor)}' data-components="${f.components}" title="${escHtml(f.fieldName + compLabel + '\nFrom: ' + pvdName)}"
+                                            onclick="_toggleIOField(this)">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="12" x2="21" y2="12"/></svg>
+                                            ${escHtml(f.fieldName)}${compLabel}
+                                        </button>`;
+                                }).join('')}
+                            </div>
+                        </div>`;
+                }
+
+                // === 3. Geometry Channels ===
+                let computedChannels = [
+                    { name: 'x_norm', label: 'X Coordinate', desc: 'Normalized X position [-1, 1]', icon: '\u2194', defaultOn: true },
+                    { name: 'y_norm', label: 'Y Coordinate', desc: 'Normalized Y position [-1, 1]', icon: '\u2195', defaultOn: true },
+                    { name: 'z_norm', label: 'Z Coordinate', desc: 'Normalized Z position [-1, 1] (3D only)', icon: '\u2197', defaultOn: false },
+                ];
+
+                hasAny = true;
+                html += `
+                    <div class="stats-category-card" style="margin-top:8px;" data-channel-group="geometry">
+                        <div class="stats-category-header" onclick="this.parentNode.classList.toggle('collapsed')">
+                            <div class="stats-category-info">
+                                <span class="stats-category-title">Geometry Channels</span>
+                                <span class="stats-category-meta">${computedChannels.length} channels · coordinates</span>
+                            </div>
+                            <svg class="stats-section-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                        </div>
+                        <div class="stats-category-body">
+                            ${computedChannels.map(ch => {
+                                const fkey = 'spatial:' + ch.name;
+                                return `
+                                <button class="stats-col-btn" data-field-key="${escHtml(fkey)}" data-field-type="spatial" data-field-value="${ch.name}" title="${escHtml(ch.desc)}"
+                                    onclick="_toggleIOField(this)">
+                                    <span style="margin-right:4px;">${ch.icon}</span>
+                                    ${escHtml(ch.label)}
+                                </button>`;
+                            }).join('')}
+                        </div>
+                    </div>`;
+
+                // Upgrade with full channel registry from API (non-blocking)
+                aiApi.get('/ai/config').then(cfgRes => {
+                    if (cfgRes && cfgRes.channel_registry && cfgRes.channel_registry.length > 0) {
+                        const fullRegistry = cfgRes.channel_registry
+                            .filter(ch => !ch.is_template && ch.category === 'geometry')
+                            .map(ch => ({
+                                name: ch.name,
+                                label: ch.display_name,
+                                desc: ch.description,
+                                icon: ch.icon || '',
+                                defaultOn: ch.default_on || false,
+                            }));
+                        if (fullRegistry.length > 0) {
+                            const geoCard = fieldList.querySelector('[data-channel-group="geometry"] .stats-category-body');
+                            if (geoCard) {
+                                geoCard.innerHTML = fullRegistry.map(ch => {
+                                    const fkey = 'spatial:' + ch.name;
+                                    return `
+                                    <button class="stats-col-btn" data-field-key="${escHtml(fkey)}" data-field-type="spatial" data-field-value="${ch.name}" title="${escHtml(ch.desc)}"
+                                        onclick="_toggleIOField(this)">
+                                        <span style="margin-right:4px;">${ch.icon}</span>
+                                        ${escHtml(ch.label)}
+                                    </button>`;
+                                }).join('');
+                                _refreshFieldStyles();
+                            }
+                        }
+                    }
+                }).catch(() => {});
+            }
+
+            // === 4. Stats table columns (for stats mode) ===
+            if (isStatsMode) {
+                const catColors = ['cyan', 'green', 'amber', 'purple', 'red', 'blue'];
+                const physicsStats = (statsInv.physics || []);
+                physicsStats.forEach((sf, fi) => {
+                    const cols = (sf.columns || []).filter(c => {
+                        const n = (c.raw || c.name || '').toLowerCase();
+                        return n !== 'time' && n !== 'timestep' && n !== 'step' && n !== 'iteration';
+                    });
+                    if (cols.length === 0) return;
+                    hasAny = true;
+                    const color = catColors[fi % catColors.length];
+                    html += `
+                        <div class="stats-category-card" style="margin-top:8px;">
+                            <div class="stats-category-header" onclick="this.parentNode.classList.toggle('collapsed')">
+                                <div class="stats-category-info">
+                                    <span class="stats-category-title">${escHtml(sf.filename.replace('.txt','').replace('.csv',''))}</span>
+                                    <span class="stats-category-meta">${cols.length} variables · ${sf.num_rows || '?'} rows</span>
+                                </div>
+                                <svg class="stats-section-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                            </div>
+                            <div class="stats-category-body">
+                                ${cols.map(col => {
+                                    const cname = col.raw || col.name || col;
+                                    const displayName = col.name || cname;
+                                    const unit = col.unit ? ` [${col.unit}]` : '';
+                                    const fkey = 'stats:' + sf.filename + ':' + cname;
+                                    return `
+                                        <button class="stats-col-btn" data-field-key="${escHtml(fkey)}" data-field-type="stats" data-field-value="${escHtml(cname)}" data-source="${escHtml(sf.filename)}" title="${escHtml(displayName + unit)}"
+                                            onclick="_toggleIOField(this)">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                                            ${escHtml(displayName)}${escHtml(unit)}
+                                        </button>`;
+                                }).join('')}
+                            </div>
+                        </div>`;
+                });
+            }
+
+            // === 5. VTK output fields (for spatial mode — all PVD sources including non-ImageData) ===
+            if (isSpatialMode) {
+                const categoryLabels = { slices_2d: '2D Slices', volumes_3d: '3D Volumes', slices_body: 'Body Slices', other: 'Other' };
+                const categoryOrder = ['slices_2d', 'volumes_3d', 'slices_body', 'other'];
+                const catColors = ['cyan', 'green', 'amber', 'purple', 'red', 'blue'];
+                let colorIdx = 0;
+                for (const cat of categoryOrder) {
+                    const pvdList = pvdInv[cat] || [];
+                    if (pvdList.length === 0) continue;
+                    for (const pvd of pvdList) {
+                        const fields = pvd.fields || [];
+                        if (fields.length === 0) continue;
+                        const gridType = (pvd.grid || {}).type || '';
+                        // Skip ImageData PVDs already shown in VTK Fields section above
+                        if (gridType === 'ImageData') { colorIdx++; continue; }
+                        hasAny = true;
+                        const pvdLabel = pvd.pvd_name || pvd.pvd_file || '?';
+                        const planeInfo = pvd.plane ? ` (${pvd.plane})` : '';
+                        const catLabel = categoryLabels[cat] || cat;
+                        const color = catColors[colorIdx % catColors.length];
+                        colorIdx++;
+                        html += `
+                            <div class="stats-category-card" style="margin-top:8px;">
+                                <div class="stats-category-header" onclick="this.parentNode.classList.toggle('collapsed')">
+                                    <div class="stats-category-info">
+                                        <span class="stats-category-title">${escHtml(pvdLabel + planeInfo)}</span>
+                                        <span class="stats-category-meta">${catLabel} · ${fields.length} fields · ${gridType || 'PolyData'}</span>
+                                    </div>
+                                    <svg class="stats-section-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                                </div>
+                                <div class="stats-category-body">
+                                    ${fields.map(f => {
+                                        const fname = f.name || f.display_name || '';
+                                        const fkey = 'output_vtk:' + pvdLabel + ':' + fname;
+                                        const tags = f.is_solver_averaged ? ' ✓avg' : (f.is_rms ? ' ~RMS' : '');
+                                        return `
+                                            <button class="stats-col-btn" data-field-key="${escHtml(fkey)}" data-field-type="output_vtk" data-field-value="${escHtml(fname)}" data-source="${escHtml(pvdLabel)}" data-components="${f.components || 1}" title="${escHtml(f.display_name || fname)}"
+                                                onclick="_toggleIOField(this)">
+                                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                                                ${escHtml(f.display_name || fname)}${tags}
+                                            </button>`;
+                                    }).join('')}
+                                </div>
+                            </div>`;
+                    }
+                }
+            }
+
+            // Set field list content
+            if (hasAny) {
+                fieldList.innerHTML = html;
+                fieldsEmpty.style.display = 'none';
+            } else {
+                fieldList.innerHTML = '';
+                fieldsEmpty.style.display = '';
+            }
+
+            // === 6. Tensor Summary (spatial mode) ===
+            const tensorSec = document.getElementById('ai-tensor-summary-section');
+            if (isSpatialMode && tensorSec) {
+                tensorSec.style.display = '';
+                tensorSec.innerHTML = `
+                    <div class="stats-category-card" style="border:1px solid var(--accent-green);">
+                        <div class="stats-category-header" style="cursor:default;">
+                            <div class="stats-category-info">
+                                <span class="stats-category-title" style="color:var(--accent-green);">\ud83e\udde0 Tensor Summary</span>
+                                <span class="stats-category-meta" id="ai-tensor-summary-meta">select channels above</span>
+                            </div>
+                        </div>
+                        <div class="stats-category-body" style="padding:0;">
+                            <div id="ai-tensor-summary" style="font-family:monospace;font-size:12px;padding:8px 12px;color:var(--text-secondary);max-height:200px;overflow-y:auto;"></div>
+                        </div>
+                    </div>`;
+            } else if (tensorSec) {
+                tensorSec.style.display = 'none';
+            }
+
+            // === 7. Fetch derived/prepared fields (async, spatial mode) ===
+            // Instead of a separate "Prepared Fields" block, insert each derived
+            // field under the PVD card it originated from (matching by pvd_name
+            // from the recipe). Falls back to an "Other Prepared" section.
+            if (isSpatialMode) {
+                aiApi.get(`/ai/datasets/${ds.id}/derived-fields`).then(derivedRes => {
+                    const derivedFields = (derivedRes && derivedRes.fields) || [];
+                    if (derivedFields.length === 0) return;
+
+                    const METHODS = {
+                        time_average: { label: 'Time Average', icon: '\u23f1' },
+                        solver_average: { label: 'Solver Average', icon: '\ud83d\udcca' },
+                        coordinates: { label: 'Coordinates', icon: '\ud83d\udcd0' },
+                        edt: { label: 'Distance Field', icon: '\ud83d\udd32' },
+                        sdf: { label: 'Signed Distance', icon: '\u00b1' },
+                        vorticity: { label: 'Vorticity', icon: '\ud83c\udf00' },
+                        q_criterion: { label: 'Q-Criterion', icon: 'Q' },
+                    };
+
+                    const preparedFields = derivedFields.filter(f => {
+                        const method = (f.recipe || {}).method || '';
+                        if (method === 'coordinates') return false;
+                        if (f.field_name && f.field_name.startsWith('target_')) return false;
+                        return true;
+                    });
+                    if (preparedFields.length === 0) return;
+
+                    // Group by source PVD name
+                    const orphaned = [];
+                    for (const f of preparedFields) {
+                        const recipe = f.recipe || {};
+                        const method = recipe.method || '?';
+                        const methodInfo = METHODS[method] || { label: method, icon: '\u2699' };
+                        const displayName = recipe.display_name || f.field_name;
+                        // Recipe keys: source.source_field, source.source_pvd, source.field_name (legacy)
+                        const src = recipe.source || {};
+                        const sourceField = src.source_field || src.field_name || f.field_name;
+                        const sourcePvd = src.source_pvd || src.pvd_name || '';
+                        const descriptor = JSON.stringify({
+                            field_name: f.field_name,
+                            source_field_name: sourceField,
+                            pvd_source: 'derived',
+                            transform: method,
+                            channel_name: f.field_name,
+                        });
+                        const fkey = 'derived:' + f.field_name;
+                        const pvdInfo = sourcePvd ? `\nSource PVD: ${sourcePvd}` : '';
+                        const title = `${displayName}\nMethod: ${methodInfo.label}\nDerived from: ${sourceField}${pvdInfo}\nCases: ${f.case_count}`;
+                        const btnHtml = `
+                            <button class="stats-col-btn" style="border-left:2px solid var(--accent-green);" data-field-key="${escHtml(fkey)}" data-field-type="derived" data-field-value='${escHtml(descriptor)}' title="${escHtml(title)}"
+                                onclick="_toggleIOField(this)">
+                                <span style="margin-right:3px;">${methodInfo.icon}</span>
+                                ${escHtml(displayName)}
+                                <span style="font-size:9px;color:var(--text-muted);margin-left:4px;">(prepared)</span>
+                            </button>`;
+
+                        // Find the PVD card this field belongs to.
+                        // Strategy: find the card that already contains the SOURCE field
+                        // (e.g. "Velocity Vector (m/s)") by checking data-field-key attrs.
+                        // Falls back to PVD name title match, then orphaned.
+                        let placed = false;
+                        const pvdCards = fieldList.querySelectorAll('.stats-category-card');
+
+                        // 1) Match by source field name — find card with a button for the same field
+                        if (sourceField) {
+                            for (const card of pvdCards) {
+                                const btns = card.querySelectorAll('.stats-col-btn[data-field-key]');
+                                for (const btn of btns) {
+                                    const fk = btn.getAttribute('data-field-key') || '';
+                                    // vtk field keys look like "vtk:SliceX_0.000.pvd:Velocity Vector (m/s)"
+                                    if (fk.startsWith('vtk:') && fk.endsWith(':' + sourceField)) {
+                                        const body = card.querySelector('.stats-category-body');
+                                        if (body) {
+                                            body.insertAdjacentHTML('beforeend', btnHtml);
+                                            placed = true;
+                                        }
+                                        break;
+                                    }
+                                }
+                                if (placed) break;
+                            }
+                        }
+
+                        // 2) Fallback: match by PVD name in card title
+                        if (!placed && sourcePvd && sourcePvd !== 'auto' && sourcePvd !== 'unknown') {
+                            for (const card of pvdCards) {
+                                const titleEl = card.querySelector('.stats-category-title');
+                                if (titleEl && titleEl.textContent.trim().includes(sourcePvd.replace('.pvd', ''))) {
+                                    const body = card.querySelector('.stats-category-body');
+                                    if (body) {
+                                        body.insertAdjacentHTML('beforeend', btnHtml);
+                                        placed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!placed) orphaned.push(btnHtml);
+                    }
+
+                    // Any fields that couldn't match a PVD card go into a fallback section
+                    if (orphaned.length > 0) {
+                        const fallbackHtml = `
+                            <div class="stats-category-card" style="margin-top:8px;" data-derived-fields>
+                                <div class="stats-category-header" onclick="this.parentNode.classList.toggle('collapsed')">
+                                    <div class="stats-category-info">
+                                        <span class="stats-category-title" style="color:var(--accent-green);">\ud83d\udce6 Prepared Fields</span>
+                                        <span class="stats-category-meta">${orphaned.length} field${orphaned.length !== 1 ? 's' : ''} \u00b7 computed in preparation</span>
+                                    </div>
+                                    <svg class="stats-section-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                                </div>
+                                <div class="stats-category-body">
+                                    ${orphaned.join('')}
+                                </div>
+                            </div>`;
+                        fieldList.insertAdjacentHTML('beforeend', fallbackHtml);
+                    }
+
+                    _updateIOCounts();
+                }).catch(e => console.warn('[AI] Failed to load derived fields:', e));
+            }
+
+            // --- Dataset info line ---
+            const nCases = ds.num_cases_with_output || ds.num_cases || 0;
+            const totalInv = (statsInv.total_data_human || _safeParse(ds.stats_inventory_json)?.total_data_human || '');
+            const modeLabel = dsMode || 'auto';
+            dsInfo.style.display = '';
+            dsInfo.textContent = `${nCases} case${nCases !== 1 ? 's' : ''} · ${modeLabel}${totalInv ? ' · ' + totalInv : ''}`;
+
+            // --- Update counts ---
+            _updateIOCounts();
+            setTimeout(() => updateTensorSummary(), 50);
+        }
+
+
+
+
+
+
+        // ---- I/O Mode Toggle Logic ----
+        window._ioMode = 'input';
+        window._ioInputs = new Set();
+        window._ioOutputs = new Set();
+
+        function _setIOMode(mode) {
+            window._ioMode = mode;
+            const inputBtn = document.getElementById('ai-io-mode-input');
+            const outputBtn = document.getElementById('ai-io-mode-output');
+            const hint = document.getElementById('ai-io-mode-hint');
+            if (!inputBtn || !outputBtn) return;
+
+            if (mode === 'input') {
+                inputBtn.style.background = 'var(--accent-blue,#3b82f6)';
+                inputBtn.style.color = 'white';
+                outputBtn.style.background = 'transparent';
+                outputBtn.style.color = 'var(--text-muted)';
+                if (hint) hint.innerHTML = 'Click fields below to add them as <strong style="color:var(--accent-blue,#3b82f6);">inputs</strong> to the neural network.';
+            } else {
+                outputBtn.style.background = 'var(--accent-cyan,#06b6d4)';
+                outputBtn.style.color = 'white';
+                inputBtn.style.background = 'transparent';
+                inputBtn.style.color = 'var(--text-muted)';
+                if (hint) hint.innerHTML = 'Click fields below to select <strong style="color:var(--accent-cyan,#06b6d4);">outputs</strong> — what the model should predict.';
+            }
+        }
+        window._setIOMode = _setIOMode;
+
+        function _toggleIOField(btn) {
+            const key = btn.dataset.fieldKey;
+            if (!key) return;
+            const mode = window._ioMode;
+            const inputs = window._ioInputs;
+            const outputs = window._ioOutputs;
+
+            if (mode === 'input') {
+                if (inputs.has(key)) inputs.delete(key);
+                else inputs.add(key);
+            } else {
+                if (outputs.has(key)) outputs.delete(key);
+                else outputs.add(key);
+            }
+            _applyFieldStyle(btn);
+            _updateIOCounts();
+            if (window.updateTensorSummary) updateTensorSummary();
+        }
+        window._toggleIOField = _toggleIOField;
+
+        function _applyFieldStyle(btn) {
+            const key = btn.dataset.fieldKey;
+            const isInput = window._ioInputs.has(key);
+            const isOutput = window._ioOutputs.has(key);
+
+            // Remove any previous role classes
+            btn.classList.remove('active', 'io-input', 'io-output', 'io-both', 'blue', 'cyan', 'green', 'amber', 'purple');
+
+            if (isInput && isOutput) {
+                btn.classList.add('active', 'io-both');
+                btn.style.borderLeft = '3px solid';
+                btn.style.borderImage = 'linear-gradient(to bottom, var(--accent-blue,#3b82f6) 50%, var(--accent-cyan,#06b6d4) 50%) 1';
+                btn.style.background = 'linear-gradient(135deg, rgba(59,130,246,0.12), rgba(6,182,212,0.12))';
+            } else if (isInput) {
+                btn.classList.add('active', 'io-input', 'blue');
+                btn.style.borderLeft = '3px solid var(--accent-blue,#3b82f6)';
+                btn.style.borderImage = '';
+                btn.style.background = 'rgba(59,130,246,0.12)';
+            } else if (isOutput) {
+                btn.classList.add('active', 'io-output', 'cyan');
+                btn.style.borderLeft = '3px solid var(--accent-cyan,#06b6d4)';
+                btn.style.borderImage = '';
+                btn.style.background = 'rgba(6,182,212,0.12)';
+            } else {
+                btn.style.borderLeft = '';
+                btn.style.borderImage = '';
+                btn.style.background = '';
+            }
+
+            // Role indicator badges
+            let badgeHtml = '';
+            if (isInput) badgeHtml += '<span style="position:absolute;top:2px;right:2px;font-size:8px;color:var(--accent-blue,#3b82f6);font-weight:700;background:rgba(59,130,246,0.15);padding:0 3px;border-radius:3px;">IN</span>';
+            if (isOutput) badgeHtml += '<span style="position:absolute;top:' + (isInput ? '14px' : '2px') + ';right:2px;font-size:8px;color:var(--accent-cyan,#06b6d4);font-weight:700;background:rgba(6,182,212,0.15);padding:0 3px;border-radius:3px;">OUT</span>';
+
+            // Ensure position:relative
+            btn.style.position = 'relative';
+            // Remove old badges
+            btn.querySelectorAll('.io-role-badge').forEach(b => b.remove());
+            if (badgeHtml) {
+                const wrapper = document.createElement('span');
+                wrapper.className = 'io-role-badge';
+                wrapper.innerHTML = badgeHtml;
+                btn.appendChild(wrapper);
+            }
+        }
+
+        function _refreshFieldStyles() {
+            document.querySelectorAll('#ai-io-field-list [data-field-key]').forEach(btn => {
+                _applyFieldStyle(btn);
+            });
+        }
+
+        // Update selection counts in mode toggle buttons
+        function _updateIOCounts() {
+            const inputs = window._ioInputs;
+            const outputs = window._ioOutputs;
+
+            const inputCountEl = document.getElementById('ai-io-input-count');
+            const outputCountEl = document.getElementById('ai-io-output-count');
+            if (inputCountEl) inputCountEl.textContent = inputs.size > 0 ? `(${inputs.size})` : '';
+            if (outputCountEl) outputCountEl.textContent = outputs.size > 0 ? `(${outputs.size})` : '';
+
+            // Build training summary
+            const summaryEl = document.getElementById('ai-training-summary');
+            if (!summaryEl) return;
+
+            if (inputs.size === 0 && outputs.size === 0) {
+                summaryEl.innerHTML = '<span style="color:var(--text-muted);">Select inputs and outputs above to see a summary.</span>';
+                return;
+            }
+
+            // Classify inputs by type
+            const paramInputs = [], vtkInputs = [], spatialInputs = [], derivedInputs = [], otherInputs = [];
+            for (const key of inputs) {
+                const btn = document.querySelector(`[data-field-key="${CSS.escape(key)}"]`);
+                const type = btn ? btn.dataset.fieldType : '';
+                const val = btn ? btn.textContent.trim() : key;
+                if (type === 'param') paramInputs.push(val);
+                else if (type === 'vtk') vtkInputs.push(val);
+                else if (type === 'spatial') spatialInputs.push(val);
+                else if (type === 'derived') derivedInputs.push(val);
+                else otherInputs.push(val);
+            }
+
+            // Classify outputs — sum components for total channel count
+            const outputNames = [];
+            let totalOutputChannels = 0;
+            for (const key of outputs) {
+                const btn = document.querySelector(`[data-field-key="${CSS.escape(key)}"]`);
+                const nComp = btn ? parseInt(btn.dataset.components || '1', 10) : 1;
+                totalOutputChannels += nComp;
+                const label = btn ? btn.textContent.trim() : key;
+                if (nComp > 1) {
+                    outputNames.push(`${label} (${nComp}ch)`);
+                } else {
+                    outputNames.push(label);
+                }
+            }
+
+            const totalInputs = inputs.size;
+            const modelEl = document.getElementById('ai-tj-model');
+            const modelName = modelEl ? modelEl.value.toUpperCase() : 'UNET';
+
+            // Build channel groups for input display
+            const channelGroups = [];
+            if (vtkInputs.length > 0)
+                channelGroups.push({ label: 'VTK Fields', channels: vtkInputs, color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' });
+            if (spatialInputs.length > 0)
+                channelGroups.push({ label: 'Computed', channels: spatialInputs, color: '#3b82f6', bg: 'rgba(59,130,246,0.12)' });
+            if (paramInputs.length > 0)
+                channelGroups.push({ label: 'Params', channels: paramInputs, color: '#06b6d4', bg: 'rgba(6,182,212,0.12)' });
+            if (derivedInputs.length > 0)
+                channelGroups.push({ label: 'Prepared', channels: derivedInputs, color: '#10b981', bg: 'rgba(16,185,129,0.12)' });
+            if (otherInputs.length > 0)
+                channelGroups.push({ label: 'Other', channels: otherInputs, color: '#8b5cf6', bg: 'rgba(139,92,246,0.12)' });
+
+            let inputHtml = '';
+            if (channelGroups.length > 0) {
+                const groupsHtml = channelGroups.map(g => {
+                    const pills = g.channels.map(n =>
+                        `<span style="display:inline-block;padding:1px 6px;border-radius:3px;background:${g.bg};color:${g.color};font-size:10px;font-weight:500;margin:1px;white-space:nowrap;">${escHtml(n)}</span>`
+                    ).join('');
+                    return `<div style="margin-bottom:4px;">
+                        <span style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">${g.label}</span>
+                        <div style="margin-top:2px;display:flex;flex-wrap:wrap;gap:1px;">${pills}</div>
+                    </div>`;
+                }).join('');
+
+                inputHtml = `
+                    <div style="flex:1;min-width:120px;border:1px solid var(--border);border-radius:8px;padding:8px 10px;background:var(--bg-secondary);">
+                        <div style="font-size:11px;font-weight:600;color:var(--text-primary);margin-bottom:6px;">
+                            Input Tensor
+                            <span style="font-weight:400;color:var(--text-muted);margin-left:4px;">(${totalInputs}, H, W)</span>
+                        </div>
+                        ${groupsHtml}
+                    </div>`;
+            }
+
+            const networkHtml = `
+                <div style="display:flex;flex-direction:column;align-items:center;flex-shrink:0;gap:2px;">
+                    <svg width="20" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                    <div style="padding:6px 14px;border-radius:8px;background:linear-gradient(135deg, rgba(139,92,246,0.2), rgba(59,130,246,0.2));border:1px solid rgba(139,92,246,0.3);text-align:center;">
+                        <div style="font-size:13px;font-weight:700;color:var(--accent-purple,#8b5cf6);">${escHtml(modelName)}</div>
+                        <div style="font-size:10px;color:var(--text-muted);">${totalInputs}ch → ${totalOutputChannels}ch</div>
+                    </div>
+                    <svg width="20" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                </div>`;
+
+            let outputHtml = '';
+            if (outputs.size > 0) {
+                const outPills = outputNames.map(n =>
+                    `<span style="display:inline-block;padding:1px 6px;border-radius:3px;background:rgba(6,182,212,0.12);color:#06b6d4;font-size:10px;font-weight:500;margin:1px;white-space:nowrap;">${escHtml(n)}</span>`
+                ).join('');
+                outputHtml = `
+                    <div style="flex:1;min-width:100px;border:1px solid var(--border);border-radius:8px;padding:8px 10px;background:var(--bg-secondary);">
+                        <div style="font-size:11px;font-weight:600;color:var(--text-primary);margin-bottom:6px;">
+                            Output Tensor
+                            <span style="font-weight:400;color:var(--text-muted);margin-left:4px;">(${totalOutputChannels}, H, W)</span>
+                        </div>
+                        <div style="display:flex;flex-wrap:wrap;gap:1px;">${outPills}</div>
+                    </div>`;
+            }
+
+            summaryEl.innerHTML = `
+                <div style="display:flex;align-items:center;gap:8px;">
+                    ${inputHtml}
+                    ${networkHtml}
+                    ${outputHtml}
+                </div>`;
+        }
+
+
+        // ---- View Data Modal ----
+        document.getElementById('ai-io-view-data-btn').addEventListener('click', () => {
+            if (!_currentDs) return;
+            const ds = _currentDs;
+            const casesData = _safeParse(ds.cases_json) || [];
+            const pvdInv = _safeParse(ds.pvd_inventory_json) || {};
+            const statsInv = _safeParse(ds.stats_inventory_json) || {};
+
+            // Build modal content
+            let html = '';
+
+            // --- Cases & Parameters ---
+            html += '<div style="margin-bottom:20px;"><div style="font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:8px;">Cases & Parameters</div>';
+            if (casesData.length > 0) {
+                // Collect all param keys
+                const allKeys = new Set();
+                for (const c of casesData) for (const k of Object.keys(c.parameters || {})) allKeys.add(k);
+                const paramKeys = [...allKeys];
+                html += '<div style="overflow-x:auto;"><table style="width:100%;font-size:12px;border-collapse:collapse;">';
+                html += '<thead><tr style="border-bottom:1px solid var(--border-color,#333);">';
+                html += '<th style="text-align:left;padding:6px 8px;color:var(--text-secondary);font-weight:600;">Case</th>';
+                for (const k of paramKeys) html += `<th style="text-align:right;padding:6px 8px;color:var(--text-secondary);font-weight:600;">${escHtml(k)}</th>`;
+                html += '<th style="text-align:center;padding:6px 8px;color:var(--text-secondary);font-weight:600;">Output</th>';
+                html += '</tr></thead><tbody>';
+                for (const c of casesData) {
+                    const hasOut = c.has_output !== false && c.status !== 'no_output';
+                    html += '<tr style="border-bottom:1px solid var(--border-color,#222);">';
+                    html += `<td style="padding:5px 8px;color:var(--text-primary);font-weight:500;">${escHtml(c.name)}</td>`;
+                    for (const k of paramKeys) {
+                        const v = (c.parameters || {})[k];
+                        const display = v !== undefined ? String(v) : '—';
+                        html += `<td style="padding:5px 8px;text-align:right;color:var(--text-muted);font-family:monospace;font-size:11px;">${escHtml(display)}</td>`;
+                    }
+                    html += `<td style="padding:5px 8px;text-align:center;">${hasOut ? '✓' : '✗'}</td>`;
+                    html += '</tr>';
+                }
+                html += '</tbody></table></div>';
+            } else {
+                html += '<div style="color:var(--text-muted);font-size:12px;">No case data available.</div>';
+            }
+            html += '</div>';
+
+            // --- PVD Sources ---
+            const categoryLabels2 = { slices_2d: '2D Slices', volumes_3d: '3D Volumes', slices_body: 'Body Slices', boundary_conditions: 'Boundary Conditions', other: 'Other' };
+            let hasPvd = false;
+            for (const [cat, items] of Object.entries(pvdInv)) {
+                if (!Array.isArray(items) || items.length === 0) continue;
+                if (!hasPvd) {
+                    html += '<div style="margin-bottom:20px;"><div style="font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:8px;">PVD Sources</div>';
+                    hasPvd = true;
+                }
+                html += `<div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin:8px 0 4px;">${categoryLabels2[cat] || cat} (${items.length})</div>`;
+                for (const pvd of items) {
+                    const name = pvd.pvd_name || '?';
+                    const plane = pvd.plane ? ` — ${pvd.plane}` : '';
+                    const ts = pvd.num_timesteps || 0;
+                    const fmt = pvd.format || '?';
+                    const fields = pvd.fields || [];
+                    const isStatic = pvd.is_static;
+                    html += `<div style="padding:6px 10px;margin-bottom:4px;border-radius:6px;background:var(--bg-tertiary,#0f1423);border:1px solid var(--border-color,#333);">`;
+                    html += `<div style="font-size:12px;font-weight:500;color:var(--text-primary);">${escHtml(name + plane)}${isStatic ? ' <span style="color:var(--text-muted);font-size:10px;">static geometry</span>' : ''}</div>`;
+                    html += `<div style="font-size:11px;color:var(--text-muted);">${fmt.toUpperCase()} · ${ts} timesteps · ${fields.length} fields</div>`;
+                    if (fields.length > 0) {
+                        html += `<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">Fields: ${fields.map(f => escHtml(f.display_name || f.name || '?')).join(', ')}</div>`;
+                    }
+                    html += '</div>';
+                }
+            }
+            if (hasPvd) html += '</div>';
+
+            // --- Stats Files ---
+            const physStats = statsInv.physics || [];
+            const sysStats = statsInv.system || [];
+            if (physStats.length > 0 || sysStats.length > 0) {
+                html += '<div style="margin-bottom:20px;"><div style="font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:8px;">Stats Files</div>';
+                for (const sf of [...physStats, ...sysStats]) {
+                    const cols = (sf.columns || []).map(c => c.raw || c.name || c).join(', ');
+                    html += `<div style="padding:6px 10px;margin-bottom:4px;border-radius:6px;background:var(--bg-tertiary,#0f1423);border:1px solid var(--border-color,#333);">`;
+                    html += `<div style="font-size:12px;font-weight:500;color:var(--text-primary);">${escHtml(sf.filename)}</div>`;
+                    html += `<div style="font-size:11px;color:var(--text-muted);">${sf.num_rows || '?'} rows · ${(sf.columns || []).length} columns</div>`;
+                    if (cols) html += `<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">Columns: ${escHtml(cols)}</div>`;
+                    html += '</div>';
+                }
+                html += '</div>';
+            }
+
+            // Create modal
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:10000;display:flex;align-items:center;justify-content:center;';
+            overlay.innerHTML = `
+                <div style="background:var(--bg-secondary,#111827);border:1px solid var(--border-color,#333);border-radius:12px;width:90vw;max-width:900px;max-height:85vh;display:flex;flex-direction:column;">
+                    <div style="display:flex;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border-color,#333);flex-shrink:0;">
+                        <span style="font-size:16px;font-weight:600;color:var(--text-primary);">Dataset: ${escHtml(ds.name)}</span>
+                        <button id="ai-view-data-close" style="margin-left:auto;background:none;border:none;color:var(--text-muted);font-size:20px;cursor:pointer;padding:4px 8px;">&times;</button>
+                    </div>
+                    <div style="padding:20px;overflow-y:auto;flex:1;">${html}</div>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+            overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+            overlay.querySelector('#ai-view-data-close').addEventListener('click', () => overlay.remove());
+        });
+
+        // Populate on initial load
+        if (datasets.length > 0) {
+            // For continue mode, use the source job's dataset; otherwise first
+            const initialDs = ((isContinue || isRestart) && resumeOpts.datasetId)
+                ? datasets.find(d => d.id === resumeOpts.datasetId) || datasets[0]
+                : datasets[0];
+            populateIOPanels(initialDs);
+
+            // If resuming, apply source job's I/O selections after panels are populated
+            if (isResume && (sourceConfig.selected_input_params || sourceConfig.selected_target_fields)) {
+                // Restore input selections via the Set model
+                const srcInputs = sourceConfig.selected_input_params || [];
+                const srcSpatial = sourceConfig.selected_spatial_channels || sourceConfig.computed_channels || [];
+                const srcOutputs = sourceConfig.selected_target_fields || [];
+
+                // Map param names to field keys
+                for (const pname of srcInputs) {
+                    const fkey = 'param:' + pname;
+                    window._ioInputs.add(fkey);
+                }
+                for (const ch of srcSpatial) {
+                    const fkey = 'spatial:' + ch;
+                    window._ioInputs.add(fkey);
+                }
+                for (const oname of srcOutputs) {
+                    // Find the matching output field key
+                    const btn = document.querySelector(`[data-field-value="${CSS.escape(oname)}"]`);
+                    if (btn && btn.dataset.fieldKey) {
+                        window._ioOutputs.add(btn.dataset.fieldKey);
+                    }
+                }
+                _refreshFieldStyles();
+                _updateIOCounts();
+                if (window.updateTensorSummary) setTimeout(() => updateTensorSummary(), 100);
+            }
+        }
+        datasetSelect.addEventListener('change', () => {
+            const ds = datasets.find(d => d.id === parseInt(datasetSelect.value, 10));
+            populateIOPanels(ds);
+        });
+
+        // Collapsible I/O sections
+        function _setupCollapsible(toggleId, chevronId, collapsibleId) {
+            const toggle = document.getElementById(toggleId);
+            const chevron = document.getElementById(chevronId);
+            const body = document.getElementById(collapsibleId);
+            if (!toggle || !body) return;
+            toggle.addEventListener('click', () => {
+                const isOpen = body.style.display !== 'none';
+                body.style.display = isOpen ? 'none' : '';
+                if (chevron) chevron.style.transform = isOpen ? 'rotate(-90deg)' : '';
+            });
+        }
+        // Mode toggle buttons
+        document.getElementById('ai-io-mode-input').addEventListener('click', () => _setIOMode('input'));
+        document.getElementById('ai-io-mode-output').addEventListener('click', () => _setIOMode('output'));
+        // Update summary when model changes
+        modelSelect.addEventListener('change', () => _updateIOCounts());
 
         // ---- GPU grid ----
         await loadTrainingGpuGrid();
@@ -1585,7 +3133,82 @@ function renderTraining(container) {
             if (scheduler) config.scheduler = scheduler;
             if (ckptInterval && ckptInterval > 0) config.checkpoint_interval = ckptInterval;
 
+            // I/O selections from unified mode-toggle Sets
+            const inputs = window._ioInputs;
+            const outputs = window._ioOutputs;
+
+            const checkedInputParams = [];
+            const checkedInputFields = [];
+            const checkedComputed = [];
+            const checkedOutputs = [];
+
+            for (const key of inputs) {
+                const btn = document.querySelector(`[data-field-key="${CSS.escape(key)}"]`);
+                if (!btn) continue;
+                const type = btn.dataset.fieldType;
+                const val = btn.dataset.fieldValue;
+                if (type === 'param') checkedInputParams.push(val);
+                else if (type === 'vtk' || type === 'derived') {
+                    try { checkedInputFields.push(JSON.parse(val)); } catch { checkedInputFields.push({ field_name: val, pvd_source: 'self', transform: 'raw', channel_name: val }); }
+                }
+                else if (type === 'spatial') checkedComputed.push(val);
+                else if (type === 'stats' || type === 'output_vtk') checkedInputParams.push(val); // stats columns as params
+            }
+
+            for (const key of outputs) {
+                const btn = document.querySelector(`[data-field-key="${CSS.escape(key)}"]`);
+                if (!btn) continue;
+                const val = btn.dataset.fieldValue;
+                const type = btn.dataset.fieldType;
+                if (type === 'vtk' || type === 'derived') {
+                    try {
+                        const d = JSON.parse(val);
+                        // For derived fields, use the source field name (original M-Star
+                        // name) so the training loader can find it in VTI cell data.
+                        // Falls back to field_name / channel_name if source not available.
+                        if (type === 'derived' && d.source_field_name) {
+                            checkedOutputs.push(d.source_field_name);
+                        } else {
+                            checkedOutputs.push(d.field_name || d.channel_name || val);
+                        }
+                    } catch { checkedOutputs.push(val); }
+                } else {
+                    checkedOutputs.push(val);
+                }
+            }
+
+            // Custom expression channels
+            const customChannelRows = document.querySelectorAll('.ai-custom-channel-row');
+            const customChannels = [];
+            customChannelRows.forEach(row => {
+                const nameInput = row.querySelector('.ai-custom-ch-name');
+                const exprInput = row.querySelector('.ai-custom-ch-expr');
+                if (nameInput && exprInput && nameInput.value.trim() && exprInput.value.trim()) {
+                    customChannels.push({
+                        channel_name: nameInput.value.trim(),
+                        expression: exprInput.value.trim(),
+                        method: 'expression',
+                    });
+                }
+            });
+
+            if (checkedInputParams.length > 0) config.selected_input_params = checkedInputParams;
+            if (checkedInputFields.length > 0) config.input_fields = checkedInputFields;
+            if (checkedComputed.length > 0) config.computed_channels = checkedComputed;
+            if (checkedOutputs.length > 0) config.selected_target_fields = checkedOutputs;
+            if (customChannels.length > 0) config.custom_channels = customChannels;
+
+            // Include dataset_mode from the selected dataset
+            const selectedDs = (dsData?.datasets || []).find(d => d.id === datasetId);
+            if (selectedDs && selectedDs.dataset_mode) config.dataset_mode = selectedDs.dataset_mode;
+
             if (Object.keys(config).length > 0) body.config = config;
+
+            // Include resume_from_job for continue/transfer learning
+            // Restart mode does NOT set this — it's a fresh start with no checkpoint
+            if (isResume && !isRestart && resumeOpts.sourceJobId) {
+                body.resume_from_job = resumeOpts.sourceJobId;
+            }
 
             const btn = document.getElementById('ai-tj-submit');
             btn.disabled = true;
@@ -1596,7 +3219,7 @@ function renderTraining(container) {
                 const res = await aiApi.post('/ai/training-jobs', body);
                 if (res && res.id) {
                     showToast(`Training job "${res.run_name}" queued`, 'success');
-                    showView('dashboard');
+                    showView('dashboard', { tab: 'training-jobs' });
                 } else {
                     showToast(res?.error || 'Failed to create training job', 'error');
                     btn.disabled = false;
@@ -1609,6 +3232,159 @@ function renderTraining(container) {
             }
         });
     }
+
+    // ---- Helper: Update Input Tensor Summary ----
+    function updateTensorSummary() {
+        const summaryEl = document.getElementById('ai-tensor-summary');
+        const metaEl = document.getElementById('ai-tensor-summary-meta');
+        if (!summaryEl) return;
+
+        const channels = [];
+        let idx = 0;
+        const inputs = window._ioInputs || new Set();
+        const outputs = window._ioOutputs || new Set();
+
+        // Build input channels from the Set
+        for (const key of inputs) {
+            const btn = document.querySelector(`[data-field-key="${CSS.escape(key)}"]`);
+            if (!btn) continue;
+            const type = btn.dataset.fieldType;
+            const val = btn.dataset.fieldValue;
+            if (type === 'vtk' || type === 'derived') {
+                try {
+                    const desc = JSON.parse(val);
+                    channels.push({ idx: idx++, name: desc.channel_name || desc.field_name, type: desc.transform || 'raw', source: type === 'derived' ? 'derived' : 'vtk_field' });
+                } catch { channels.push({ idx: idx++, name: val, type: 'raw', source: 'vtk_field' }); }
+            } else if (type === 'spatial') {
+                channels.push({ idx: idx++, name: val, type: 'computed', source: 'registry' });
+            } else if (type === 'param') {
+                channels.push({ idx: idx++, name: 'param_' + val.toLowerCase().replace(/\s+/g, '_'), type: 'broadcast', source: 'sweep_param' });
+            } else {
+                channels.push({ idx: idx++, name: val || btn.textContent.trim(), type: 'input', source: type || 'unknown' });
+            }
+        }
+
+        // Custom channels
+        document.querySelectorAll('.ai-custom-channel-row').forEach(row => {
+            const n = row.querySelector('.ai-custom-ch-name');
+            if (n && n.value.trim()) {
+                channels.push({ idx: idx++, name: n.value.trim(), type: 'expression', source: 'custom' });
+            }
+        });
+
+        if (channels.length === 0 && outputs.size === 0) {
+            summaryEl.innerHTML = '<span style="color:var(--text-muted);">No channels selected</span>';
+            metaEl.textContent = 'select channels above';
+            return;
+        }
+
+        if (metaEl) {
+            let totalOutputCh = 0;
+            for (const key of outputs) {
+                const btn = document.querySelector(`[data-field-key="${CSS.escape(key)}"]`);
+                totalOutputCh += btn ? parseInt(btn.dataset.components || '1', 10) : 1;
+            }
+            metaEl.textContent = `${channels.length} input${channels.length !== 1 ? 's' : ''} · ${totalOutputCh} output${totalOutputCh !== 1 ? 's' : ''}`;
+        }
+
+        const typeColors = {
+            vtk_field: 'var(--accent-amber)',
+            computed: 'var(--accent-blue)',
+            broadcast: 'var(--accent-cyan)',
+            expression: 'var(--accent-green)',
+        };
+
+        const lines = channels.map(ch => {
+            const color = typeColors[ch.source] || 'var(--text-secondary)';
+            return `<div style="display:flex;gap:8px;padding:2px 0;">`
+                + `<span style="color:var(--text-muted);min-width:24px;text-align:right;">${ch.idx}:</span>`
+                + `<span style="color:${color};min-width:200px;">${escHtml(ch.name)}</span>`
+                + `<span style="color:var(--text-muted);font-size:11px;">(${ch.type})</span>`
+                + `</div>`;
+        });
+
+        summaryEl.innerHTML = lines.join('');
+        metaEl.textContent = `${channels.length} channels · shape: (${channels.length}, H, W)`;
+
+        // Also update the change event
+        const ioBody = document.getElementById('ai-io-body');
+        if (ioBody) ioBody.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    // ---- Helper: Add Custom Channel Row ----
+    function addCustomChannelRow() {
+        const list = document.getElementById('ai-custom-channels-list');
+        if (!list) return;
+        const rowId = 'custom-ch-' + Date.now();
+        const row = document.createElement('div');
+        row.className = 'ai-custom-channel-row';
+        row.id = rowId;
+        row.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:6px;';
+        row.innerHTML = `
+            <input class="ai-custom-ch-name" type="text" placeholder="channel_name"
+                style="width:120px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-size:12px;"
+                oninput="updateTensorSummary()">
+            <input class="ai-custom-ch-expr" type="text" placeholder="np.sqrt(field_vx**2 + field_vy**2)"
+                style="flex:1;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-size:12px;font-family:monospace;"
+                oninput="updateTensorSummary()">
+            <button style="background:none;border:none;color:var(--text-muted);cursor:pointer;padding:4px;"
+                onclick="this.parentNode.remove(); updateTensorSummary();" title="Remove">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+        `;
+        list.appendChild(row);
+        row.querySelector('.ai-custom-ch-name').focus();
+    }
+
+    // ---- Helper: Render channel cards from a registry array ----
+    function _renderChannelCards(channels, containerEl) {
+        const categoryMeta = {
+            geometry: { title: 'Geometry Channels', meta: 'coordinates · always available', color: 'blue' },
+        };
+        const grouped = {};
+        for (const ch of channels) {
+            const cat = ch.category || 'geometry';
+            if (!grouped[cat]) grouped[cat] = [];
+            grouped[cat].push(ch);
+        }
+        let html = '';
+        for (const [cat, chList] of Object.entries(grouped)) {
+            const meta = categoryMeta[cat] || { title: cat, meta: '', color: 'blue' };
+            html += `
+                <div class="stats-category-card" style="margin-top: 8px;" data-channel-group="${cat}">
+                    <div class="stats-category-header" onclick="this.parentNode.classList.toggle('collapsed')">
+                        <div class="stats-category-info">
+                            <span class="stats-category-title">${escHtml(meta.title)}</span>
+                            <span class="stats-category-meta">${chList.length} channel${chList.length !== 1 ? 's' : ''} · ${escHtml(meta.meta)}</span>
+                        </div>
+                        <svg class="stats-section-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                    </div>
+                    <div class="stats-category-body">
+                        ${chList.map(ch => {
+                            const fkey = 'spatial:' + ch.name;
+                            return `
+                            <button class="stats-col-btn" data-field-key="${escHtml(fkey)}" data-field-type="spatial" data-field-value="${ch.name}" title="${escHtml(ch.desc || '')}"
+                                onclick="_toggleIOField(this)">
+                                <span style="margin-right:4px;">${ch.icon}</span>
+                                ${escHtml(ch.label)}
+                            </button>`;
+                        }).join('')}
+                    </div>
+                </div>`;
+        }
+        // Insert before the custom expression card (or at end)
+        const customCard = containerEl.querySelector('[data-channel-group="custom-expr"]');
+        if (customCard) {
+            customCard.insertAdjacentHTML('beforebegin', html);
+        } else {
+            containerEl.insertAdjacentHTML('beforeend', html);
+        }
+        _refreshFieldStyles();
+    }
+
+    // Make helpers available in onclick handlers
+    window.updateTensorSummary = updateTensorSummary;
+    window.addCustomChannelRow = addCustomChannelRow;
 
     async function loadTrainingGpuGrid() {
         const grid = document.getElementById('ai-gpu-select-grid');
@@ -1661,7 +3437,874 @@ function renderTraining(container) {
             clearInterval(pollTimer);
             pollTimer = null;
         }
+        // Also close any open metrics modal
+        if (window._aiTrainingMetrics) {
+            window._aiTrainingMetrics.closeTrainingMetrics();
+        }
     };
+
+    // ============================================================
+    // VIEW: PREPARE DATASET — Compute derived fields & export VTK
+    // ============================================================
+    async function renderPrepareDataset(opts) {
+        if (!opts || !opts.datasetId) {
+            showToast('No dataset selected', 'error');
+            return showView('dashboard', { tab: 'datasets' });
+        }
+
+        const dsId = opts.datasetId;
+        const dsName = opts.datasetName || `Dataset #${dsId}`;
+        const sweepRoot = opts.sweepRoot || '';
+
+        container.innerHTML = '';
+        container.appendChild(styleEl);
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'page-enter';
+        wrapper.style.maxWidth = '1400px';
+        wrapper.innerHTML = `
+            <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;">
+                <div>
+                    <button class="btn btn-secondary" id="ai-prep-back" style="margin-bottom:8px;">← Back to Dashboard</button>
+                    <h1>Prepare Dataset</h1>
+                    <p style="color:var(--text-muted);margin-top:4px;">${escHtml(dsName)}</p>
+                    <p style="color:var(--text-muted);font-size:12px;margin-top:2px;font-family:monospace;">${escHtml(sweepRoot)}</p>
+                </div>
+            </div>
+
+            <!-- Sweep/DoE Parameters Summary -->
+            <div id="ai-prep-sweep-params" style="margin-top:12px;display:none;"></div>
+
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:16px;">
+                <!-- Left: Available M-Star Fields -->
+                <div class="card" style="padding:20px;">
+                    <h3 style="margin-bottom:4px;">Available Fields</h3>
+                    <p style="color:var(--text-muted);font-size:12px;margin-bottom:14px;">
+                        Discovered from M-Star output. Click <strong>Add</strong> to include in the preparation recipe.
+                    </p>
+                    <div id="ai-probe-results" style="display:flex;flex-direction:column;gap:6px;">
+                        <div style="text-align:center;padding:30px;color:var(--text-muted);">
+                            <div class="spinner" style="width:20px;height:20px;margin:0 auto 8px;"></div>
+                            Scanning output files…
+                        </div>
+                    </div>
+
+                    <!-- Synthetic fields section -->
+                    <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border-color);">
+                        <h4 style="margin-bottom:8px;font-size:12px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;">Synthetic Fields</h4>
+                        <p style="color:var(--text-muted);font-size:11px;margin-bottom:8px;">Generated grids, not from simulation data.</p>
+                        <div style="display:flex;flex-wrap:wrap;gap:6px;" id="ai-prep-synthetic-btns">
+                            <button class="btn btn-secondary" data-synth="coordinates_x" style="font-size:12px;padding:4px 10px;">+ X Coordinate</button>
+                            <button class="btn btn-secondary" data-synth="coordinates_y" style="font-size:12px;padding:4px 10px;">+ Y Coordinate</button>
+                            <button class="btn btn-secondary" data-synth="coordinates_z" style="font-size:12px;padding:4px 10px;">+ Z Coordinate</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right: Recipe + Computed -->
+                <div class="card" style="padding:20px;">
+                    <h3 style="margin-bottom:4px;">Preparation Recipe</h3>
+                    <p style="color:var(--text-muted);font-size:12px;margin-bottom:14px;">
+                        Fields that will be extracted and processed. Change the method or output name before computing.
+                    </p>
+                    <div id="ai-prep-recipe-list" style="display:flex;flex-direction:column;gap:6px;">
+                        <p style="color:var(--text-muted);font-size:13px;font-style:italic;">No fields added yet.</p>
+                    </div>
+
+                    <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border-color);display:flex;gap:8px;flex-wrap:wrap;">
+                        <button class="btn btn-primary" id="ai-prep-compute" disabled>
+                            Compute
+                        </button>
+                    </div>
+                    <div id="ai-prep-status" style="margin-top:10px;display:none;"></div>
+
+                    <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--border-color);">
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                            <h4 style="margin:0;font-size:12px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;">
+                                Already Computed
+                            </h4>
+                            <button class="btn btn-sm" id="ai-prep-delete-selected" style="display:none;font-size:11px;padding:3px 10px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#ef4444;border-radius:6px;cursor:pointer;">
+                                Delete Selected (<span id="ai-prep-delete-count">0</span>)
+                            </button>
+                        </div>
+                        <div id="ai-prep-computed">
+                            <p style="color:var(--text-muted);font-size:12px;">Loading…</p>
+                        </div>
+                    </div>
+
+                    <!-- Password Confirmation Modal -->
+                    <div id="ai-prep-delete-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:9999;align-items:center;justify-content:center;">
+                        <div style="background:var(--bg-secondary, #1e293b);border:1px solid var(--border-color);border-radius:12px;padding:24px;width:380px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,0.4);">
+                            <h3 style="margin:0 0 8px 0;font-size:16px;color:var(--text-primary);">Confirm Deletion</h3>
+                            <p id="ai-prep-delete-modal-msg" style="margin:0 0 16px 0;font-size:13px;color:var(--text-secondary);"></p>
+                            <div style="margin-bottom:16px;">
+                                <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px;">Enter your password to confirm</label>
+                                <input type="password" id="ai-prep-delete-password" placeholder="Password"
+                                    style="width:100%;padding:8px 12px;font-size:13px;background:var(--bg-tertiary, #0f172a);border:1px solid var(--border-color);border-radius:6px;color:var(--text-primary);box-sizing:border-box;">
+                                <p id="ai-prep-delete-error" style="color:#ef4444;font-size:12px;margin:6px 0 0 0;display:none;"></p>
+                            </div>
+                            <div style="display:flex;gap:8px;justify-content:flex-end;">
+                                <button id="ai-prep-delete-cancel" style="font-size:12px;padding:6px 14px;background:var(--bg-tertiary, #0f172a);border:1px solid var(--border-color);color:var(--text-primary);border-radius:6px;cursor:pointer;">Cancel</button>
+                                <button id="ai-prep-delete-confirm" style="font-size:12px;padding:6px 14px;background:#ef4444;border:1px solid #dc2626;color:white;border-radius:6px;cursor:pointer;">Delete</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+        container.appendChild(wrapper);
+
+        // Back button
+        document.getElementById('ai-prep-back').addEventListener('click', () => showView('dashboard', { tab: 'datasets' }));
+
+        // ---- State ----
+        let probeData = null;
+        let recipe = [];
+        let sweepParamInfos = [];  // Sweep/DoE parameters for the summary bar
+
+        // ---- Fetch dataset details for sweep parameters ----
+        (async () => {
+            try {
+                const ds = await aiApi.get(`/ai/datasets/${dsId}`);
+                if (!ds || ds.error) { console.warn('Sweep params: ds fetch error', ds); return; }
+
+                const sweepParams = _safeParse(ds.sweep_parameters_json) || [];
+                const casesData = _safeParse(ds.cases_json) || [];
+                const numCases = casesData.length || ds.num_cases || 0;
+
+                // Build parameter info from sweep_parameters_json
+                // Format: [{"name":"Rotation Speed UDF","values":["40.0","46.7",...]}]
+                if (Array.isArray(sweepParams)) {
+                    for (const sp of sweepParams) {
+                        const pname = typeof sp === 'string' ? sp : (sp.name || String(sp));
+                        // Use pre-computed values if available, else extract from cases
+                        let values = [];
+                        if (sp.values && Array.isArray(sp.values)) {
+                            values = sp.values;
+                        } else {
+                            for (const c of casesData) {
+                                const pv = (c.parameters || {})[pname];
+                                if (pv !== undefined) values.push(pv);
+                            }
+                        }
+                        const uniqueVals = [...new Set(values.map(v => String(v)))];
+                        const allNumeric = values.length > 0 && values.every(v => !isNaN(parseFloat(v)));
+                        const varies = uniqueVals.length > 1;
+
+                        let rangeStr = '';
+                        if (allNumeric && uniqueVals.length > 0) {
+                            const nums = uniqueVals.map(Number).sort((a,b) => a - b);
+                            rangeStr = nums.length > 1 ? `${nums[0]} → ${nums[nums.length-1]}` : `${nums[0]}`;
+                        } else if (uniqueVals.length > 0) {
+                            rangeStr = uniqueVals.length <= 5 ? uniqueVals.join(', ') : `${uniqueVals.length} values`;
+                        }
+
+                        sweepParamInfos.push({ name: pname, values: uniqueVals, rangeStr, allNumeric, varies, count: uniqueVals.length });
+                    }
+                }
+
+                // Render the sweep params bar
+                const sweepEl = document.getElementById('ai-prep-sweep-params');
+                if (!sweepEl) { console.warn('Sweep params: DOM element not found'); return; }
+
+                if (sweepParamInfos.length > 0) {
+                    sweepEl.style.display = '';
+                    sweepEl.innerHTML = `
+                        <div style="background:var(--bg-secondary, #1e293b);border:1px solid var(--border-color);border-radius:8px;padding:14px 16px;">
+                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue, #60a5fa)" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M4.93 4.93l4.24 4.24m5.66 5.66l4.24 4.24M19.07 4.93l-4.24 4.24m-5.66 5.66l-4.24 4.24M1 12h4m14 0h4M12 1v4m0 14v4"/></svg>
+                                <span style="font-size:12px;font-weight:600;color:var(--text-primary);">
+                                    Sweep / DoE Parameters
+                                </span>
+                                <span style="font-size:11px;color:var(--text-muted);margin-left:auto;">${numCases} cases</span>
+                            </div>
+                            <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                                <thead>
+                                    <tr style="border-bottom:1px solid var(--border-color);">
+                                        <th style="text-align:left;padding:4px 8px;font-weight:500;color:var(--text-secondary);font-size:11px;">Parameter</th>
+                                        <th style="text-align:left;padding:4px 8px;font-weight:500;color:var(--text-secondary);font-size:11px;">Range</th>
+                                        <th style="text-align:left;padding:4px 8px;font-weight:500;color:var(--text-secondary);font-size:11px;">Values</th>
+                                        <th style="text-align:center;padding:4px 8px;font-weight:500;color:var(--text-secondary);font-size:11px;">Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${sweepParamInfos.map(p => {
+                                        const statusBadge = p.varies
+                                            ? '<span style="display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;background:rgba(34,197,94,0.15);color:#4ade80;">varies</span>'
+                                            : '<span style="display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;background:rgba(250,204,21,0.15);color:#facc15;">constant</span>';
+                                        const valuesStr = p.values.length <= 12
+                                            ? p.values.join(', ')
+                                            : p.values.slice(0, 10).join(', ') + ` … (+${p.values.length - 10})`;
+                                        return `<tr style="border-bottom:1px solid rgba(255,255,255,0.03);">
+                                            <td style="padding:5px 8px;font-weight:500;color:var(--text-primary);">${escHtml(p.name)}</td>
+                                            <td style="padding:5px 8px;color:var(--accent-blue, #60a5fa);font-family:monospace;">${escHtml(p.rangeStr)}</td>
+                                            <td style="padding:5px 8px;color:var(--text-muted);font-family:monospace;font-size:11px;">${escHtml(valuesStr)}</td>
+                                            <td style="padding:5px 8px;text-align:center;">${statusBadge}</td>
+                                        </tr>`;
+                                    }).join('')}
+                                </tbody>
+                            </table>
+                        </div>`;
+                } else {
+                    sweepEl.style.display = 'none';
+                }
+            } catch (e) {
+                console.warn('Failed to load sweep params:', e);
+            }
+        })();
+
+        // All available computation methods — must match prepare.py's _compute_field dispatch
+        const METHODS = {
+            time_average:       { label: 'Time Average',       desc: 'Arithmetic mean of field values across output files. "Last N" uses the tail end; "All Files" uses every output for a cumulative mean. Vectors are averaged component-wise.',  for: 'source' },
+            solver_average:     { label: 'Solver Average',     desc: 'M-Star solver-computed running mean (Mean Trim). Averages over every solver substep, more accurate than time average.', for: 'source' },
+            identity:           { label: 'Last Timestep',      desc: 'Raw field value from the final output file. No averaging.',                                      for: 'source' },
+            binary_mask:        { label: 'Binary Mask',        desc: 'Applies a threshold to a scalar field to produce a 0/1 mask (e.g., Volume Fraction > 0.01 → fluid mask).', for: 'source_scalar' },
+            edt:                { label: 'Distance (EDT)',     desc: 'Euclidean distance transform from a binary mask boundary. Computes how far each cell is from the nearest wall. Requires a mask field as input.', for: 'source_scalar' },
+            sdf:                { label: 'Signed Distance (SDF)', desc: 'Signed distance function: positive in fluid, negative in solid. Smoother than binary masks. Uses EDT internally with sign flip at the boundary.', for: 'source_scalar' },
+            vorticity:          { label: 'Vorticity',          desc: 'Curl of velocity (|∂v/∂x − ∂u/∂y|). Measures local rotation rate. Requires a vector velocity source field.', for: 'source_vector' },
+            coordinates:        { label: 'Normalize [-1, 1]',  desc: 'Generates a coordinate grid with values normalized from -1 to 1 across the grid dimension. Based on pixel index, not physical position.', for: 'synthetic' },
+            custom_expression:  { label: 'Custom Expression',  desc: 'User-defined numpy expression. Variables: field_<name> (loaded fields), x/y/z (coordinate grids), mask, np. Example: np.sqrt(field_vx**2 + field_vy**2)', for: 'source' },
+        };
+
+        // ---- Probe the dataset ----
+        async function runProbe() {
+            try {
+                const res = await aiApi.post(`/ai/datasets/${dsId}/probe`, {});
+                probeData = res?.probe || null;
+                renderProbeResults();
+            } catch (e) {
+                const el = document.getElementById('ai-probe-results');
+                if (el) el.innerHTML = `<div style="padding:12px;color:var(--accent-red);font-size:13px;">Probe failed: ${escHtml(e.message || 'Unknown error')}</div>`;
+            }
+        }
+
+        // ---- Render discovered fields (deduplicated across PVDs) ----
+        function renderProbeResults() {
+            const el = document.getElementById('ai-probe-results');
+            if (!el || !probeData) return;
+
+            const sources = probeData.pvd_sources || [];
+            const fluidSources = sources.filter(s => s.type === 'fluid_slice' || s.type === 'fluid_volume');
+
+            if (fluidSources.length === 0) {
+                el.innerHTML = '<p style="color:var(--text-muted);font-size:13px;">No fluid fields found in the output.</p>';
+                return;
+            }
+
+            // Deduplicate fields across PVDs — same field name appears in multiple PVDs
+            // Build a unique field list with which PVDs contain them
+            const fieldMap = new Map(); // fieldName -> { field, pvds: [{name, type, timesteps, hasSolverAvg}] }
+            for (const src of fluidSources) {
+                const hasSolverAvg = src.solver_averages?.has_solver_averages || false;
+                for (const field of (src.fields || [])) {
+                    if (!fieldMap.has(field.name)) {
+                        fieldMap.set(field.name, { field, pvds: [] });
+                    }
+                    fieldMap.get(field.name).pvds.push({
+                        name: src.pvd_name,
+                        type: src.type,
+                        timesteps: src.timesteps,
+                        hasSolverAvg,
+                        solverMapping: src.solver_averages?.field_mapping || {},
+                    });
+                }
+            }
+
+            let html = '';
+
+            // Show PVD summary at top
+            html += `<div style="margin-bottom:12px;padding:8px 10px;border-radius:6px;background:var(--bg-tertiary);font-size:11px;color:var(--text-muted);">
+                <strong style="color:var(--text-secondary);">Sources:</strong> `;
+            html += fluidSources.map(s => {
+                const label = s.type === 'fluid_volume' ? 'Volume' : s.pvd_name.replace('.pvd','');
+                return `<code style="padding:0 4px;">${escHtml(label)}</code> (${s.timesteps} ts)`;
+            }).join(' · ');
+            html += `</div>`;
+
+            // Render each unique field
+            for (const [fieldName, entry] of fieldMap) {
+                const { field, pvds } = entry;
+                const compLabel = field.components > 1 ? `${field.components}-component` : 'scalar';
+                const anySolverAvg = pvds.some(p => p.hasSolverAvg && p.solverMapping[fieldName]);
+
+                // Check if already added to recipe (any PVD)
+                const alreadyAdded = recipe.some(r => r.source_field === fieldName);
+
+                // Default PVD: pick the first slice (more common for 2D training)
+                const defaultPvd = pvds.find(p => p.type === 'fluid_slice') || pvds[0];
+                const defaultMethod = (anySolverAvg && defaultPvd.solverMapping?.[fieldName]) ? 'solver_average' : 'time_average';
+
+                html += `<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:6px;border:1px solid var(--border-color);margin-bottom:4px;background:var(--bg-secondary);${alreadyAdded ? 'opacity:0.4;' : ''}">
+                    <button class="btn btn-secondary ai-add-field-btn" data-field="${escHtml(fieldName)}" data-pvd="${escHtml(defaultPvd.name)}" data-method="${defaultMethod}" data-components="${field.components}" data-pvd-options='${escHtml(JSON.stringify(pvds.map(p => p.name)))}'
+                        ${alreadyAdded ? 'disabled' : ''} style="font-size:11px;padding:3px 10px;min-width:42px;${alreadyAdded ? 'cursor:default;' : ''}">
+                        ${alreadyAdded ? 'Added' : 'Add'}
+                    </button>
+                    <div style="flex:1;min-width:0;">
+                        <div style="font-size:13px;font-weight:500;">${escHtml(fieldName)}</div>
+                        <div style="font-size:10px;color:var(--text-muted);">${compLabel}${anySolverAvg ? ' · solver averages available' : ''}</div>
+                    </div>
+                </div>`;
+            }
+
+            // Other PVDs (collapsed)
+            const otherSources = sources.filter(s => s.type !== 'fluid_slice' && s.type !== 'fluid_volume');
+            if (otherSources.length > 0) {
+                html += `<details style="margin-top:10px;"><summary style="cursor:pointer;font-size:12px;color:var(--text-muted);user-select:none;">Other PVDs (${otherSources.length})</summary>
+                <div style="margin-top:6px;">`;
+                for (const src of otherSources) {
+                    html += `<div style="display:flex;align-items:center;gap:6px;padding:3px 0;">
+                        <code style="font-size:11px;background:var(--bg-tertiary);padding:1px 6px;border-radius:4px;">${escHtml(src.pvd_name)}</code>
+                        <span style="font-size:10px;color:var(--text-muted);">${src.type} · ${src.timesteps} ts · ${(src.fields||[]).length} fields</span>
+                    </div>`;
+                }
+                html += `</div></details>`;
+            }
+
+            el.innerHTML = html;
+
+            // Wire "Add" buttons
+            el.querySelectorAll('.ai-add-field-btn:not([disabled])').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const fieldName = btn.dataset.field;
+                    const pvdName = btn.dataset.pvd;
+                    const defaultMethod = btn.dataset.method;
+                    const components = parseInt(btn.dataset.components, 10) || 1;
+                    let pvdOptions = [];
+                    try { pvdOptions = JSON.parse(btn.dataset.pvdOptions || '[]'); } catch {}
+
+                    let shortName = fieldName
+                        .replace(/\s*\([^)]*\)\s*/g, '')
+                        .replace(/\s+/g, '_')
+                        .toLowerCase();
+
+                    recipe.push({
+                        name: shortName,
+                        display_name: fieldName,
+                        method: defaultMethod,
+                        source_field: fieldName,
+                        source_pvd: pvdName,
+                        pvd_options: pvdOptions,
+                        components: components,
+                        is_synthetic: false,
+                        params: defaultMethod === 'binary_mask'
+                            ? { operator: 'gt', threshold: 0.5 }
+                            : defaultMethod === 'time_average'
+                            ? { n_files: 10, averaging_mode: 'last_n' }
+                            : {},
+                    });
+
+                    renderRecipe();
+                    renderProbeResults();
+                });
+            });
+        }
+
+        // ---- Render the recipe list (right panel) ----
+        function renderRecipe() {
+            const el = document.getElementById('ai-prep-recipe-list');
+            if (!el) return;
+
+            if (recipe.length === 0) {
+                el.innerHTML = '<p style="color:var(--text-muted);font-size:13px;font-style:italic;">No fields added yet.</p>';
+                document.getElementById('ai-prep-compute').disabled = true;
+                return;
+            }
+
+            document.getElementById('ai-prep-compute').disabled = false;
+
+            el.innerHTML = recipe.map((entry, idx) => {
+                // Build method dropdown — filter based on entry type and method.for tag
+                const isSource = !!entry.source_field;
+                const isScalar = entry.components <= 1;
+                const isVector = entry.components > 1;
+
+                const methodOptions = Object.entries(METHODS).map(([key, m]) => {
+                    const mFor = m.for || 'source';
+
+                    // Synthetic methods only for non-source entries
+                    if (mFor === 'synthetic' && isSource) return '';
+                    if (mFor !== 'synthetic' && !isSource) return '';
+
+                    // Scalar-only methods
+                    if (mFor === 'source_scalar' && isVector) return '';
+                    // Vector-only methods
+                    if (mFor === 'source_vector' && isScalar) return '';
+
+                    // solver_average only if PVD has solver averages
+                    if (key === 'solver_average') {
+                        const src = (probeData?.pvd_sources || []).find(s => s.pvd_name === entry.source_pvd);
+                        if (!src?.solver_averages?.has_solver_averages) return '';
+                    }
+
+                    const selected = key === entry.method ? 'selected' : '';
+                    return `<option value="${key}" ${selected}>${escHtml(m.label)}</option>`;
+                }).filter(Boolean).join('');
+
+                const methodInfo = METHODS[entry.method] || {};
+
+                // Source line — only for fields that have a source
+                let sourceLine = '';
+                if (entry.source_field) {
+                    let pvdSelector = '';
+                    if (entry.pvd_options && entry.pvd_options.length > 1) {
+                        const pvdOpts = entry.pvd_options.map(p => {
+                            const sel = p === entry.source_pvd ? 'selected' : '';
+                            const label = p.replace('.pvd', '');
+                            return `<option value="${escHtml(p)}" ${sel}>${escHtml(label)}</option>`;
+                        }).join('');
+                        pvdSelector = `<select data-idx="${idx}" data-role="pvd" style="font-size:10px;padding:1px 4px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:4px;color:var(--text-primary);">${pvdOpts}</select>`;
+                    } else {
+                        const pvdLabel = (entry.source_pvd || '').replace('.pvd', '');
+                        pvdSelector = `<code style="background:var(--bg-tertiary);padding:0 4px;border-radius:3px;font-size:10px;">${escHtml(pvdLabel)}</code>`;
+                    }
+                    sourceLine = `<div style="font-size:10px;color:var(--text-muted);margin-bottom:4px;display:flex;align-items:center;gap:4px;">
+                        Input: <code style="background:var(--bg-tertiary);padding:0 4px;border-radius:3px;">${escHtml(entry.source_field)}</code>
+                        from ${pvdSelector}
+                    </div>`;
+                }
+
+                // Binary mask params
+                let extraParams = '';
+                if (entry.method === 'binary_mask') {
+                    const thresh = entry.params?.threshold ?? 0.5;
+                    const op = entry.params?.operator ?? 'gt';
+                    extraParams = `
+                        <div style="display:flex;gap:4px;align-items:center;margin-top:4px;">
+                            <span style="font-size:10px;color:var(--text-muted);">Threshold:</span>
+                            <select data-idx="${idx}" data-param="operator" style="font-size:11px;padding:1px 4px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:4px;color:var(--text-primary);">
+                                <option value="gt" ${op==='gt'?'selected':''}>&gt;</option>
+                                <option value="lt" ${op==='lt'?'selected':''}>&lt;</option>
+                                <option value="gte" ${op==='gte'?'selected':''}>≥</option>
+                                <option value="lte" ${op==='lte'?'selected':''}>≤</option>
+                            </select>
+                            <input type="number" step="any" value="${thresh}" data-idx="${idx}" data-param="threshold"
+                                style="width:60px;font-size:11px;padding:1px 4px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:4px;color:var(--text-primary);">
+                        </div>`;
+                }
+
+                // Custom expression params
+                if (entry.method === 'custom_expression') {
+                    const expr = entry.params?.expression || '';
+                    extraParams += `
+                        <div style="margin-top:4px;display:flex;align-items:center;gap:6px;">
+                            <span style="font-size:10px;color:var(--text-muted);">Expr:</span>
+                            <input type="text" value="${escHtml(expr)}" data-idx="${idx}" data-param="expression"
+                                placeholder="np.sqrt(field_vx**2 + field_vy**2)"
+                                style="flex:1;font-size:11px;padding:2px 6px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:4px;color:var(--text-primary);font-family:monospace;">
+                        </div>`;
+                }
+
+                // Time average params
+                if (entry.method === 'time_average') {
+                    const avgMode = entry.params?.averaging_mode ?? 'last_n';
+                    const nFiles = entry.params?.n_files ?? 10;
+                    extraParams += `
+                        <div style="display:flex;gap:6px;align-items:center;margin-top:4px;">
+                            <span style="font-size:10px;color:var(--text-muted);">Mode</span>
+                            <select data-idx="${idx}" data-param="averaging_mode"
+                                style="font-size:11px;padding:1px 4px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:4px;color:var(--text-primary);">
+                                <option value="last_n" ${avgMode === 'last_n' ? 'selected' : ''}>Last N files</option>
+                                <option value="all" ${avgMode === 'all' ? 'selected' : ''}>All files (cumulative)</option>
+                            </select>
+                        </div>`;
+                    if (avgMode === 'last_n') {
+                        extraParams += `
+                        <div style="display:flex;gap:6px;align-items:center;margin-top:4px;">
+                            <span style="font-size:10px;color:var(--text-muted);">Average last</span>
+                            <input type="number" min="1" step="1" value="${nFiles}" data-idx="${idx}" data-param="n_files"
+                                style="width:50px;font-size:11px;padding:1px 4px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:4px;color:var(--text-primary);">
+                            <span style="font-size:10px;color:var(--text-muted);">output files</span>
+                        </div>`;
+                    }
+                }
+
+                // EDT / SDF params — need to know which mask to compute distance from
+                if (entry.method === 'edt' || entry.method === 'sdf') {
+                    const srcMask = entry.params?.source_mask || 'fluid_mask';
+                    // Find candidate mask fields from the recipe
+                    const maskCandidates = recipe
+                        .filter(r => r.method === 'binary_mask')
+                        .map(r => r.name);
+                    let maskSelector;
+                    if (maskCandidates.length > 0) {
+                        const opts = maskCandidates.map(m => {
+                            const sel = m === srcMask ? 'selected' : '';
+                            return `<option value="${escHtml(m)}" ${sel}>${escHtml(m)}</option>`;
+                        }).join('');
+                        maskSelector = `<select data-idx="${idx}" data-param="source_mask" style="font-size:11px;padding:1px 4px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:4px;color:var(--text-primary);">${opts}</select>`;
+                    } else {
+                        maskSelector = `<input type="text" value="${escHtml(srcMask)}" data-idx="${idx}" data-param="source_mask" placeholder="fluid_mask"
+                            style="width:100px;font-size:11px;padding:1px 4px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:4px;color:var(--text-primary);">`;
+                    }
+                    extraParams += `
+                        <div style="display:flex;gap:6px;align-items:center;margin-top:4px;">
+                            <span style="font-size:10px;color:var(--text-muted);">From mask:</span>
+                            ${maskSelector}
+                        </div>`;
+                }
+
+                return `
+                <div style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border-radius:8px;border:1px solid var(--border-color);background:var(--bg-secondary);">
+                    <div style="flex:1;min-width:0;">
+                        <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;">
+                            <input type="text" value="${escHtml(entry.name)}" data-idx="${idx}" data-role="name"
+                                style="font-size:12px;font-weight:600;background:transparent;border:1px solid transparent;border-radius:4px;padding:1px 4px;color:var(--text-primary);width:100%;max-width:220px;"
+                                title="Output field name">
+                        </div>
+                        ${sourceLine}
+                        <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;">
+                            <span style="font-size:10px;color:var(--text-muted);">Method:</span>
+                            <select data-idx="${idx}" data-role="method"
+                                style="font-size:11px;padding:2px 6px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:4px;color:var(--text-primary);">
+                                ${methodOptions}
+                            </select>
+                        </div>
+                        <div style="font-size:10px;color:var(--text-muted);padding:3px 6px;background:var(--bg-tertiary);border-radius:4px;line-height:1.4;">
+                            ${escHtml(methodInfo.desc || '')}
+                        </div>
+                        ${extraParams}
+                    </div>
+                    <button class="btn-icon ai-recipe-remove" data-idx="${idx}" title="Remove" style="color:var(--accent-red);font-size:14px;padding:2px 6px;cursor:pointer;background:none;border:none;">✕</button>
+                </div>`;
+            }).join('');
+
+            // Wire name editing
+            el.querySelectorAll('input[data-role="name"]').forEach(input => {
+                input.addEventListener('change', e => {
+                    const idx = parseInt(e.target.dataset.idx, 10);
+                    if (recipe[idx]) recipe[idx].name = e.target.value.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+                    renderRecipe();
+                });
+            });
+
+            // Wire method changes
+            el.querySelectorAll('select[data-role="method"]').forEach(sel => {
+                sel.addEventListener('change', e => {
+                    const idx = parseInt(e.target.dataset.idx, 10);
+                    if (!recipe[idx]) return;
+                    const newMethod = e.target.value;
+                    recipe[idx].method = newMethod;
+                    // Initialize default params for each method
+                    if (newMethod === 'binary_mask') {
+                        recipe[idx].params = { operator: 'gt', threshold: 0.5 };
+                    } else if (newMethod === 'time_average') {
+                        recipe[idx].params = { n_files: 10, averaging_mode: 'last_n' };
+                    } else if (newMethod === 'custom_expression') {
+                        recipe[idx].params = { expression: '' };
+                    } else if (newMethod === 'edt' || newMethod === 'sdf') {
+                        recipe[idx].params = { source_mask: 'fluid_mask' };
+                    } else {
+                        recipe[idx].params = {};
+                    }
+                    renderRecipe();
+                });
+            });
+
+            // Wire PVD source changes
+            el.querySelectorAll('select[data-role="pvd"]').forEach(sel => {
+                sel.addEventListener('change', e => {
+                    const idx = parseInt(e.target.dataset.idx, 10);
+                    if (recipe[idx]) recipe[idx].source_pvd = e.target.value;
+                });
+            });
+
+            // Wire param changes
+            el.querySelectorAll('select[data-param], input[data-param]').forEach(ctrl => {
+                ctrl.addEventListener('change', e => {
+                    const idx = parseInt(e.target.dataset.idx, 10);
+                    const param = e.target.dataset.param;
+                    if (!recipe[idx]) return;
+                    if (!recipe[idx].params) recipe[idx].params = {};
+                    const numericParams = ['threshold', 'n_files'];
+                    if (numericParams.includes(param)) {
+                        recipe[idx].params[param] = param === 'n_files' ? parseInt(e.target.value, 10) : parseFloat(e.target.value);
+                    } else {
+                        recipe[idx].params[param] = e.target.value;
+                    }
+                    // Re-render if averaging_mode changed (controls n_files visibility)
+                    if (param === 'averaging_mode') renderRecipe();
+                });
+            });
+
+            // Wire remove buttons
+            el.querySelectorAll('.ai-recipe-remove').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const idx = parseInt(btn.dataset.idx, 10);
+                    recipe.splice(idx, 1);
+                    renderRecipe();
+                    renderProbeResults();
+                });
+            });
+        }
+
+        // ---- Synthetic field buttons ----
+        document.getElementById('ai-prep-synthetic-btns').querySelectorAll('button').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const synth = btn.dataset.synth;
+                if (!synth) return;
+
+                if (synth.startsWith('coordinates_')) {
+                    const axis = synth.split('_')[1];
+                    if (recipe.some(r => r.name === `coord_${axis}`)) {
+                        showToast(`${axis.toUpperCase()} coordinate already in recipe`, 'info');
+                        return;
+                    }
+                    recipe.push({
+                        name: `coord_${axis}`,
+                        display_name: `${axis.toUpperCase()} Coordinate Grid [-1, 1]`,
+                        method: 'coordinates',
+                        source_field: null,
+                        source_pvd: null,
+                        components: 1,
+                        is_synthetic: true,
+                        params: { axis },
+                    });
+                }
+                renderRecipe();
+            });
+        });
+
+        // ---- Load existing computed fields ----
+        let selectedForDelete = new Set();
+
+        function updateDeleteButton() {
+            const btn = document.getElementById('ai-prep-delete-selected');
+            const countEl = document.getElementById('ai-prep-delete-count');
+            if (!btn) return;
+            if (selectedForDelete.size > 0) {
+                btn.style.display = 'inline-block';
+                countEl.textContent = selectedForDelete.size;
+            } else {
+                btn.style.display = 'none';
+            }
+        }
+
+        async function loadComputedFields() {
+            try {
+                const res = await aiApi.get(`/ai/datasets/${dsId}/derived-fields`);
+                const computedEl = document.getElementById('ai-prep-computed');
+                if (!computedEl) return;
+
+                const fields = res?.fields || [];
+                selectedForDelete.clear();
+                updateDeleteButton();
+
+                if (fields.length === 0) {
+                    computedEl.innerHTML = '<p style="color:var(--text-muted);font-size:12px;">No fields computed yet.</p>';
+                    return;
+                }
+
+                computedEl.innerHTML = fields.map(f => {
+                    const r = f.recipe || {};
+                    const displayName = r.display_name || f.field_name;
+                    const method = r.method || '?';
+                    const methodLabel = METHODS[method]?.label || method;
+                    const fieldId = f.field_name;
+                    // Provenance: show which source field & PVD this was derived from
+                    const source = r.source || {};
+                    const sourceField = source.source_field || source.field_name || '';
+                    const sourcePvd = source.source_pvd || source.pvd_name || '';
+                    let provenanceParts = [];
+                    provenanceParts.push(`${f.case_count} cases`);
+                    provenanceParts.push(escHtml(methodLabel));
+                    if (sourceField) provenanceParts.push(`of ${escHtml(sourceField)}`);
+                    if (sourcePvd && sourcePvd !== 'auto' && sourcePvd !== 'unknown') provenanceParts.push(`from ${escHtml(sourcePvd)}`);
+                    const provenanceStr = provenanceParts.join(' · ');
+                    return `
+                        <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:6px;background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.12);margin-bottom:4px;cursor:pointer;" data-delete-field="${escHtml(fieldId)}">
+                            <input type="checkbox" class="ai-delete-check" data-field="${escHtml(fieldId)}"
+                                style="accent-color:#ef4444;cursor:pointer;flex-shrink:0;">
+                            <span style="color:#10b981;font-size:12px;">●</span>
+                            <div style="flex:1;min-width:0;">
+                                <div style="font-size:12px;font-weight:500;">${escHtml(displayName)}</div>
+                                <div style="font-size:10px;color:var(--text-muted);">${provenanceStr}</div>
+                            </div>
+                        </div>`;
+                }).join('');
+
+                // Wire checkboxes
+                computedEl.querySelectorAll('.ai-delete-check').forEach(cb => {
+                    cb.addEventListener('change', e => {
+                        e.stopPropagation();
+                        const field = cb.dataset.field;
+                        if (cb.checked) {
+                            selectedForDelete.add(field);
+                        } else {
+                            selectedForDelete.delete(field);
+                        }
+                        updateDeleteButton();
+                    });
+                });
+
+                // Click row to toggle checkbox
+                computedEl.querySelectorAll('[data-delete-field]').forEach(row => {
+                    row.addEventListener('click', e => {
+                        if (e.target.tagName === 'INPUT') return;
+                        const cb = row.querySelector('.ai-delete-check');
+                        if (cb) {
+                            cb.checked = !cb.checked;
+                            cb.dispatchEvent(new Event('change'));
+                        }
+                    });
+                });
+            } catch (e) {
+                console.warn('[Prepare] Failed to load derived fields:', e);
+            }
+        }
+        // ---- Delete modal wiring ----
+        document.getElementById('ai-prep-delete-selected').addEventListener('click', () => {
+            if (selectedForDelete.size === 0) return;
+            const modal = document.getElementById('ai-prep-delete-modal');
+            const msg = document.getElementById('ai-prep-delete-modal-msg');
+            const errEl = document.getElementById('ai-prep-delete-error');
+            const pwdInput = document.getElementById('ai-prep-delete-password');
+
+            msg.textContent = `This will permanently delete ${selectedForDelete.size} computed field${selectedForDelete.size > 1 ? 's' : ''} and all cached data for every case. This cannot be undone.`;
+            errEl.style.display = 'none';
+            pwdInput.value = '';
+            modal.style.display = 'flex';
+            setTimeout(() => pwdInput.focus(), 100);
+        });
+
+        document.getElementById('ai-prep-delete-cancel').addEventListener('click', () => {
+            document.getElementById('ai-prep-delete-modal').style.display = 'none';
+        });
+
+        // Click outside modal to close
+        document.getElementById('ai-prep-delete-modal').addEventListener('click', e => {
+            if (e.target === e.currentTarget) {
+                e.currentTarget.style.display = 'none';
+            }
+        });
+
+        // Enter key in password field triggers confirm
+        document.getElementById('ai-prep-delete-password').addEventListener('keydown', e => {
+            if (e.key === 'Enter') {
+                document.getElementById('ai-prep-delete-confirm').click();
+            }
+        });
+
+        document.getElementById('ai-prep-delete-confirm').addEventListener('click', async () => {
+            const password = document.getElementById('ai-prep-delete-password').value;
+            const errEl = document.getElementById('ai-prep-delete-error');
+            const confirmBtn = document.getElementById('ai-prep-delete-confirm');
+
+            if (!password) {
+                errEl.textContent = 'Password is required';
+                errEl.style.display = 'block';
+                return;
+            }
+
+            confirmBtn.disabled = true;
+            confirmBtn.textContent = 'Deleting…';
+            errEl.style.display = 'none';
+
+            try {
+                const res = await aiApi.post(`/ai/field-ops/delete/${dsId}`, {
+                    field_names: Array.from(selectedForDelete),
+                    password: password,
+                });
+
+                if (res?.error) {
+                    errEl.textContent = res.error;
+                    errEl.style.display = 'block';
+                    return;
+                }
+
+                // Success — close modal and refresh
+                document.getElementById('ai-prep-delete-modal').style.display = 'none';
+                selectedForDelete.clear();
+                updateDeleteButton();
+                loadComputedFields();
+
+                if (res?.deleted_count > 0) {
+                    console.log(`[Prepare] Deleted ${res.deleted_count} field(s)`);
+                }
+                if (res?.errors?.length > 0) {
+                    console.warn('[Prepare] Some deletions failed:', res.errors);
+                }
+            } catch (e) {
+                errEl.textContent = e.message || 'Delete failed';
+                errEl.style.display = 'block';
+            } finally {
+                confirmBtn.disabled = false;
+                confirmBtn.textContent = 'Delete';
+            }
+        });
+
+        // ---- Compute button ----
+        document.getElementById('ai-prep-compute').addEventListener('click', async () => {
+            if (recipe.length === 0) return;
+
+            const payload = {
+                fields: recipe.map(entry => {
+                    const f = {
+                        name: entry.name,
+                        display_name: entry.display_name,
+                        method: entry.method,
+                    };
+                    if (entry.source_field) f.source_field = entry.source_field;
+                    if (entry.source_pvd) f.source_pvd = entry.source_pvd;
+                    if (entry.params && Object.keys(entry.params).length > 0) f.params = entry.params;
+                    return f;
+                }),
+            };
+
+            const statusEl = document.getElementById('ai-prep-status');
+            statusEl.style.display = 'block';
+            statusEl.innerHTML = `
+                <div style="display:flex;align-items:center;gap:8px;padding:10px;border-radius:8px;background:rgba(6,182,212,0.08);border:1px solid rgba(6,182,212,0.2);">
+                    <div class="spinner" style="width:14px;height:14px;"></div>
+                    <span style="color:var(--accent-cyan);font-size:12px;">Computing derived fields… This may take a few minutes.</span>
+                </div>`;
+
+            const computeBtn = document.getElementById('ai-prep-compute');
+            computeBtn.disabled = true;
+            computeBtn.textContent = 'Computing…';
+
+            try {
+                const res = await aiApi.post(`/ai/datasets/${dsId}/prepare`, payload);
+                if (res?.error) {
+                    statusEl.innerHTML = `<div style="padding:10px;border-radius:8px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);color:var(--accent-red);font-size:12px;">Error: ${escHtml(res.error)}</div>`;
+                    computeBtn.disabled = false;
+                    computeBtn.textContent = 'Compute';
+                    return;
+                }
+
+                const pollPrepare = setInterval(async () => {
+                    try {
+                        const dsRes = await aiApi.get(`/ai/datasets/${dsId}`);
+                        const ds = dsRes?.dataset || dsRes;
+                        if (!ds) return;
+
+                        if (ds.status === 'prepared') {
+                            clearInterval(pollPrepare);
+                            statusEl.innerHTML = `
+                                <div style="padding:10px;border-radius:8px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);color:#10b981;font-size:12px;">
+                                    Done. Fields are ready and viewable in the PVD Viewer.
+                                </div>`;
+                            computeBtn.disabled = false;
+                            computeBtn.textContent = 'Compute';
+                            loadComputedFields();
+                        } else if (ds.status === 'error') {
+                            clearInterval(pollPrepare);
+                            statusEl.innerHTML = `<div style="padding:10px;border-radius:8px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);color:var(--accent-red);font-size:12px;">Preparation failed.</div>`;
+                            computeBtn.disabled = false;
+                            computeBtn.textContent = 'Compute';
+                        }
+                    } catch { /* ignore poll errors */ }
+                }, 3000);
+            } catch (e) {
+                statusEl.innerHTML = `<div style="padding:10px;border-radius:8px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);color:var(--accent-red);font-size:12px;">Error: ${escHtml(e.message || 'Unknown')}</div>`;
+                computeBtn.disabled = false;
+                computeBtn.textContent = 'Compute';
+            }
+        });
+
+        // ---- Initialize ----
+        runProbe();
+        loadComputedFields();
+    }
 
     // ---- Initial render ----
     showView('dashboard');

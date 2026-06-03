@@ -380,9 +380,12 @@ def export_for_queue(msb_path, sweep_index, sweep_root_dir):
             export_errors = target_sweep.Export(sweep_root_dir)
             mstar.CheckInLicense()
 
-        # Collect exported case info
+        # Collect exported case info + populate per-case parameters
+        # Build per-case parameter mapping from sweep_properties
+        # sweep_properties = [{name: "Prop Name", values: ["40.0", "46.7", ...]}, ...]
+        # Each property has one value per case (same order as case_names)
         cases = []
-        for case_name in case_names:
+        for case_idx, case_name in enumerate(case_names):
             case_dir = os.path.join(sweep_root_dir, case_name)
             msb_file = None
             if os.path.isdir(case_dir):
@@ -390,12 +393,63 @@ def export_for_queue(msb_path, sweep_index, sweep_root_dir):
                     if f.lower().endswith(".msb"):
                         msb_file = os.path.join(case_dir, f)
                         break
+
+            # Build parameters dict for this case
+            case_params = {}
+            for prop in sweep_properties:
+                pname = prop["name"]
+                pvals = prop.get("values", [])
+                if case_idx < len(pvals):
+                    # Try to convert to numeric
+                    raw = pvals[case_idx]
+                    try:
+                        case_params[pname] = float(raw) if '.' in str(raw) else int(raw)
+                    except (ValueError, TypeError):
+                        case_params[pname] = raw
+
             cases.append({
                 "name": case_name,
                 "directory": case_dir,
                 "msb_file": msb_file,
                 "exists": os.path.isdir(case_dir),
+                "parameters": case_params,
             })
+
+        # Try to improve parameter names by reading sweep.xml
+        # sweep.xml <Parameter> elements have PropertyDisplayName which is
+        # more descriptive than prop.GetName() (which often returns "Sweep Property")
+        sweep_xml_path = os.path.join(sweep_root_dir, "sweep.xml")
+        if os.path.isfile(sweep_xml_path):
+            try:
+                import xml.etree.ElementTree as ET
+                tree = ET.parse(sweep_xml_path)
+                root = tree.getroot()
+                first_case = root.find("Case")
+                if first_case is not None:
+                    xml_params = []
+                    for param_elem in first_case.findall("Parameter"):
+                        display = param_elem.get("PropertyDisplayName", "")
+                        obj = param_elem.get("ObjectName", "")
+                        prop_name = param_elem.get("PropertyName", "")
+                        if display:
+                            xml_params.append(display)
+                        elif obj and prop_name:
+                            xml_params.append(f"{obj}.{prop_name}")
+                        elif prop_name:
+                            xml_params.append(prop_name)
+                    # If we found better names, remap sweep_properties and case parameters
+                    if xml_params and len(xml_params) == len(sweep_properties):
+                        old_names = [p["name"] for p in sweep_properties]
+                        for i, new_name in enumerate(xml_params):
+                            old_name = old_names[i]
+                            if new_name != old_name:
+                                sweep_properties[i]["name"] = new_name
+                                # Update all case parameters
+                                for c in cases:
+                                    if old_name in c["parameters"]:
+                                        c["parameters"][new_name] = c["parameters"].pop(old_name)
+            except Exception:
+                pass  # sweep.xml parsing is best-effort
 
         # Build and write the sweep manifest
         manifest = {

@@ -507,7 +507,7 @@ pub fn build_mstar_ai_command(
     } else {
         let python_exec = &config.python_executable;
         let mut cmd = Command::new(python_exec);
-        cmd.arg("-m").arg("mstar_ai.cli").arg(subcommand);
+        cmd.arg("-u").arg("-m").arg("mstar_ai.cli").arg(subcommand);
 
         for (key, value) in args {
             cmd.arg(key).arg(value);
@@ -571,7 +571,10 @@ pub fn spawn_training_process(
     cmd.stdout(Stdio::from(log_file))
        .stderr(Stdio::from(log_stderr))
        .stdin(Stdio::null())
-       .env("PYTHONPATH", &pythonpath);
+       .env("PYTHONPATH", &pythonpath)
+       .env("PYTHONUNBUFFERED", "1")
+       .env("PYTHONDONTWRITEBYTECODE", "1")
+       .env("WARP_LOG_LEVEL", "error");
 
     // CRITICAL: Restrict training to only the user-selected GPUs.
     // Without this, PyTorch/PhysicsNeMo will see ALL GPUs and potentially

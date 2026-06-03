@@ -1024,14 +1024,64 @@ def _discover_cases(
 
     if manifest and "cases" in manifest:
         # Use manifest for case info (has parameters)
-        for case in manifest["cases"]:
+        for idx, case in enumerate(manifest["cases"]):
             name = case.get("name", case.get("case_name", ""))
             directory = case.get("directory", os.path.join(sweep_root, name))
+            params = case.get("parameters", {})
+
+            # If per-case parameters are empty, try to populate from global
+            # sweep parameters array (older manifests stored params globally)
+            if not params:
+                for sp in manifest.get("parameters", []):
+                    pname = sp.get("name", "Sweep Property")
+                    pvals = sp.get("values", [])
+                    if idx < len(pvals):
+                        raw = pvals[idx]
+                        try:
+                            params[pname] = float(raw) if '.' in str(raw) else int(raw)
+                        except (ValueError, TypeError):
+                            params[pname] = raw
+
             cases.append({
                 "name": name,
                 "directory": directory,
-                "parameters": case.get("parameters", {}),
+                "parameters": params,
             })
+
+        # Try to improve parameter names from sweep.xml (has PropertyDisplayName)
+        sweep_xml = os.path.join(sweep_root, "sweep.xml")
+        if os.path.isfile(sweep_xml):
+            try:
+                tree = ET.parse(sweep_xml)
+                root = tree.getroot()
+                first_case = root.find("Case")
+                if first_case is not None:
+                    xml_params = []
+                    for pe in first_case.findall("Parameter"):
+                        dn = pe.get("PropertyDisplayName", "")
+                        on = pe.get("ObjectName", "")
+                        pn = pe.get("PropertyName", "")
+                        if dn:
+                            xml_params.append(dn)
+                        elif on and pn:
+                            xml_params.append(f"{on}.{pn}")
+                        elif pn:
+                            xml_params.append(pn)
+                    # Remap generic names to descriptive ones
+                    global_params = manifest.get("parameters", [])
+                    if xml_params and len(xml_params) == len(global_params):
+                        old_names = [p.get("name", "") for p in global_params]
+                        for i, new_name in enumerate(xml_params):
+                            old_name = old_names[i]
+                            if new_name and new_name != old_name:
+                                # Update global params list
+                                global_params[i]["name"] = new_name
+                                # Update all case parameters
+                                for c in cases:
+                                    if old_name in c["parameters"]:
+                                        c["parameters"][new_name] = c["parameters"].pop(old_name)
+            except Exception:
+                pass
     else:
         # Scan directories — look for subdirs that contain out/
         try:

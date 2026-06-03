@@ -1237,6 +1237,8 @@ async fn launch_training_job(
     // child.wait() is std::process::Child::wait() which is blocking — must use
     // spawn_blocking to avoid stalling the tokio runtime for hours/days.
     let db_clone = db.clone();
+    let log_path_str = log_path.to_str().unwrap_or("").to_string();
+    let artifact_dir_str = artifact_dir.to_str().unwrap_or("").to_string();
     tokio::spawn(async move {
         let exit_status = tokio::task::spawn_blocking(move || {
             child.wait()
@@ -1268,12 +1270,85 @@ async fn launch_training_job(
             Ok(Ok(status)) => {
                 if status.success() {
                     println!("[AI] Training job {} completed successfully", job_id);
+
+                    // Parse training log for the JSON result to extract actual artifact paths.
+                    // The training script prints a JSON block like:
+                    //   { "status": "ok", "run_directory": "ai_artifacts/run_unet_...", ... }
+                    // We need run_directory to find metrics.jsonl and results.json.
+                    let mut actual_artifact_dir = artifact_dir_str.clone();
+                    let mut metrics_path: Option<String> = None;
+                    let log_path_update: Option<String> = Some(log_path_str.clone());
+
+                    if let Ok(log_content) = std::fs::read_to_string(&log_path_str) {
+                        // Try parsing the log output as JSON result.
+                        // Case 1: entire log is the JSON result (mstar-ai CLI writes only JSON to stdout)
+                        // Case 2: JSON block embedded in other log output (preceded by \n{)
+                        let trimmed = log_content.trim();
+                        let parsed = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                            serde_json::from_str::<serde_json::Value>(trimmed).ok()
+                        } else {
+                            None
+                        };
+
+                        // Fallback: scan for embedded JSON block (e.g. after logging output)
+                        let parsed = parsed.or_else(|| {
+                            let search = if let Some(pos) = log_content.rfind("\n{") {
+                                &log_content[pos + 1..]
+                            } else {
+                                return None;
+                            };
+                            if let Some(end) = search.rfind("\n}") {
+                                let block = &search[..end + 2];
+                                serde_json::from_str::<serde_json::Value>(block).ok()
+                            } else if search.trim_end().ends_with('}') {
+                                serde_json::from_str::<serde_json::Value>(search.trim()).ok()
+                            } else {
+                                None
+                            }
+                        });
+
+                        if let Some(result) = parsed {
+                            if let Some(run_dir) = result.get("run_directory").and_then(|v| v.as_str()) {
+                                let abs_run_dir = if std::path::Path::new(run_dir).is_absolute() {
+                                    run_dir.to_string()
+                                } else {
+                                    let cwd = std::env::current_dir().unwrap_or_default();
+                                    cwd.join(run_dir).to_str().unwrap_or(run_dir).to_string()
+                                };
+                                println!("[AI] Training job {} — actual run directory: {}", job_id, abs_run_dir);
+                                actual_artifact_dir = abs_run_dir;
+                            }
+                            if let Some(mp) = result.get("metrics_log_path").and_then(|v| v.as_str()) {
+                                let abs_mp = if std::path::Path::new(mp).is_absolute() {
+                                    mp.to_string()
+                                } else {
+                                    let cwd = std::env::current_dir().unwrap_or_default();
+                                    cwd.join(mp).to_str().unwrap_or(mp).to_string()
+                                };
+                                metrics_path = Some(abs_mp);
+                            }
+                        } else {
+                            eprintln!("[AI] Training job {} — could not parse JSON result from log", job_id);
+                        }
+                    }
+
+                    // Update DB with actual artifact paths
+                    let _ = conn.execute(
+                        "UPDATE ai_training_jobs SET artifact_directory = ?2, log_path = ?3, metrics_path = ?4 WHERE id = ?1",
+                        rusqlite::params![job_id, actual_artifact_dir, log_path_update, metrics_path],
+                    );
+
                     let _ = crate::ai_training::update_training_job_status(
                         &conn, job_id, "completed", None, None,
                     );
                 } else {
                     let msg = format!("Training process exited with status: {}", status);
                     println!("[AI] Training job {} failed: {}", job_id, msg);
+                    // Still update log_path so users can see what went wrong
+                    let _ = conn.execute(
+                        "UPDATE ai_training_jobs SET log_path = ?2 WHERE id = ?1",
+                        rusqlite::params![job_id, log_path_str],
+                    );
                     let _ = crate::ai_training::update_training_job_status(
                         &conn, job_id, "failed", None, Some(&msg),
                     );

@@ -448,94 +448,137 @@
             return;
         }
 
-        // Group jobs by sweep_group_id for badge rendering
+        // Group jobs by sweep_group_id
         const sweepGroups = {};
+        const standaloneJobs = [];
+        const groupOrder = []; // track first-seen order
+
         jobs.forEach(job => {
             if (job.sweep_group_id) {
                 if (!sweepGroups[job.sweep_group_id]) {
-                    sweepGroups[job.sweep_group_id] = { jobs: [], allComplete: true, name: '' };
+                    sweepGroups[job.sweep_group_id] = { jobs: [], name: '', groupId: job.sweep_group_id };
+                    groupOrder.push(job.sweep_group_id);
                 }
                 sweepGroups[job.sweep_group_id].jobs.push(job);
-                if (job.status !== 'completed') sweepGroups[job.sweep_group_id].allComplete = false;
-                // Extract sweep name from config
                 try {
                     const cfg = JSON.parse(job.sweep_config || '{}');
                     if (cfg.sweep_name) sweepGroups[job.sweep_group_id].name = cfg.sweep_name;
                 } catch (_) {}
+            } else {
+                standaloneJobs.push(job);
+            }
+        });
+
+        // Build ordered list: interleave sweep groups and standalone jobs by position
+        // Use the first job in each group to determine position
+        const entries = []; // { type: 'job' | 'sweep', data }
+        const sweepFirstIds = {};
+        groupOrder.forEach(gid => {
+            const g = sweepGroups[gid];
+            if (g.jobs.length > 0) sweepFirstIds[g.jobs[0].id] = gid;
+        });
+
+        jobs.forEach(job => {
+            if (job.sweep_group_id) {
+                // Only insert the group once, at the position of its first job
+                if (sweepFirstIds[job.id] !== undefined) {
+                    entries.push({ type: 'sweep', data: sweepGroups[job.sweep_group_id] });
+                }
+                // Skip individual sweep job rows — they'll be inside the group
+            } else {
+                entries.push({ type: 'job', data: job });
             }
         });
 
         let tableRows = '';
-        const renderedGroups = new Set();
 
-        jobs.forEach((job, idx) => {
-            let sweepBadge = '';
-            if (job.sweep_group_id) {
-                // Parse sweep_config to get total cases and sweep name
-                let sweepLabel = 'sweep';
-                try {
-                    const cfg = JSON.parse(job.sweep_config || '{}');
-                    const total = cfg.total_cases || '?';
-                    // Count which case # this is in the group
-                    const groupJobs = jobs.filter(j => j.sweep_group_id === job.sweep_group_id);
-                    const caseIdx = groupJobs.findIndex(j => j.id === job.id) + 1;
-                    sweepLabel = `${caseIdx}/${total}`;
-                } catch(e) {}
-                sweepBadge = ` <span class="badge" style="background:rgba(139,92,246,0.15);color:var(--accent-purple,#8b5cf6);font-size:10px;padding:2px 6px;border-radius:4px;cursor:pointer;" data-sweep-group="${escapeHtml(job.sweep_group_id)}" title="Sweep group ${escapeHtml(job.sweep_group_id)} — click to filter">sweep ${sweepLabel}</span>`;
-            }
-            const renderBadge = job.job_type === 'render' ? ' <span class="badge badge-render">render</span>' : '';
+        entries.forEach(entry => {
+            if (entry.type === 'job') {
+                const job = entry.data;
+                const renderBadge = job.job_type === 'render' ? ' <span class="badge badge-render">render</span>' : '';
+                tableRows += _renderJobRow(job, renderBadge, '');
+            } else {
+                // Sweep group header + child rows
+                const group = entry.data;
+                const gid = group.groupId;
+                const totalCases = group.jobs.length;
+                const completedCases = group.jobs.filter(j => j.status === 'completed').length;
+                const runningCases = group.jobs.filter(j => j.status === 'running' || j.status === 'launching').length;
+                const failedCases = group.jobs.filter(j => j.status === 'failed').length;
+                const allComplete = completedCases === totalCases;
+                const progressPct = totalCases > 0 ? Math.round((completedCases / totalCases) * 100) : 0;
 
-            tableRows += `
-                <tr>
-                    <td class="text-mono">#${job.id}</td>
-                    <td>${escapeHtml(job.name)}${renderBadge}${sweepBadge}</td>
-                    <td>${escapeHtml(job.username)}</td>
-                    <td class="text-mono text-sm">${job.resolved_version || job.mstar_version}</td>
-                    <td class="text-mono text-sm">${formatGpuIds(job.gpu_ids)}</td>
-                    <td>${statusBadge(job.status)}</td>
-                    <td class="text-sm text-muted">${formatTime(job.submitted_at)}</td>
-                    <td>
-                        <div class="flex gap-2">
-                            ${(job.status !== 'queued' || job.job_type === 'render') ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.viewOutput(${job.id})">View</button>` : ''}
-                            ${(job.status === 'queued' || job.status === 'running' || job.status === 'launching') ? `<button class="btn btn-danger btn-sm" id="cancel-btn-${job.id}" onclick="window.mstarApp.cancelJob(${job.id})">Cancel</button>` : ''}
-                            ${(job.status === 'failed' || job.status === 'cancelled') && job.job_type !== 'render' ? `<button class="btn btn-primary btn-sm" id="restart-btn-${job.id}" onclick="window.mstarApp.restartJob(${job.id})">Restart</button>` : ''}
-                            ${(job.status === 'failed' || job.status === 'cancelled' || job.status === 'completed') ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.archiveJob(${job.id})" title="Archive this job">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="21 8 21 21 3 21 3 8"></polyline><rect x="1" y="3" width="22" height="5"></rect><line x1="10" y1="12" x2="14" y2="12"></line></svg>
-                            </button>` : ''}
-                        </div>
-                        ${job.error_message ? `<div class="text-sm" style="color:var(--accent-red);margin-top:4px;max-width:350px;word-wrap:break-word;white-space:normal;line-height:1.3;" title="${escapeHtml(job.error_message)}">${escapeHtml(job.error_message)}</div>` : ''}
-                    </td>
-                </tr>
-            `;
+                // Status summary
+                let statusHtml = '';
+                if (allComplete) {
+                    statusHtml = `<span style="color:#22c55e;font-weight:500;">✓ All ${totalCases} complete</span>`;
+                } else {
+                    const parts = [];
+                    if (completedCases > 0) parts.push(`<span style="color:#22c55e;">${completedCases} done</span>`);
+                    if (runningCases > 0) parts.push(`<span style="color:#3b82f6;">${runningCases} running</span>`);
+                    if (failedCases > 0) parts.push(`<span style="color:#ef4444;">${failedCases} failed</span>`);
+                    const queuedCases = totalCases - completedCases - runningCases - failedCases;
+                    if (queuedCases > 0) parts.push(`<span style="color:var(--text-muted);">${queuedCases} queued</span>`);
+                    statusHtml = parts.join(' · ');
+                }
 
-            // Track which group this job belongs to for the summary row below
-            if (job.sweep_group_id) {
-                renderedGroups.add(job.sweep_group_id);
-            }
-        });
+                // Version + GPU from first job
+                const firstJob = group.jobs[0];
+                const version = firstJob.resolved_version || firstJob.mstar_version || '';
 
-        // After all job rows, append "Create Dataset" rows for fully-completed sweep groups
-        renderedGroups.forEach(groupId => {
-            const group = sweepGroups[groupId];
-            if (group && group.allComplete && group.jobs.length > 1) {
-                // Escape name for safe inclusion in JS string context (onclick)
+                // Create dataset button
                 const safeName = (group.name || 'Sweep Dataset').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+                const datasetBtn = allComplete ? `<button class="btn btn-sm" style="padding:3px 10px;font-size:10px;background:linear-gradient(135deg,rgba(139,92,246,0.15),rgba(59,130,246,0.15));border:1px solid rgba(139,92,246,0.3);color:var(--accent-blue);white-space:nowrap;"
+                    onclick="event.stopPropagation();window.mstarApp.createDatasetFromSweep('${escapeHtml(gid)}', '${safeName}')">Create Dataset</button>` : '';
+
+                // Build sweep config data for the params modal
+                let sweepCfg = null;
+                try { sweepCfg = JSON.parse(firstJob.sweep_config || '{}'); } catch (_) {}
+                const hasParams = sweepCfg && Array.isArray(sweepCfg.parameters) && sweepCfg.parameters.length > 0;
+                const paramsBtn = `<button class="btn btn-sm btn-secondary" style="padding:3px 10px;font-size:10px;white-space:nowrap;" onclick="event.stopPropagation();window.mstarApp.showSweepParams('${escapeHtml(gid)}')" title="View sweep parameters">Params</button>`;
+
+                // Store sweep data globally for modal access
+                window._sweepData = window._sweepData || {};
+                window._sweepData[gid] = { name: group.name, config: sweepCfg, jobs: group.jobs };
+
+                // Sweep header row
                 tableRows += `
-                    <tr style="background:rgba(139,92,246,0.04);">
-                        <td colspan="8" style="padding:8px 16px;">
-                            <div style="display:flex;align-items:center;justify-content:space-between;">
-                                <span style="font-size:12px;color:var(--text-muted);">
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:4px;"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path></svg>
-                                    Sweep "${escapeHtml(group.name || 'Unnamed')}" — ${group.jobs.length} cases completed
-                                </span>
-                                <button class="btn btn-sm" style="padding:4px 12px;font-size:11px;background:linear-gradient(135deg,rgba(139,92,246,0.15),rgba(59,130,246,0.15));border:1px solid rgba(139,92,246,0.3);color:var(--accent-blue);"
-                                    onclick="window.mstarApp.createDatasetFromSweep('${escapeHtml(groupId)}', '${safeName}')">
-                                    🧠 Create Training Dataset
-                                </button>
+                <tr class="sweep-header" data-sweep-group="${escapeHtml(gid)}" style="background:rgba(139,92,246,0.06);cursor:pointer;border-left:3px solid var(--accent-purple,#8b5cf6);" onclick="(function(el){
+                    var rows = document.querySelectorAll('.sweep-child-${escapeHtml(gid).replace(/[^a-zA-Z0-9]/g,'_')}');
+                    var chevron = el.querySelector('.sweep-chevron');
+                    var hidden = rows.length > 0 && rows[0].style.display === 'none';
+                    rows.forEach(function(r){ r.style.display = hidden ? '' : 'none'; });
+                    if (chevron) chevron.style.transform = hidden ? 'rotate(0deg)' : 'rotate(-90deg)';
+                })(this)">
+                    <td class="text-mono" style="color:var(--accent-purple,#8b5cf6);font-weight:600;">
+                        <svg class="sweep-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="transition:transform 0.15s;vertical-align:-1px;margin-right:2px;"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                        ⟡
+                    </td>
+                    <td colspan="2" style="font-weight:600;color:var(--text-primary);">
+                        <span style="color:var(--accent-purple,#8b5cf6);">${escapeHtml(group.name || 'Unnamed Sweep')}</span>
+                        <span style="font-weight:400;color:var(--text-muted);font-size:12px;margin-left:6px;">${totalCases} cases</span>
+                    </td>
+                    <td class="text-mono text-sm">${escapeHtml(version)}</td>
+                    <td>
+                        <div style="display:flex;align-items:center;gap:6px;min-width:100px;">
+                            <div style="flex:1;height:4px;background:var(--bg-tertiary,#1e293b);border-radius:2px;overflow:hidden;">
+                                <div style="width:${progressPct}%;height:100%;background:${allComplete ? '#22c55e' : '#3b82f6'};border-radius:2px;transition:width 0.3s;"></div>
                             </div>
-                        </td>
-                    </tr>
-                `;
+                            <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">${progressPct}%</span>
+                        </div>
+                    </td>
+                    <td style="font-size:11px;">${statusHtml}</td>
+                    <td class="text-sm text-muted">${formatTime(firstJob.submitted_at)}</td>
+                    <td><div class="flex gap-2">${paramsBtn}${datasetBtn}</div></td>
+                </tr>`;
+
+                // Child job rows (initially visible)
+                const safeClass = 'sweep-child-' + gid.replace(/[^a-zA-Z0-9]/g, '_');
+                group.jobs.forEach((job, caseIdx) => {
+                    const renderBadge = job.job_type === 'render' ? ' <span class="badge badge-render">render</span>' : '';
+                    const caseLabel = ` <span style="font-size:10px;color:var(--accent-purple,#8b5cf6);opacity:0.7;">${caseIdx + 1}/${totalCases}</span>`;
+                    tableRows += _renderJobRow(job, renderBadge + caseLabel, safeClass, true);
+                });
             }
         });
 
@@ -560,6 +603,142 @@
                 </table>
             </div>
         `;
+    }
+
+    function _renderJobRow(job, extraBadge, childClass, isChild) {
+        const childAttr = childClass ? `class="${childClass}"` : '';
+        const indent = isChild ? 'padding-left:28px;' : '';
+        const childStyle = isChild ? 'style="border-left:3px solid rgba(139,92,246,0.15);"' : '';
+        return `
+            <tr ${childAttr} ${childStyle}>
+                <td class="text-mono" style="${indent}">#${job.id}</td>
+                <td>${escapeHtml(job.name)}${extraBadge}</td>
+                <td>${escapeHtml(job.username)}</td>
+                <td class="text-mono text-sm">${job.resolved_version || job.mstar_version}</td>
+                <td class="text-mono text-sm">${formatGpuIds(job.gpu_ids)}</td>
+                <td>${statusBadge(job.status)}</td>
+                <td class="text-sm text-muted">${formatTime(job.submitted_at)}</td>
+                <td>
+                    <div class="flex gap-2">
+                        ${(job.status !== 'queued' || job.job_type === 'render') ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.viewOutput(${job.id})">View</button>` : ''}
+                        ${(job.status === 'queued' || job.status === 'running' || job.status === 'launching') ? `<button class="btn btn-danger btn-sm" id="cancel-btn-${job.id}" onclick="window.mstarApp.cancelJob(${job.id})">Cancel</button>` : ''}
+                        ${(job.status === 'failed' || job.status === 'cancelled') && job.job_type !== 'render' ? `<button class="btn btn-primary btn-sm" id="restart-btn-${job.id}" onclick="window.mstarApp.restartJob(${job.id})">Restart</button>` : ''}
+                        ${(job.status === 'failed' || job.status === 'cancelled' || job.status === 'completed') ? `<button class="btn btn-secondary btn-sm" onclick="window.mstarApp.archiveJob(${job.id})" title="Archive this job">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="21 8 21 21 3 21 3 8"></polyline><rect x="1" y="3" width="22" height="5"></rect><line x1="10" y1="12" x2="14" y2="12"></line></svg>
+                        </button>` : ''}
+                    </div>
+                    ${job.error_message ? `<div class="text-sm" style="color:var(--accent-red);margin-top:4px;max-width:350px;word-wrap:break-word;white-space:normal;line-height:1.3;" title="${escapeHtml(job.error_message)}">${escapeHtml(job.error_message)}</div>` : ''}
+                </td>
+            </tr>
+        `;
+    }
+
+    // Sweep Parameters Modal
+    function showSweepParamsModal(groupId) {
+        const data = (window._sweepData || {})[groupId];
+        if (!data) return;
+
+        const cfg = data.config || {};
+        const params = cfg.parameters || [];
+        const sweepCases = cfg.cases || [];
+        const sweepName = data.name || cfg.sweep_name || 'Unnamed Sweep';
+
+        // Build parameter table
+        let tableHtml = '';
+        if (params.length > 0 && sweepCases.length > 0) {
+            // Per-case table: Case Name | Param1 | Param2 | ...
+            const paramNames = params.map(p => typeof p === 'string' ? p : (p.name || 'Parameter'));
+            tableHtml = `
+                <table class="data-table" style="font-size:12px;width:100%;">
+                    <thead><tr>
+                        <th>Case</th>
+                        ${paramNames.map(n => `<th style="color:var(--accent-blue,#3b82f6);">${escapeHtml(n)}</th>`).join('')}
+                    </tr></thead>
+                    <tbody>
+                        ${sweepCases.map(c => {
+                            const cp = c.parameters || {};
+                            return `<tr>
+                                <td style="font-weight:500;">${escapeHtml(c.name || '')}</td>
+                                ${paramNames.map(n => {
+                                    const v = cp[n];
+                                    return v !== undefined
+                                        ? `<td class="text-mono" style="font-weight:600;color:var(--accent-blue,#3b82f6);">${escapeHtml(String(v))}</td>`
+                                        : '<td class="text-muted">&mdash;</td>';
+                                }).join('')}
+                            </tr>`;
+                        }).join('')}
+                    </tbody>
+                </table>
+            `;
+        } else if (params.length > 0) {
+            // Fallback: just show param names + values arrays
+            tableHtml = `
+                <table class="data-table" style="font-size:12px;width:100%;">
+                    <thead><tr><th>Parameter</th><th>Values</th></tr></thead>
+                    <tbody>
+                        ${params.map(p => {
+                            const name = typeof p === 'string' ? p : (p.name || 'Parameter');
+                            const vals = (p.values || []).join(', ');
+                            return `<tr>
+                                <td style="font-weight:500;">${escapeHtml(name)}</td>
+                                <td class="text-mono" style="color:var(--accent-blue,#3b82f6);">${escapeHtml(vals)}</td>
+                            </tr>`;
+                        }).join('')}
+                    </tbody>
+                </table>
+            `;
+        } else {
+            // No param data — show case names from jobs
+            tableHtml = `
+                <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">Parameter details not available for this sweep (created before parameter tracking was added). Case names:</div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px;">
+                    ${data.jobs.map(j => `<span style="padding:4px 10px;border-radius:6px;background:var(--bg-tertiary);font-size:12px;font-weight:500;">${escapeHtml(j.name.replace(/^.*—\s*/, ''))}</span>`).join('')}
+                </div>
+            `;
+        }
+
+        // Config summary
+        const configItems = [];
+        if (cfg.gpus_per_case) configItems.push(`GPUs/case: ${cfg.gpus_per_case}`);
+        if (cfg.max_concurrent) configItems.push(`Max concurrent: ${cfg.max_concurrent}`);
+        if (cfg.sweep_root) configItems.push(`Root: ${cfg.sweep_root}`);
+        if (cfg.msb_source) configItems.push(`Source: ${cfg.msb_source}`);
+
+        const overlay = document.createElement('div');
+        overlay.className = 'modal';
+        overlay.innerHTML = `
+            <div class="modal-backdrop" id="sweep-params-backdrop"></div>
+            <div class="modal-content" style="max-width:700px;">
+                <div class="modal-header">
+                    <h3 style="margin:0;display:flex;align-items:center;gap:8px;">
+                        <span style="color:var(--accent-purple,#8b5cf6);">⟡</span>
+                        ${escapeHtml(sweepName)}
+                        <span style="font-size:12px;font-weight:400;color:var(--text-muted);">${cfg.total_cases || data.jobs.length} cases</span>
+                    </h3>
+                    <button class="btn btn-secondary btn-sm" id="sweep-params-close" style="padding:4px 8px;">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                    </button>
+                </div>
+                <div class="modal-body" style="max-height:60vh;overflow-y:auto;">
+                    ${tableHtml}
+                    ${configItems.length ? `
+                        <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border-color);">
+                            <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Configuration</div>
+                            <div style="font-size:11px;color:var(--text-muted);line-height:1.8;">
+                                ${configItems.map(i => `<div><code style="font-size:11px;">${escapeHtml(i)}</code></div>`).join('')}
+                            </div>
+                        </div>
+                    ` : ''}
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        function closeModal() {
+            overlay.remove();
+        }
+        document.getElementById('sweep-params-close').addEventListener('click', closeModal);
+        document.getElementById('sweep-params-backdrop').addEventListener('click', closeModal);
     }
 
     // ============================================================
@@ -686,7 +865,7 @@
                                 </div>
                                 <div style="display:flex;gap:8px;">
                                     <input type="text" class="form-input" id="copy-to-path" placeholder="/simulations/ProjectName/Results" style="flex:1;">
-                                    <button class="btn btn-sm" id="copy-to-browse-btn" title="Browse server">📂</button>
+                                    <button class="btn btn-sm" id="copy-to-browse-btn" title="Browse server"></button>
                                 </div>
                                 <div class="dropzone-hint" style="margin-top:4px;">Completed job results will be automatically copied here</div>
                             </div>
@@ -837,10 +1016,10 @@
             for (const entry of data.entries) {
                 if (entry.is_dir) {
                     html += `<div class="browse-entry browse-dir" data-browse-path="${entry.path}" style="padding:10px 14px;display:flex;align-items:center;gap:10px;cursor:pointer;border-bottom:1px solid var(--border);">
-                        <span style="font-size:18px;">📁</span><span>${escapeHtml(entry.name)}</span></div>`;
+                        <span>${escapeHtml(entry.name)}</span></div>`;
                 } else if (entry.is_msb) {
                     html += `<div class="browse-entry browse-msb" data-msb-path="${entry.path}" style="padding:10px 14px;display:flex;align-items:center;gap:10px;cursor:pointer;border-bottom:1px solid var(--border);${selectedServerPath === entry.path ? 'background:rgba(59,130,246,0.15);' : ''}">
-                        <span style="font-size:18px;">📄</span><span style="flex:1;">${escapeHtml(entry.name)}</span><span style="font-size:12px;color:var(--text-muted);">${formatFileSize(entry.size)}</span></div>`;
+                        <span style="flex:1;">${escapeHtml(entry.name)}</span><span style="font-size:12px;color:var(--text-muted);">${formatFileSize(entry.size)}</span></div>`;
                 }
             }
             if (!data.entries.length && !data.parent) html = '<div style="padding:20px;text-align:center;color:var(--text-muted);">No MSB files found</div>';
@@ -962,7 +1141,7 @@
                 }
                 for (const entry of data.entries) {
                     html += `<div class="dir-picker-entry" data-path="${entry.path}">
-                        <span style="font-size:18px;">📁</span><span>${escapeHtml(entry.name)}</span></div>`;
+                        <span>${escapeHtml(entry.name)}</span></div>`;
                 }
                 if (!data.entries.length && !data.parent) {
                     html = '<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px;">Empty directory</div>';
@@ -2384,7 +2563,7 @@
                     Visuals
                 </button>
                 <button class="btn btn-secondary btn-sm report-generate-btn" id="btn-generate-report" onclick="window.mstarApp.generateReport()" title="Generate PDF report of selected charts" style="display:none;">
-                    📄 Generate Report <span id="report-count-badge" class="report-count-badge" style="display:none;">0</span>
+                    Generate Report <span id="report-count-badge" class="report-count-badge" style="display:none;">0</span>
                 </button>
             </div>
             <div id="view-progress" class="progress-dashboard">
@@ -2612,7 +2791,7 @@
         window.mstarApp.generateReport = async function() {
             const reportPanels = progressState.panels.filter(p => p.inReport);
             if (reportPanels.length === 0) {
-                alert('No charts selected for report. Click 📌 Report on charts to include them.');
+                alert('No charts selected for report. Click Report on charts to include them.');
                 return;
             }
 
@@ -2624,7 +2803,7 @@
 
             const btn = document.getElementById('btn-generate-report');
             const origText = btn.innerHTML;
-            btn.innerHTML = '⏳ Generating...';
+            btn.innerHTML = 'Generating...';
             btn.disabled = true;
 
             try {
@@ -2906,21 +3085,21 @@
             if (jobMeta.status === 'queued') {
                 cardsEl.innerHTML = `
                     <div class="stat-card blue">
-                        <div class="stat-value" style="font-size:18px;">⏳ Queued</div>
+                        <div class="stat-value" style="font-size:18px;">Queued</div>
                         <div class="stat-label">Waiting for available GPU</div>
                     </div>
                 `;
             } else if (jobMeta.status === 'failed') {
                 cardsEl.innerHTML = `
                     <div class="stat-card red">
-                        <div class="stat-value" style="font-size:16px;">❌ Render Failed</div>
+                        <div class="stat-value" style="font-size:16px;">Render Failed</div>
                         <div class="stat-label">${escapeHtml(jobMeta.error_message || 'No error details available')}</div>
                     </div>
                 `;
             } else {
                 cardsEl.innerHTML = `
                     <div class="stat-card blue">
-                        <div class="stat-value" style="font-size:18px;">🔄 Initializing</div>
+                        <div class="stat-value" style="font-size:18px;">Initializing</div>
                         <div class="stat-label">Setting up ParaView render pipeline...</div>
                     </div>
                 `;
@@ -2954,14 +3133,14 @@
         if (isFailed) {
             cardsEl.innerHTML = `
                 <div class="stat-card red">
-                    <div class="stat-value" style="font-size:16px;">❌ Render Failed</div>
+                    <div class="stat-value" style="font-size:16px;">Render Failed</div>
                     <div class="stat-label">${escapeHtml(status.error || jobMeta.error_message || 'Unknown error')}</div>
                 </div>
             `;
         } else if (isComplete) {
             cardsEl.innerHTML = `
                 <div class="stat-card green">
-                    <div class="stat-value">✅ Complete</div>
+                    <div class="stat-value">Complete</div>
                     <div class="stat-label">${totalFrames} frames rendered</div>
                 </div>
                 <div class="stat-card blue">
@@ -3069,14 +3248,14 @@
             if (d.status === 'failed') {
                 cardsEl.innerHTML = `
                     <div class="stat-card red">
-                        <div class="stat-value" style="font-size:16px;">❌ Job Failed</div>
+                        <div class="stat-value" style="font-size:16px;">Job Failed</div>
                         <div class="stat-label">${d.error_message || 'No error details available'}</div>
                     </div>
                 `;
             } else {
                 cardsEl.innerHTML = `
                     <div class="stat-card blue">
-                        <div class="stat-value" style="font-size:18px;">⏳ Initializing Lattice</div>
+                        <div class="stat-value" style="font-size:18px;">Initializing Lattice</div>
                         <div class="stat-label">Status — waiting for first output block</div>
                     </div>
                 `;
@@ -3304,7 +3483,7 @@
                 </label>
                 <span style="flex:1;"></span>
                 <button class="chart-stat-toggle chart-report-toggle" id="stat-report-${id}" onclick="window.mstarApp.toggleReport(${id})" title="Add to PDF report">
-                    📌 Report
+                    Report
                 </button>
             </div>
             <div class="chart-panel-body">
@@ -3446,7 +3625,7 @@
                 </label>
                 <span style="flex:1;"></span>
                 <button class="chart-stat-toggle chart-report-toggle" id="stat-report-${id}" onclick="window.mstarApp.toggleReport(${id})" title="Add to PDF report">
-                    📌 Report
+                    Report
                 </button>
             </div>
             <div class="chart-panel-body">
@@ -3992,7 +4171,7 @@
         }
     }
 
-    window.mstarApp = Object.assign(window.mstarApp || {}, { viewOutput, cancelJob, deleteUser, editUser, popOutPanel, restartJob, archiveJob, archiveAllFailed, createDatasetFromSweep });
+    window.mstarApp = Object.assign(window.mstarApp || {}, { viewOutput, cancelJob, deleteUser, editUser, popOutPanel, restartJob, archiveJob, archiveAllFailed, createDatasetFromSweep, showSweepParams: showSweepParamsModal });
 
     // ============================================================
     // Modal close handlers

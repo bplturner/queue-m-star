@@ -19,3 +19,7 @@ tests/
 =0.38
 =9.0
 static/static
+
+# AI training artifacts (checkpoints, exports)
+ai_artifacts/
+__pycache__/

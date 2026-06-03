@@ -79,8 +79,19 @@ struct Args {
 // Main Entry Point
 // ============================================================
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Build a custom tokio runtime with larger worker thread stacks.
+    // Warp's deeply nested Or<> route chain requires more stack than the
+    // default 2 MB when matching 50+ routes.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024) // 8 MB
+        .build()
+        .expect("Failed to build tokio runtime");
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("===========================================");
     println!("  M-Star Queue - Job Management System");
     println!("===========================================");
@@ -251,10 +262,21 @@ async fn run_web_server(state: AppState, web_config: &config::WebServerConfig) {
         .and_then(handle_full_job_submit);
 
     // Serve the SPA index.html for all non-API, non-static routes
-    let index = warp::get()
-        .and(warp::path::tail())
-        .and(warp::fs::file("./static/index.html"))
-        .map(|_tail: warp::path::Tail, file| file);
+    // The filter rejects paths starting with "api/" to avoid catching API GET routes.
+    let spa_guard = warp::get()
+        .and(warp::path::full())
+        .and_then(|full_path: warp::path::FullPath| async move {
+            let path = full_path.as_str();
+            if path.starts_with("/api/") || path.starts_with("/static/") {
+                Err(warp::reject::not_found())
+            } else {
+                Ok(())
+            }
+        })
+        .untuple_one();
+
+    let index = spa_guard
+        .and(warp::fs::file("./static/index.html"));
 
     // Static file serving
     let static_files = warp::path("static").and(warp::fs::dir("./static"));
