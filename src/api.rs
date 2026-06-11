@@ -699,6 +699,16 @@ pub fn api_routes(
         .and(with_state(state.clone()))
         .and_then(handle_ai_infer_sweep);
 
+    // GET /api/ai/training-jobs/:id/inference-progress — poll sweep inference progress
+    let ai_training_jobs_inference_progress = api.and(warp::path("ai")).and(warp::path("training-jobs"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("inference-progress"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::optional::<String>("authorization"))
+        .and(with_state(state.clone()))
+        .and_then(handle_ai_inference_progress);
+
     // GET /api/ai/config  (return enabled status + defaults)
     let ai_training_config = api.and(warp::path("ai")).and(warp::path("config")).and(warp::path::end())
         .and(warp::get())
@@ -821,6 +831,7 @@ pub fn api_routes(
         .or(ai_training_jobs_export)
         .or(ai_training_jobs_infer)
         .or(ai_training_jobs_infer_sweep)
+        .or(ai_training_jobs_inference_progress)
         .or(ai_training_config)
         .or(ai_preflight)
         .or(ai_artifacts_pvd_info)
@@ -3914,11 +3925,22 @@ async fn handle_ai_get_derived_fields(
                 .cmp(b.get("field_name").and_then(|v| v.as_str()).unwrap_or(""))
         });
 
+        // Read live progress if preparation is in-flight
+        let progress_path = derived_dir.join(".progress.json");
+        let progress: Option<serde_json::Value> = if progress_path.is_file() {
+            std::fs::read_to_string(&progress_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        } else {
+            None
+        };
+
         return Ok(json_ok(&serde_json::json!({
             "dataset_id": id,
             "derived_dir": derived_dir.to_string_lossy(),
             "fields": fields,
             "preparation_meta": prep_meta,
+            "progress": progress,
         })));
     }
 
@@ -4149,7 +4171,7 @@ async fn handle_ai_create_training_job(
     };
 
     // Validate model family
-    let valid_families = ["unet", "gnn", "mlp"];
+    let valid_families = ["fno", "unet", "gnn", "mlp", "transolver"];
     if !valid_families.contains(&body.model_family.as_str()) {
         return Ok(json_error(
             &format!("Invalid model_family: '{}'. Valid: {:?}", body.model_family, valid_families),
@@ -5074,6 +5096,88 @@ async fn handle_ai_infer_sweep(
     }
 }
 
+/// GET /api/ai/training-jobs/:id/inference-progress — poll sweep inference progress
+async fn handle_ai_inference_progress(
+    id: i64,
+    auth: Option<String>,
+    state: AppState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !state.config.ai_training.enabled {
+        return Ok(json_error("AI training is not enabled", warp::http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let token = match extract_token(auth) {
+        Some(t) => t,
+        None => return Ok(json_error("Authentication required", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let db = state.db.lock().await;
+    let user = match db::validate_session(&db, &token) {
+        Ok(u) => u,
+        Err(_) => return Ok(json_error("Invalid session", warp::http::StatusCode::UNAUTHORIZED)),
+    };
+
+    let jobs = ai_training::list_training_jobs(&db, None, None);
+    let job = match jobs.into_iter().find(|j| j.id == id) {
+        Some(j) => j,
+        None => return Ok(json_error("Training job not found", warp::http::StatusCode::NOT_FOUND)),
+    };
+
+    if user.role != "admin" && job.user_id != user.id {
+        return Ok(json_error("Forbidden", warp::http::StatusCode::FORBIDDEN));
+    }
+    drop(db);
+
+    let artifact_dir = match &job.artifact_directory {
+        Some(dir) => {
+            let p = std::path::PathBuf::from(dir);
+            if p.is_absolute() { p } else { std::env::current_dir().unwrap_or_default().join(p) }
+        }
+        None => return Ok(json_ok(&serde_json::json!({
+            "status": "ok",
+            "progress": null,
+        }))),
+    };
+
+    // Try the run directory first (same parent-sibling logic as metrics)
+    let mut progress_path = artifact_dir.join("inference_output").join("inference_progress.json");
+    if !progress_path.exists() {
+        if let Some(parent) = artifact_dir.parent() {
+            let sibling = parent.join(&job.run_name).join("inference_output").join("inference_progress.json");
+            if sibling.exists() {
+                progress_path = sibling;
+            }
+        }
+    }
+
+    if progress_path.exists() {
+        match tokio::fs::read_to_string(&progress_path).await {
+            Ok(content) => {
+                if let Ok(progress) = serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(json_ok(&serde_json::json!({
+                        "status": "ok",
+                        "progress": progress,
+                    })))
+                } else {
+                    Ok(json_ok(&serde_json::json!({
+                        "status": "ok",
+                        "progress": null,
+                    })))
+                }
+            }
+            Err(_) => Ok(json_ok(&serde_json::json!({
+                "status": "ok",
+                "progress": null,
+            }))),
+        }
+    } else {
+        Ok(json_ok(&serde_json::json!({
+            "status": "ok",
+            "progress": null,
+        })))
+    }
+}
+
 /// GET /api/ai/artifacts/pvd-info — parse PVD from AI artifact output
 async fn handle_ai_artifact_pvd_info(
     auth: Option<String>,
@@ -5117,7 +5221,10 @@ async fn handle_ai_artifact_pvd_info(
         Err(e) => return Ok(json_error(&format!("Failed to read PVD: {}", e), warp::http::StatusCode::INTERNAL_SERVER_ERROR)),
     };
 
-    let mut timestep_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> = std::collections::BTreeMap::new();
+    // Use a Vec to preserve PVD file order, then sort numerically.
+    // A BTreeMap<String> would sort "10" before "2" lexicographically,
+    // which scrambles animation playback for AI prediction sweeps.
+    let mut timestep_entries: Vec<(f64, String, Vec<serde_json::Value>)> = Vec::new();
     let mut file_extension = String::new();
 
     for line in pvd_content.lines() {
@@ -5147,11 +5254,20 @@ async fn handle_ai_artifact_pvd_info(
             "name": if name.is_empty() { "" } else { &name },
         });
 
-        timestep_map.entry(ts).or_insert_with(Vec::new).push(entry);
+        let ts_f64 = ts.parse::<f64>().unwrap_or(0.0);
+
+        // Check if we already have this timestep (for multi-part datasets)
+        if let Some(existing) = timestep_entries.iter_mut().find(|(t, _, _)| (*t - ts_f64).abs() < 1e-12) {
+            existing.2.push(entry);
+        } else {
+            timestep_entries.push((ts_f64, ts, vec![entry]));
+        }
     }
 
-    let timesteps: Vec<serde_json::Value> = timestep_map.into_iter().map(|(ts_str, files)| {
-        let t: f64 = ts_str.parse().unwrap_or(0.0);
+    // Sort by the numeric timestep value, not the string representation
+    timestep_entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let timesteps: Vec<serde_json::Value> = timestep_entries.into_iter().map(|(t, _ts_str, files)| {
         // Use the name from the first file entry as the timestep label
         let label = files.first()
             .and_then(|f| f.get("name"))
