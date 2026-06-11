@@ -140,6 +140,28 @@ function renderTraining(container) {
         .ai-panel.active { display: block; }
         .ai-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
         @media (max-width: 768px) { .ai-form-grid { grid-template-columns: 1fr; } }
+        .ai-tooltip-icon {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 15px; height: 15px; font-size: 10px; line-height: 1;
+            border-radius: 50%; background: rgba(139,92,246,0.12); color: #a78bfa;
+            cursor: help; position: relative; vertical-align: middle; margin-left: 4px;
+            transition: background 0.15s;
+        }
+        .ai-tooltip-icon:hover { background: rgba(139,92,246,0.25); }
+        .ai-tooltip-icon:hover::after {
+            content: attr(data-tip);
+            position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+            width: max-content; max-width: 260px; padding: 8px 10px;
+            background: var(--bg-card, #1a1a2e); color: var(--text-secondary, #ccc);
+            border: 1px solid var(--border-color, #333); border-radius: 8px;
+            font-size: 11px; font-weight: 400; line-height: 1.4;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.3); z-index: 100; pointer-events: none;
+            white-space: normal;
+        }
+        .ai-tooltip-icon:hover::before {
+            content: ''; position: absolute; bottom: calc(100% + 2px); left: 50%; transform: translateX(-50%);
+            border: 4px solid transparent; border-top-color: var(--border-color, #333); z-index: 101;
+        }
         .ai-empty { text-align: center; padding: 48px 16px; color: var(--text-muted, #6b7280); }
         .ai-empty svg { margin-bottom: 12px; opacity: 0.4; }
         .ai-empty h3 { margin: 0 0 8px; font-size: 16px; color: var(--text-secondary); }
@@ -1027,8 +1049,32 @@ function renderTraining(container) {
                 : '—');
         const gpuDisplay = j.gpu_ids ? formatGpuList(j.gpu_ids) : 'auto';
 
+        // Parse full training config for display
+        let jobConfig = {};
         let inferParams = [];
-        try { const cfg = JSON.parse(j.config_json || '{}'); inferParams = cfg.selected_input_params || []; } catch {}
+        try {
+            jobConfig = JSON.parse(j.config_json || '{}');
+            inferParams = jobConfig.selected_input_params || [];
+        } catch {}
+
+        const cfgInputParams = jobConfig.selected_input_params || [];
+        const cfgInputFields = jobConfig.input_fields || [];
+        const cfgTargets = jobConfig.selected_target_fields || [];
+        const cfgChannels = jobConfig.computed_channels || [];
+        const cfgEpochs = jobConfig.epochs || '—';
+        const cfgBatch = jobConfig.batch_size || '—';
+        const cfgLR = jobConfig.learning_rate || '—';
+        const cfgOptimizer = jobConfig.optimizer || '—';
+        const cfgScheduler = jobConfig.scheduler || '—';
+        const cfgCkptInterval = jobConfig.checkpoint_interval || '—';
+        const cfgAmp = jobConfig.amp != null ? (jobConfig.amp ? 'On' : 'Off') : 'Auto';
+        const cfgGradAccum = jobConfig.gradient_accumulation_steps || '1';
+        const cfgWeightDecay = jobConfig.weight_decay != null ? jobConfig.weight_decay : '—';
+        const cfgMode = jobConfig.dataset_mode || '';
+        const cfgModeLabel = cfgMode === 'time_averaged_3d' ? '3D Volume'
+            : cfgMode === 'time_averaged_2d' ? '2D Slice'
+            : cfgMode === 'stats_table' ? 'Stats Table'
+            : cfgMode || 'auto (2D)';
 
         const modal = document.createElement('div');
         modal.id = 'ai-job-detail-modal';
@@ -1047,6 +1093,10 @@ function renderTraining(container) {
                         <div>
                             <div style="font-size:15px;font-weight:600;color:var(--text-primary);">${escHtml(j.run_name)}</div>
                             <div style="font-size:11px;color:var(--text-muted);margin-top:1px;">Job #${j.id} · ${escHtml(j.model_family)} · ${statusBadge(j.status)}</div>
+                            ${j.artifact_directory ? (() => {
+                                const absPath = j.artifact_directory.startsWith('/') ? j.artifact_directory : '/simulations/Queue/' + j.artifact_directory;
+                                return `<div style="font-size:10px;color:var(--text-muted);margin-top:3px;font-family:var(--font-mono);word-break:break-all;opacity:0.7;user-select:all;" title="Artifact directory on server — click to select">📁 ${escHtml(absPath)}</div>`;
+                            })() : ''}
                         </div>
                     </div>
                     <button class="btn-icon ai-job-detail-close" style="font-size:18px;color:var(--text-muted);">✕</button>
@@ -1112,6 +1162,80 @@ function renderTraining(container) {
                 <div style="padding:12px 24px;background:rgba(239,68,68,0.08);border-bottom:1px solid var(--border-color);">
                     <div style="font-size:12px;color:#f87171;font-weight:500;">Error</div>
                     <div style="font-size:12px;color:#fca5a5;margin-top:4px;font-family:var(--font-mono);white-space:pre-wrap;">${escHtml(j.failure_reason)}</div>
+                </div>` : ''}
+
+                <!-- Training Configuration -->
+                ${(cfgInputParams.length > 0 || cfgTargets.length > 0 || cfgInputFields.length > 0) ? `
+                <div style="padding:14px 24px;border-bottom:1px solid var(--border-color);">
+                    <div style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">Model & I/O Configuration</div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 20px;font-size:12px;">
+                        <!-- Model Info -->
+                        <div>
+                            <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:3px;">Model</div>
+                            <div style="font-weight:500;color:var(--text-primary);">${escHtml(j.model_family.toUpperCase())}</div>
+                        </div>
+                        <div>
+                            <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:3px;">Data Mode</div>
+                            <div style="font-weight:500;color:var(--text-primary);">${escHtml(cfgModeLabel)}</div>
+                        </div>
+
+                        <!-- Input Parameters -->
+                        ${cfgInputParams.length > 0 ? `
+                        <div style="grid-column:1/-1;">
+                            <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:4px;">Input Parameters</div>
+                            <div style="display:flex;flex-wrap:wrap;gap:4px;">
+                                ${cfgInputParams.map(p => `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;background:rgba(59,130,246,0.12);color:#60a5fa;border:1px solid rgba(59,130,246,0.2);">${escHtml(p)}</span>`).join('')}
+                            </div>
+                        </div>` : ''}
+
+                        <!-- Input Fields (VTK) -->
+                        ${cfgInputFields.length > 0 ? `
+                        <div style="grid-column:1/-1;">
+                            <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:4px;">Input Fields</div>
+                            <div style="display:flex;flex-wrap:wrap;gap:4px;">
+                                ${cfgInputFields.map(f => {
+                                    const fname = typeof f === 'string' ? f : (f.field_name || f.channel_name || '?');
+                                    const pvd = typeof f === 'object' ? (f.pvd_source || '') : '';
+                                    const pvdLabel = pvd && pvd !== 'self' && pvd !== 'derived' ? ' ← ' + pvd : '';
+                                    return `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;background:rgba(139,92,246,0.12);color:#a78bfa;border:1px solid rgba(139,92,246,0.2);">${escHtml(fname)}${pvdLabel ? '<span style="color:var(--text-muted);font-size:9px;">' + escHtml(pvdLabel) + '</span>' : ''}</span>`;
+                                }).join('')}
+                            </div>
+                        </div>` : ''}
+
+                        <!-- Targets -->
+                        ${cfgTargets.length > 0 ? `
+                        <div style="grid-column:1/-1;">
+                            <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:4px;">Output Targets</div>
+                            <div style="display:flex;flex-wrap:wrap;gap:4px;">
+                                ${cfgTargets.map(t => `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;background:rgba(245,158,11,0.12);color:#fbbf24;border:1px solid rgba(245,158,11,0.2);">${escHtml(t)}</span>`).join('')}
+                            </div>
+                        </div>` : ''}
+
+                        <!-- Spatial Channels -->
+                        ${cfgChannels.length > 0 ? `
+                        <div style="grid-column:1/-1;">
+                            <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:4px;">Spatial Channels</div>
+                            <div style="display:flex;flex-wrap:wrap;gap:4px;">
+                                ${cfgChannels.map(c => `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;background:rgba(16,185,129,0.12);color:#34d399;border:1px solid rgba(16,185,129,0.2);">${escHtml(c)}</span>`).join('')}
+                            </div>
+                        </div>` : ''}
+                    </div>
+
+                    <!-- Hyperparameters -->
+                    <div style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.05);">
+                        <div style="color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:6px;">Hyperparameters</div>
+                        <div style="display:flex;flex-wrap:wrap;gap:12px;font-size:11px;">
+                            <div><span style="color:var(--text-muted);">Epochs:</span> <span style="color:var(--text-primary);font-weight:500;font-family:var(--font-mono);">${cfgEpochs}</span></div>
+                            <div><span style="color:var(--text-muted);">Batch:</span> <span style="color:var(--text-primary);font-weight:500;font-family:var(--font-mono);">${cfgBatch}</span></div>
+                            <div><span style="color:var(--text-muted);">LR:</span> <span style="color:var(--text-primary);font-weight:500;font-family:var(--font-mono);">${cfgLR}</span></div>
+                            <div><span style="color:var(--text-muted);">Optimizer:</span> <span style="color:var(--text-primary);font-weight:500;">${escHtml(String(cfgOptimizer))}</span></div>
+                            <div><span style="color:var(--text-muted);">Scheduler:</span> <span style="color:var(--text-primary);font-weight:500;">${escHtml(String(cfgScheduler))}</span></div>
+                            <div><span style="color:var(--text-muted);">Ckpt:</span> <span style="color:var(--text-primary);font-weight:500;font-family:var(--font-mono);">every ${cfgCkptInterval}</span></div>
+                            <div><span style="color:var(--text-muted);">AMP:</span> <span style="color:var(--text-primary);font-weight:500;">${cfgAmp}</span></div>
+                            <div><span style="color:var(--text-muted);">Grad Accum:</span> <span style="color:var(--text-primary);font-weight:500;font-family:var(--font-mono);">${cfgGradAccum}×</span></div>
+                            <div><span style="color:var(--text-muted);">Weight Decay:</span> <span style="color:var(--text-primary);font-weight:500;font-family:var(--font-mono);">${cfgWeightDecay}</span></div>
+                        </div>
+                    </div>
                 </div>` : ''}
 
                 <!-- Actions -->
@@ -1473,12 +1597,52 @@ function renderTraining(container) {
                         resultDiv.style.display = '';
                         resultDiv.style.background = 'rgba(99,102,241,0.1)';
                         resultDiv.style.color = '#818cf8';
-                        resultDiv.textContent = `Running ${n} predictions... This may take a minute.`;
+                        resultDiv.textContent = `Initializing sweep (${n} predictions)...`;
+
+                        // Poll for progress while sweep runs
+                        let progressPollTimer = null;
+                        const formatTime = (s) => {
+                            if (s < 60) return `${Math.round(s)}s`;
+                            const m = Math.floor(s / 60);
+                            const sec = Math.round(s % 60);
+                            return `${m}m ${sec}s`;
+                        };
+                        const pollProgress = async () => {
+                            try {
+                                const prog = await aiApi.get(`/ai/training-jobs/${jobId}/inference-progress`);
+                                if (prog && prog.progress) {
+                                    const p = prog.progress;
+                                    const pct = p.percent || 0;
+                                    const cur = p.current || 0;
+                                    const tot = p.total || n;
+                                    const elapsed = p.elapsed_seconds || 0;
+                                    const eta = p.eta_seconds || 0;
+                                    const phase = p.phase === 'loading_model' ? 'Loading model...' : 'Predicting';
+                                    const valInfo = p.current_value !== undefined ? ` · ${p.param_name || ''} = ${p.current_value}` : '';
+
+                                    // Progress bar
+                                    resultDiv.innerHTML = `
+                                        <div style="margin-bottom:6px;font-weight:600;">${phase} ${cur}/${tot} (${pct}%)${valInfo}</div>
+                                        <div style="width:100%;background:rgba(99,102,241,0.15);border-radius:4px;height:6px;overflow:hidden;margin-bottom:4px;">
+                                            <div style="width:${pct}%;background:linear-gradient(90deg,#6366f1,#818cf8);height:100%;border-radius:4px;transition:width 0.3s ease;"></div>
+                                        </div>
+                                        <div style="font-size:10px;color:var(--text-muted);">
+                                            Elapsed: ${formatTime(elapsed)} · ETA: ~${formatTime(eta)}
+                                        </div>
+                                    `;
+                                    runBtn.innerHTML = `<span class="spinner" style="width:14px;height:14px;"></span> ${cur}/${tot}`;
+                                }
+                            } catch (_) {}
+                        };
+                        // Start polling immediately and every 1.5s
+                        progressPollTimer = setInterval(pollProgress, 1500);
+                        setTimeout(pollProgress, 500);
 
                         try {
                             const res = await aiApi.post(`/ai/training-jobs/${jobId}/infer-sweep`, {
                                 param_name: paramName, start, end, step
                             });
+                            clearInterval(progressPollTimer);
                             if (res && res.status === 'ok') {
                                 const sw = res.sweep || {};
                                 const outDir = res.output_dir || sw.output_dir || '';
@@ -1510,6 +1674,7 @@ function renderTraining(container) {
                                 resultDiv.textContent = 'Error: ' + (res?.error || res?.message || 'Unknown error');
                             }
                         } catch (e) {
+                            clearInterval(progressPollTimer);
                             resultDiv.style.background = 'rgba(239,68,68,0.1)';
                             resultDiv.style.color = '#f87171';
                             resultDiv.textContent = 'Network error: ' + e.message;
@@ -1998,10 +2163,20 @@ function renderTraining(container) {
                                     <label class="form-label">Model Family</label>
                                     <select class="form-select" id="ai-tj-model">
                                         <option value="unet" selected>U-Net (Encoder-Decoder)</option>
+                                        <option value="transolver">Transolver (Physics-Attention Transformer)</option>
                                         <option value="gnn">GNN (Graph Neural Network)</option>
                                         <option value="mlp">MLP (Multi-Layer Perceptron)</option>
                                     </select>
                                     <div id="ai-tj-model-note" style="font-size:11px;color:var(--text-muted);margin-top:4px;">2D/3D structured CFD fields, slices, voxel grids, image-like field prediction</div>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Data Mode</label>
+                                    <select class="form-select" id="ai-tj-data-mode">
+                                        <option value="time_averaged_2d" selected>2D Slice (e.g., SliceX, SliceY)</option>
+                                        <option value="time_averaged_3d">3D Volume (full domain)</option>
+                                        <option value="stats_table">Stats Table (scalar outputs only)</option>
+                                    </select>
+                                    <div id="ai-tj-mode-note" style="font-size:11px;color:var(--text-muted);margin-top:4px;">Determines spatial dimensions and model architecture (2D vs 3D convolutions)</div>
                                 </div>
                             </div>
                             <div class="form-group" style="margin-bottom:0;">
@@ -2052,21 +2227,32 @@ function renderTraining(container) {
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-left:auto;transition:transform 0.2s;" id="ai-advanced-chevron"><polyline points="6 9 12 15 18 9"></polyline></svg>
                         </div>
                         <div id="ai-advanced-body" style="padding:0 16px 16px;">
+                            <!-- Auto-suggest banner -->
+                            <div id="ai-autosuggest-bar" style="display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:8px 12px;border-radius:8px;background:rgba(139,92,246,0.06);border:1px solid rgba(139,92,246,0.15);">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2"><path d="M12 2a7 7 0 017 7c0 2.38-1.19 4.47-3 5.74V17a2 2 0 01-2 2h-4a2 2 0 01-2-2v-2.26C6.19 13.47 5 11.38 5 9a7 7 0 017-7z"></path><line x1="9" y1="21" x2="15" y2="21"></line></svg>
+                                <span style="flex:1;font-size:11px;color:#a78bfa;">Set optimal hyperparameters based on your GPU and dataset</span>
+                                <button class="btn" id="ai-autosuggest-btn" style="padding:4px 12px;font-size:11px;background:rgba(139,92,246,0.12);color:#a78bfa;border:1px solid rgba(139,92,246,0.25);border-radius:6px;cursor:pointer;white-space:nowrap;">
+                                    ✨ Auto-Suggest
+                                </button>
+                            </div>
+                            <div id="ai-autosuggest-msg" style="display:none;margin-bottom:10px;padding:8px 12px;border-radius:6px;background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.15);font-size:11px;color:#10b981;"></div>
+
                             <div class="ai-form-grid">
-                                <div class="form-group">
-                                    <label class="form-label">Epochs</label>
+                                <!-- Core Training -->
+                                <div class="form-group" title="Number of full passes through the training data. More epochs = longer training but potentially better convergence. 3D training may need fewer epochs due to richer spatial information.">
+                                    <label class="form-label">Epochs <span class="ai-tooltip-icon" data-tip="Total training iterations over the full dataset. Typical: 200–500 for U-Net, 500–1000 for GNN.">ⓘ</span></label>
                                     <input type="number" class="form-input" id="ai-tj-epochs" value="500" min="1" max="10000">
                                 </div>
-                                <div class="form-group">
-                                    <label class="form-label">Batch Size</label>
+                                <div class="form-group" title="Samples processed per optimizer step. Larger batches = smoother gradients but more VRAM. For 3D data, use batch_size=1 with gradient accumulation.">
+                                    <label class="form-label">Batch Size <span class="ai-tooltip-icon" data-tip="Samples per GPU per step. 3D volumes may require batch=1 due to VRAM. Use gradient accumulation to simulate larger batches.">ⓘ</span></label>
                                     <input type="number" class="form-input" id="ai-tj-batch" value="4" min="1" max="65536">
                                 </div>
-                                <div class="form-group">
-                                    <label class="form-label">Learning Rate</label>
+                                <div class="form-group" title="Step size for weight updates. Too high = unstable training, too low = slow convergence. Typical: 1e-4 to 3e-4 for AdamW.">
+                                    <label class="form-label">Learning Rate <span class="ai-tooltip-icon" data-tip="Controls how aggressively weights are updated. Lower values are safer but slower. 3e-4 is a good starting point for AdamW.">ⓘ</span></label>
                                     <input type="number" class="form-input" id="ai-tj-lr" value="0.0003" step="0.0001" min="0.000001" max="1">
                                 </div>
-                                <div class="form-group">
-                                    <label class="form-label">Optimizer</label>
+                                <div class="form-group" title="Gradient descent algorithm. AdamW is the best general-purpose choice with decoupled weight decay.">
+                                    <label class="form-label">Optimizer <span class="ai-tooltip-icon" data-tip="AdamW (recommended): adaptive learning rate + weight decay. Adam: no weight decay. SGD: simple, may need tuning.">ⓘ</span></label>
                                     <select class="form-select" id="ai-tj-optimizer">
                                         <option value="adamw" selected>AdamW</option>
                                         <option value="adam">Adam</option>
@@ -2074,8 +2260,8 @@ function renderTraining(container) {
                                         <option value="rmsprop">RMSProp</option>
                                     </select>
                                 </div>
-                                <div class="form-group">
-                                    <label class="form-label">LR Scheduler</label>
+                                <div class="form-group" title="Learning rate schedule over training. Cosine annealing smoothly decays LR; OneCycle ramps up then down.">
+                                    <label class="form-label">LR Scheduler <span class="ai-tooltip-icon" data-tip="Cosine: smooth decay to near-zero. OneCycle: warmup → peak → decay (best with known epoch count). Plateau: reduce when loss stalls.">ⓘ</span></label>
                                     <select class="form-select" id="ai-tj-scheduler">
                                         <option value="cosine" selected>Cosine Annealing</option>
                                         <option value="reduce_on_plateau">Reduce on Plateau</option>
@@ -2084,11 +2270,47 @@ function renderTraining(container) {
                                         <option value="">None</option>
                                     </select>
                                 </div>
-                                <div class="form-group">
-                                    <label class="form-label">Checkpoint Interval</label>
+                                <div class="form-group" title="Save a model checkpoint every N epochs. Lower = more checkpoints (more disk space) but easier to resume from a good state.">
+                                    <label class="form-label">Checkpoint Interval <span class="ai-tooltip-icon" data-tip="How often to save model weights (in epochs). 10 is a good default; set lower (e.g. 5) if training is unstable.">ⓘ</span></label>
                                     <input type="number" class="form-input" id="ai-tj-ckpt" value="10" min="1" max="1000">
                                 </div>
+
+                                <!-- Memory & Performance -->
+                                <div class="form-group" title="Mixed precision (FP16) training halves VRAM usage for activations with minimal accuracy impact. Essential for 3D models.">
+                                    <label class="form-label">Mixed Precision (AMP) <span class="ai-tooltip-icon" data-tip="Uses float16 for forward/backward pass, float32 for weight updates. Halves VRAM for activations. Strongly recommended for 3D.">ⓘ</span></label>
+                                    <select class="form-select" id="ai-tj-amp">
+                                        <option value="auto" selected>Auto (on for 3D)</option>
+                                        <option value="true">Enabled</option>
+                                        <option value="false">Disabled</option>
+                                    </select>
+                                </div>
+                                <div class="form-group" title="Accumulate gradients over N mini-batches before updating weights. Effectively multiplies your batch size without using more VRAM. E.g., batch=1 × accum=4 = effective batch of 4.">
+                                    <label class="form-label">Gradient Accumulation <span class="ai-tooltip-icon" data-tip="Simulates larger batch sizes by accumulating gradients. Effective batch = batch_size × accum_steps. Essential for 3D where batch=1 is the max.">ⓘ</span></label>
+                                    <input type="number" class="form-input" id="ai-tj-grad-accum" value="1" min="1" max="64">
+                                </div>
+
+                                <!-- Regularization -->
+                                <div class="form-group" title="L2 regularization strength. Prevents overfitting by penalizing large weights. 0 = no regularization.">
+                                    <label class="form-label">Weight Decay <span class="ai-tooltip-icon" data-tip="L2 regularization. Higher = more regularization. Typical range: 0.01–0.1 for AdamW, 0 for Adam.">ⓘ</span></label>
+                                    <input type="number" class="form-input" id="ai-tj-weight-decay" value="0.01" step="0.01" min="0" max="1">
+                                </div>
+
+                                <!-- Data Processing -->
+                                <div class="form-group" title="Downsample the spatial grid before training. 'Auto' only downsamples if the grid exceeds PyTorch's 2^31 element indexing limit. Explicit factors (1.5×, 2×, etc.) always downsample — useful for faster iteration on large 3D datasets.">
+                                    <label class="form-label">Spatial Downsampling <span class="ai-tooltip-icon" data-tip="Reduces spatial resolution of training data. 'Auto': only if grid too large for PyTorch's int32 indexing (>2B elements). Explicit: always downsample by this factor. Trades spatial detail for speed and VRAM.">ⓘ</span></label>
+                                    <select class="form-select" id="ai-tj-downsample">
+                                        <option value="auto" selected>Auto (only if needed)</option>
+                                        <option value="1">None (full resolution)</option>
+                                        <option value="1.5">1.5× (moderate)</option>
+                                        <option value="2">2× (recommended for 3D)</option>
+                                        <option value="3">3× (fast iteration)</option>
+                                        <option value="4">4× (very coarse)</option>
+                                    </select>
+                                </div>
                             </div>
+
+                            <!-- VRAM estimate -->
+                            <div id="ai-vram-estimate" style="display:none;margin-top:10px;padding:8px 12px;border-radius:6px;border:1px solid var(--border-color,#333);font-size:11px;color:var(--text-muted);"></div>
                         </div>
                     </div>
                 </div>
@@ -2143,16 +2365,29 @@ function renderTraining(container) {
                 note: '2D/3D structured CFD fields, slices, voxel grids, image-like field prediction',
                 epochs: 500, batch_size: 4, learning_rate: 0.0003,
                 optimizer: 'adamw', scheduler: 'cosine', checkpoint_interval: 10,
+                amp: 'auto', gradient_accumulation_steps: 1, weight_decay: 0.01,
+                spatial_downsample: 'auto',
+            },
+            transolver: {
+                note: 'Physics-Attention transformer for structured CFD grids (voxels/slices) — not for unstructured body meshes (STL)',
+                epochs: 500, batch_size: 4, learning_rate: 0.0003,
+                optimizer: 'adamw', scheduler: 'cosine', checkpoint_interval: 10,
+                amp: 'true', gradient_accumulation_steps: 1, weight_decay: 0.01,
+                spatial_downsample: 'auto',
             },
             gnn: {
                 note: 'Unstructured meshes, particle neighborhoods, irregular geometry, graph-based flow fields',
                 epochs: 800, batch_size: 2, learning_rate: 0.0003,
                 optimizer: 'adamw', scheduler: 'reduce_on_plateau', checkpoint_interval: 15,
+                amp: 'false', gradient_accumulation_steps: 1, weight_decay: 0.01,
+                spatial_downsample: '1',
             },
             mlp: {
                 note: 'Low-dimensional surrogate, pointwise regression, coordinates/RPM/time → field values',
                 epochs: 500, batch_size: 8192, learning_rate: 0.001,
                 optimizer: 'adamw', scheduler: 'onecycle', checkpoint_interval: 10,
+                amp: 'false', gradient_accumulation_steps: 1, weight_decay: 0,
+                spatial_downsample: '1',
             },
         };
         function applyModelDefaults(family) {
@@ -2165,9 +2400,14 @@ function renderTraining(container) {
             document.getElementById('ai-tj-optimizer').value = d.optimizer;
             document.getElementById('ai-tj-scheduler').value = d.scheduler;
             document.getElementById('ai-tj-ckpt').value = d.checkpoint_interval;
+            document.getElementById('ai-tj-amp').value = d.amp;
+            document.getElementById('ai-tj-grad-accum').value = d.gradient_accumulation_steps;
+            document.getElementById('ai-tj-weight-decay').value = d.weight_decay;
+            document.getElementById('ai-tj-downsample').value = d.spatial_downsample || 'auto';
         }
         modelSelect.addEventListener('change', () => {
             applyModelDefaults(modelSelect.value);
+            _updateVramEstimate();
         });
 
         // ---- Resume / Transfer / Restart pre-fill ----
@@ -2188,6 +2428,11 @@ function renderTraining(container) {
             if (sourceConfig.optimizer) document.getElementById('ai-tj-optimizer').value = sourceConfig.optimizer;
             if (sourceConfig.scheduler) document.getElementById('ai-tj-scheduler').value = sourceConfig.scheduler;
             if (sourceConfig.checkpoint_interval) document.getElementById('ai-tj-ckpt').value = sourceConfig.checkpoint_interval;
+            if (sourceConfig.dataset_mode) document.getElementById('ai-tj-data-mode').value = sourceConfig.dataset_mode;
+            if (sourceConfig.amp != null) document.getElementById('ai-tj-amp').value = String(sourceConfig.amp);
+            if (sourceConfig.gradient_accumulation_steps) document.getElementById('ai-tj-grad-accum').value = sourceConfig.gradient_accumulation_steps;
+            if (sourceConfig.weight_decay != null) document.getElementById('ai-tj-weight-decay').value = sourceConfig.weight_decay;
+            if (sourceConfig.spatial_downsample) document.getElementById('ai-tj-downsample').value = sourceConfig.spatial_downsample;
 
             // Auto-generate a run name
             const suffix = isContinue ? '_cont' : isRestart ? '_restart' : '_transfer';
@@ -2454,8 +2699,66 @@ function renderTraining(container) {
                                 _refreshFieldStyles();
                             }
                         }
+
+                        // Upgrade body geometry section from API registry
+                        const bodyRegistry = cfgRes.channel_registry
+                            .filter(ch => !ch.is_template && ch.category === 'body_geometry')
+                            .map(ch => ({
+                                name: ch.name,
+                                label: ch.display_name,
+                                desc: ch.description,
+                                icon: ch.icon || '',
+                                defaultOn: ch.default_on || false,
+                            }));
+                        if (bodyRegistry.length > 0) {
+                            const bodyCard = fieldList.querySelector('[data-channel-group="body_geometry"] .stats-category-body');
+                            if (bodyCard) {
+                                bodyCard.innerHTML = bodyRegistry.map(ch => {
+                                    const fkey = 'spatial:' + ch.name;
+                                    return `
+                                    <button class="stats-col-btn" data-field-key="${escHtml(fkey)}" data-field-type="spatial" data-field-value="${ch.name}" title="${escHtml(ch.desc)}"
+                                        onclick="_toggleIOField(this)">
+                                        <span style="margin-right:4px;">${ch.icon}</span>
+                                        ${escHtml(ch.label)}
+                                    </button>`;
+                                }).join('');
+                                _refreshFieldStyles();
+                            }
+                        }
                     }
                 }).catch(() => {});
+
+                // === 3b. Body Geometry Channels ===
+                if (!isStatsMode) {
+                    const bodyChannels = [
+                        { name: 'static_body_mask', label: 'Static Body Mask', desc: 'Binary mask at static walls, baffles, fixed geometry (BC==0)', icon: '\uD83E\uDDF1', defaultOn: false },
+                        { name: 'moving_body_mask', label: 'Moving Body / Rotating Zone', desc: 'Binary mask in rotating zones and moving body regions (BC==1) — critical for impeller-driven flows', icon: '\u2699\uFE0F', defaultOn: true },
+                        { name: 'all_body_mask', label: 'All Bodies Combined', desc: 'Binary mask wherever any solid body exists (static OR moving)', icon: '\u25A3', defaultOn: false },
+                        { name: 'body_sdf', label: 'Body SDF', desc: 'Signed distance to nearest body surface. Positive in fluid, negative inside bodies.', icon: '\uD83D\uDCCF', defaultOn: false },
+                    ];
+
+                    html += `
+                        <div class="stats-category-card" style="margin-top:8px;" data-channel-group="body_geometry">
+                            <div class="stats-category-header" onclick="this.parentNode.classList.toggle('collapsed')">
+                                <div class="stats-category-info">
+                                    <span class="stats-category-title">Body Geometry</span>
+                                    <span class="stats-category-meta">${bodyChannels.length} channels · from BoundaryConditions.pvd</span>
+                                </div>
+                                <svg class="stats-section-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                            </div>
+                            <div class="stats-category-body">
+                                ${bodyChannels.map(ch => {
+                                    const fkey = 'spatial:' + ch.name;
+                                    return `
+                                    <button class="stats-col-btn" data-field-key="${escHtml(fkey)}" data-field-type="spatial" data-field-value="${ch.name}" title="${escHtml(ch.desc)}"
+                                        onclick="_toggleIOField(this)">
+                                        <span style="margin-right:4px;">${ch.icon}</span>
+                                        ${escHtml(ch.label)}
+                                    </button>`;
+                                }).join('')}
+                            </div>
+                        </div>`;
+                }
             }
 
             // === 4. Stats table columns (for stats mode) ===
@@ -2637,13 +2940,34 @@ function renderTraining(container) {
                         let placed = false;
                         const pvdCards = fieldList.querySelectorAll('.stats-category-card');
 
-                        // 1) Match by source field name — find card with a button for the same field
-                        if (sourceField) {
+                        // 1) Best match: card with a button matching BOTH the source PVD and field name
+                        if (sourceField && sourcePvd) {
+                            const pvdBase = sourcePvd.replace('.pvd', '');
                             for (const card of pvdCards) {
                                 const btns = card.querySelectorAll('.stats-col-btn[data-field-key]');
                                 for (const btn of btns) {
                                     const fk = btn.getAttribute('data-field-key') || '';
-                                    // vtk field keys look like "vtk:SliceX_0.000.pvd:Velocity Vector (m/s)"
+                                    // vtk field keys: "vtk:<pvd_name>:<field_name>"
+                                    if (fk === 'vtk:' + sourcePvd + ':' + sourceField ||
+                                        fk === 'vtk:' + pvdBase + ':' + sourceField) {
+                                        const body = card.querySelector('.stats-category-body');
+                                        if (body) {
+                                            body.insertAdjacentHTML('beforeend', btnHtml);
+                                            placed = true;
+                                        }
+                                        break;
+                                    }
+                                }
+                                if (placed) break;
+                            }
+                        }
+
+                        // 2) Fallback: match by source field name only (any PVD card)
+                        if (!placed && sourceField) {
+                            for (const card of pvdCards) {
+                                const btns = card.querySelectorAll('.stats-col-btn[data-field-key]');
+                                for (const btn of btns) {
+                                    const fk = btn.getAttribute('data-field-key') || '';
                                     if (fk.startsWith('vtk:') && fk.endsWith(':' + sourceField)) {
                                         const body = card.querySelector('.stats-category-body');
                                         if (body) {
@@ -3125,6 +3449,9 @@ function renderTraining(container) {
             const optimizer = document.getElementById('ai-tj-optimizer').value;
             const scheduler = document.getElementById('ai-tj-scheduler').value;
             const ckptInterval = parseInt(document.getElementById('ai-tj-ckpt').value, 10);
+            const ampVal = document.getElementById('ai-tj-amp').value;
+            const gradAccum = parseInt(document.getElementById('ai-tj-grad-accum').value, 10);
+            const weightDecay = parseFloat(document.getElementById('ai-tj-weight-decay').value);
 
             if (epochs && epochs > 0) config.epochs = epochs;
             if (batchSize && batchSize > 0) config.batch_size = batchSize;
@@ -3132,6 +3459,21 @@ function renderTraining(container) {
             if (optimizer) config.optimizer = optimizer;
             if (scheduler) config.scheduler = scheduler;
             if (ckptInterval && ckptInterval > 0) config.checkpoint_interval = ckptInterval;
+            // AMP: 'auto' → let backend decide, 'true'/'false' → explicit
+            if (ampVal === 'true') config.amp = true;
+            else if (ampVal === 'false') config.amp = false;
+            // else 'auto' — don't set, let the backend auto-detect based on 3D mode
+            if (gradAccum && gradAccum > 0) config.gradient_accumulation_steps = gradAccum;
+            if (!isNaN(weightDecay) && weightDecay >= 0) config.weight_decay = weightDecay;
+            // Spatial downsampling: 'auto' or a numeric factor
+            const downsampleVal = document.getElementById('ai-tj-downsample').value;
+            if (downsampleVal && downsampleVal !== 'auto') {
+                const factor = parseFloat(downsampleVal);
+                if (factor > 1) config.spatial_downsample = factor;
+                // factor === 1 means "none" — don't send (backend default is auto)
+            } else if (downsampleVal === 'auto') {
+                config.spatial_downsample = 'auto';
+            }
 
             // I/O selections from unified mode-toggle Sets
             const inputs = window._ioInputs;
@@ -3197,10 +3539,65 @@ function renderTraining(container) {
             if (checkedComputed.length > 0) config.computed_channels = checkedComputed;
             if (checkedOutputs.length > 0) config.selected_target_fields = checkedOutputs;
             if (customChannels.length > 0) config.custom_channels = customChannels;
+            // Dataset mode — read from the user's explicit selection
+            config.dataset_mode = document.getElementById('ai-tj-data-mode').value;
 
-            // Include dataset_mode from the selected dataset
-            const selectedDs = (dsData?.datasets || []).find(d => d.id === datasetId);
-            if (selectedDs && selectedDs.dataset_mode) config.dataset_mode = selectedDs.dataset_mode;
+            // --- Validate mode ↔ field compatibility ---
+            // Check that selected I/O fields come from PVDs matching the chosen mode
+            if (config.dataset_mode !== 'stats_table') {
+                const selectedDs = (dsData?.datasets || []).find(d => d.id === datasetId);
+                const pvdInv = _safeParse(selectedDs?.pvd_inventory_json) || {};
+
+                // Build sets of PVD names per category
+                const slicePvdNames = new Set(
+                    (pvdInv.slices_2d || []).map(e => e.pvd_name || e)
+                );
+                const volumePvdNames = new Set(
+                    (pvdInv.volumes_3d || []).map(e => e.pvd_name || e)
+                );
+
+                // Collect all selected VTK field PVD sources
+                const allFieldKeys = [...(window._ioInputs || []), ...(window._ioOutputs || [])];
+                const fieldPvdSources = new Set();
+                for (const key of allFieldKeys) {
+                    const btn = document.querySelector(`[data-field-key="${CSS.escape(key)}"]`);
+                    if (!btn) continue;
+                    const type = btn.dataset.fieldType;
+                    if (type === 'vtk' || type === 'derived') {
+                        try {
+                            const desc = JSON.parse(btn.dataset.fieldValue || '{}');
+                            const pvdSrc = desc.pvd_source || desc.source_pvd || '';
+                            if (pvdSrc && pvdSrc !== 'self') fieldPvdSources.add(pvdSrc);
+                        } catch {}
+                    }
+                }
+
+                // Check for mismatch
+                if (config.dataset_mode === 'time_averaged_3d' && fieldPvdSources.size > 0) {
+                    const hasSliceFields = [...fieldPvdSources].some(s => slicePvdNames.has(s));
+                    const hasVolumeFields = [...fieldPvdSources].some(s => volumePvdNames.has(s));
+                    if (hasSliceFields && !hasVolumeFields) {
+                        showToast(
+                            '⚠ Mode mismatch: You selected "3D Volume" mode but all your I/O fields come from 2D Slice PVDs. ' +
+                            'Either switch to "2D Slice" mode, or choose fields from a Volume PVD.',
+                            'error'
+                        );
+                        return;
+                    }
+                }
+                if (config.dataset_mode === 'time_averaged_2d' && fieldPvdSources.size > 0) {
+                    const hasSliceFields = [...fieldPvdSources].some(s => slicePvdNames.has(s));
+                    const hasVolumeFields = [...fieldPvdSources].some(s => volumePvdNames.has(s));
+                    if (hasVolumeFields && !hasSliceFields) {
+                        showToast(
+                            '⚠ Mode mismatch: You selected "2D Slice" mode but your I/O fields come from 3D Volume PVDs. ' +
+                            'Either switch to "3D Volume" mode, or choose fields from a Slice PVD.',
+                            'error'
+                        );
+                        return;
+                    }
+                }
+            }
 
             if (Object.keys(config).length > 0) body.config = config;
 
@@ -3430,6 +3827,284 @@ function renderTraining(container) {
             grid.innerHTML = '<div style="padding:12px;font-size:12px;color:var(--text-muted);">Failed to load GPU status</div>';
         }
     }
+
+    // ---- Auto-Suggest & VRAM Estimation ----
+    let _cachedGpuInfo = null;
+
+    async function _getGpuInfo() {
+        if (_cachedGpuInfo) return _cachedGpuInfo;
+        try {
+            const gpus = await aiApi.get('/gpus');
+            if (Array.isArray(gpus) && gpus.length > 0) {
+                _cachedGpuInfo = gpus;
+            }
+        } catch { /* ignore */ }
+        return _cachedGpuInfo || [];
+    }
+
+    function _getDataMode() {
+        const el = document.getElementById('ai-tj-data-mode');
+        return el ? el.value : 'time_averaged_2d';
+    }
+
+    function _is3D() {
+        return _getDataMode().includes('3d');
+    }
+
+    /**
+     * Estimate VRAM needed for a single training step.
+     * Based on the U-Net Pix2Pix architecture:
+     *   - Input:  (B, C_in, D, H, W) or (B, C_in, H, W)
+     *   - Feature maps at each level: channels double, spatial halves
+     *   - Backward pass stores ~2x the forward activations
+     */
+    function _estimateVramGB(batchSize, is3d, useAmp) {
+        const modelFamily = document.getElementById('ai-tj-model').value;
+        const bytesPerEl = useAmp ? 2 : 4; // fp16 vs fp32
+
+        if (modelFamily === 'mlp') {
+            return 0.5; // MLP is tiny
+        }
+
+        if (modelFamily === 'gnn') {
+            return batchSize * 2.0; // rough estimate
+        }
+
+        // UNet estimation
+        const inCh = 5;  // typical: volume_fraction + x/y/z_norm + param
+        const outCh = 3; // velocity vector components
+        const convBase = 32;
+        const depth = 4;
+
+        let totalBytes = 0;
+
+        // Spatial dims (typical for this dataset)
+        let dims;
+        if (is3d) {
+            dims = [301, 476, 300]; // 3D volume
+        } else {
+            dims = [476, 300]; // 2D slice
+        }
+
+        // Input + target tensors
+        const spatialSize = dims.reduce((a, b) => a * b, 1);
+        totalBytes += batchSize * inCh * spatialSize * bytesPerEl;   // input
+        totalBytes += batchSize * outCh * spatialSize * bytesPerEl;  // target
+
+        // Feature maps at each encoder level (forward + backward ≈ 3x)
+        for (let d = 0; d <= depth; d++) {
+            const ch = convBase * Math.pow(2, d);
+            const levelSize = dims.map(s => Math.floor(s / Math.pow(2, d)));
+            const levelSpatial = levelSize.reduce((a, b) => a * b, 1);
+            // Encoder + decoder + skip connections ≈ 3x feature maps
+            totalBytes += batchSize * ch * levelSpatial * bytesPerEl * 3;
+        }
+
+        // Model params + optimizer state (~2x for AdamW)
+        const paramCount = 37_800_000; // typical for conv_size=32, depth=4
+        totalBytes += paramCount * 4 * 3; // params (fp32) + momentum + variance
+
+        // Gradient buffers
+        totalBytes += paramCount * bytesPerEl;
+
+        return totalBytes / (1024 ** 3);
+    }
+
+    function _updateVramEstimate() {
+        const el = document.getElementById('ai-vram-estimate');
+        if (!el) return;
+
+        const batchSize = parseInt(document.getElementById('ai-tj-batch').value, 10) || 1;
+        const ampVal = document.getElementById('ai-tj-amp').value;
+        const is3d = _is3D();
+        const useAmp = ampVal === 'true' || (ampVal === 'auto' && is3d);
+        const gradAccum = parseInt(document.getElementById('ai-tj-grad-accum').value, 10) || 1;
+
+        const vramGB = _estimateVramGB(batchSize, is3d, useAmp);
+        const effectiveBatch = batchSize * gradAccum;
+
+        // Get downsample factor
+        const dsVal = document.getElementById('ai-tj-downsample').value;
+        let dsFactor = 1;
+        if (dsVal === 'auto' && is3d) {
+            // Auto: estimate if downsampling would trigger (301×476×300 × 64 > 2^31)
+            const testElements = 64 * 301 * 476 * 300; // conv_base=32, decoder concat=64
+            if (testElements > 2**31) dsFactor = 1.5;
+        } else if (dsVal !== 'auto' && dsVal !== '1') {
+            dsFactor = parseFloat(dsVal) || 1;
+        }
+
+        const adjustedVram = dsFactor > 1 ? vramGB / Math.pow(dsFactor, is3d ? 3 : 2) : vramGB;
+
+        let html = `<div style="display:flex;align-items:center;gap:8px;">`;
+        html += `<span style="font-weight:600;">Estimated VRAM:</span> `;
+        html += `<span style="font-family:var(--font-mono);font-weight:600;color:${adjustedVram > 80 ? '#ef4444' : adjustedVram > 40 ? '#f59e0b' : '#10b981'};">${adjustedVram.toFixed(1)} GB</span>`;
+        html += `<span style="color:var(--text-muted);">per GPU</span>`;
+        if (effectiveBatch > 1 && gradAccum > 1) {
+            html += `<span style="margin-left:auto;color:var(--text-muted);">Effective batch: ${effectiveBatch} (${batchSize} × ${gradAccum} accum)</span>`;
+        }
+        html += `</div>`;
+
+        if (dsFactor > 1) {
+            const origDims = is3d ? '301×476×300' : '476×300';
+            const newDims = is3d
+                ? `${Math.round(301/dsFactor)}×${Math.round(476/dsFactor)}×${Math.round(300/dsFactor)}`
+                : `${Math.round(476/dsFactor)}×${Math.round(300/dsFactor)}`;
+            html += `<div style="color:#a78bfa;margin-top:4px;">📐 Spatial grid: ${origDims} → ${newDims} (${dsFactor}× downsample)</div>`;
+        }
+
+        if (adjustedVram > 80) {
+            html += `<div style="color:#ef4444;margin-top:4px;">⚠️ Likely to OOM on most GPUs. Reduce batch size or enable AMP.</div>`;
+        } else if (adjustedVram > 40) {
+            html += `<div style="color:#f59e0b;margin-top:4px;">⚠ Tight fit — ensure your GPU has ≥${Math.ceil(adjustedVram + 10)} GB VRAM.</div>`;
+        }
+
+        el.style.display = 'block';
+        el.innerHTML = html;
+    }
+
+    async function _autoSuggest() {
+        const gpus = await _getGpuInfo();
+        const is3d = _is3D();
+        const modelFamily = document.getElementById('ai-tj-model').value;
+        const msgEl = document.getElementById('ai-autosuggest-msg');
+
+        // Find minimum VRAM across available GPUs
+        let minVram = 96; // fallback
+        if (gpus.length > 0) {
+            const memoryValues = gpus
+                .filter(g => !g.running_job && !g.externally_busy)
+                .map(g => (g.memory_total || 0) / (1024 * 1024)); // bytes → MB → GB... depends on API
+            if (memoryValues.length > 0) {
+                // memory_total is typically in bytes
+                minVram = Math.min(...gpus.map(g => (g.memory_total || 0) / (1024 * 1024 * 1024)));
+                if (minVram < 1) {
+                    // Might be in MB already
+                    minVram = Math.min(...gpus.map(g => (g.memory_total || 0) / 1024));
+                }
+                if (minVram < 1) minVram = 96; // fallback
+            }
+        }
+
+        const changes = [];
+
+        if (modelFamily === 'unet') {
+            if (is3d) {
+                // 3D UNet — aggressive memory optimization
+                document.getElementById('ai-tj-batch').value = 1;
+                document.getElementById('ai-tj-amp').value = 'true';
+                document.getElementById('ai-tj-grad-accum').value = 4;
+                document.getElementById('ai-tj-lr').value = 0.0003;
+                document.getElementById('ai-tj-epochs').value = 300;
+                document.getElementById('ai-tj-weight-decay').value = 0.01;
+                document.getElementById('ai-tj-optimizer').value = 'adamw';
+                document.getElementById('ai-tj-scheduler').value = 'cosine';
+                document.getElementById('ai-tj-downsample').value = 'auto';
+                changes.push('batch_size=1 (3D volumes use ~5 GB/sample)');
+                changes.push('AMP enabled (halves activation memory)');
+                changes.push('gradient accumulation=4 (effective batch=4)');
+                changes.push('spatial downsample=auto (only if grid > 2B elements)');
+                changes.push('300 epochs (3D converges faster)');
+            } else {
+                // 2D UNet — can be more generous
+                let suggestedBatch = 4;
+                if (minVram >= 40) suggestedBatch = 8;
+                if (minVram >= 80) suggestedBatch = 16;
+
+                document.getElementById('ai-tj-batch').value = suggestedBatch;
+                document.getElementById('ai-tj-amp').value = 'false';
+                document.getElementById('ai-tj-grad-accum').value = 1;
+                document.getElementById('ai-tj-lr').value = 0.0003;
+                document.getElementById('ai-tj-epochs').value = 500;
+                document.getElementById('ai-tj-weight-decay').value = 0.01;
+                changes.push(`batch_size=${suggestedBatch} (based on ${minVram.toFixed(0)} GB VRAM)`);
+                changes.push('AMP disabled (2D fits easily)');
+            }
+        } else if (modelFamily === 'transolver') {
+            if (is3d) {
+                // 3D Transolver — similar to 3D U-Net memory profile
+                document.getElementById('ai-tj-batch').value = 1;
+                document.getElementById('ai-tj-amp').value = 'true';
+                document.getElementById('ai-tj-grad-accum').value = 4;
+                document.getElementById('ai-tj-lr').value = 0.0003;
+                document.getElementById('ai-tj-epochs').value = 300;
+                document.getElementById('ai-tj-weight-decay').value = 0.01;
+                document.getElementById('ai-tj-optimizer').value = 'adamw';
+                document.getElementById('ai-tj-scheduler').value = 'cosine';
+                document.getElementById('ai-tj-downsample').value = 'auto';
+                changes.push('batch_size=1 (3D attention is memory-intensive)');
+                changes.push('AMP enabled (halves activation memory)');
+                changes.push('gradient accumulation=4 (effective batch=4)');
+                changes.push('300 epochs (3D converges faster)');
+            } else {
+                let suggestedBatch = 4;
+                if (minVram >= 40) suggestedBatch = 8;
+                document.getElementById('ai-tj-batch').value = suggestedBatch;
+                document.getElementById('ai-tj-amp').value = 'true';
+                document.getElementById('ai-tj-grad-accum').value = 1;
+                document.getElementById('ai-tj-lr').value = 0.0003;
+                document.getElementById('ai-tj-epochs').value = 500;
+                document.getElementById('ai-tj-weight-decay').value = 0.01;
+                changes.push(`batch_size=${suggestedBatch} (based on ${minVram.toFixed(0)} GB VRAM)`);
+                changes.push('AMP enabled (Transolver benefits from mixed precision)');
+            }
+        } else if (modelFamily === 'gnn') {
+            document.getElementById('ai-tj-batch').value = 2;
+            document.getElementById('ai-tj-amp').value = is3d ? 'true' : 'false';
+            document.getElementById('ai-tj-grad-accum').value = is3d ? 2 : 1;
+            changes.push('GNN defaults applied');
+        } else if (modelFamily === 'mlp') {
+            document.getElementById('ai-tj-batch').value = 8192;
+            document.getElementById('ai-tj-amp').value = 'false';
+            document.getElementById('ai-tj-grad-accum').value = 1;
+            changes.push('MLP: large batch (fits in RAM)');
+        }
+
+        // Show feedback
+        if (msgEl && changes.length > 0) {
+            const gpuLabel = gpus.length > 0
+                ? `${gpus.length}× ${(gpus[0].name || 'GPU').split(' ').pop()} (${minVram.toFixed(0)} GB each)`
+                : 'GPU info unavailable';
+            msgEl.innerHTML = `
+                <div style="font-weight:600;margin-bottom:4px;">✨ Auto-configured for ${is3d ? '3D' : '2D'} ${modelFamily.toUpperCase()} — ${gpuLabel}</div>
+                <ul style="margin:0;padding-left:16px;line-height:1.6;">
+                    ${changes.map(c => `<li>${c}</li>`).join('')}
+                </ul>
+            `;
+            msgEl.style.display = 'block';
+            // Auto-hide after 15s
+            setTimeout(() => { if (msgEl) msgEl.style.display = 'none'; }, 15000);
+        }
+
+        _updateVramEstimate();
+    }
+
+    // Wire up auto-suggest button
+    const autoSuggestBtn = document.getElementById('ai-autosuggest-btn');
+    if (autoSuggestBtn) {
+        autoSuggestBtn.addEventListener('click', _autoSuggest);
+    }
+
+    // Update VRAM estimate whenever relevant fields change
+    ['ai-tj-batch', 'ai-tj-amp', 'ai-tj-grad-accum', 'ai-tj-downsample'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', _updateVramEstimate);
+        if (el) el.addEventListener('input', _updateVramEstimate);
+    });
+
+    // Update VRAM estimate when data mode changes
+    const dataModeEl = document.getElementById('ai-tj-data-mode');
+    if (dataModeEl) {
+        dataModeEl.addEventListener('change', () => {
+            _updateVramEstimate();
+            // Also update the autosuggest bar hint
+            const msgEl = document.getElementById('ai-autosuggest-msg');
+            if (msgEl) msgEl.style.display = 'none'; // hide old suggestions
+        });
+    }
+
+    // Initial VRAM estimate
+    _updateVramEstimate();
 
     // ---- Cleanup on page navigation ----
     container._aiTrainingCleanup = () => {
@@ -4255,12 +4930,20 @@ function renderTraining(container) {
             statusEl.innerHTML = `
                 <div style="display:flex;align-items:center;gap:8px;padding:10px;border-radius:8px;background:rgba(6,182,212,0.08);border:1px solid rgba(6,182,212,0.2);">
                     <div class="spinner" style="width:14px;height:14px;"></div>
-                    <span style="color:var(--accent-cyan);font-size:12px;">Computing derived fields… This may take a few minutes.</span>
+                    <span style="color:var(--accent-cyan);font-size:12px;">Starting preparation…</span>
                 </div>`;
 
             const computeBtn = document.getElementById('ai-prep-compute');
             computeBtn.disabled = true;
             computeBtn.textContent = 'Computing…';
+
+            // Helper to format seconds as human-readable
+            const fmtTime = (s) => {
+                if (s < 60) return `${Math.round(s)}s`;
+                const m = Math.floor(s / 60);
+                const sec = Math.round(s % 60);
+                return sec > 0 ? `${m}m ${sec}s` : `${m}m`;
+            };
 
             try {
                 const res = await aiApi.post(`/ai/datasets/${dsId}/prepare`, payload);
@@ -4273,10 +4956,54 @@ function renderTraining(container) {
 
                 const pollPrepare = setInterval(async () => {
                     try {
-                        const dsRes = await aiApi.get(`/ai/datasets/${dsId}`);
+                        // Poll both dataset status AND progress
+                        const [dsRes, dfRes] = await Promise.all([
+                            aiApi.get(`/ai/datasets/${dsId}`),
+                            aiApi.get(`/ai/datasets/${dsId}/derived-fields`),
+                        ]);
                         const ds = dsRes?.dataset || dsRes;
-                        if (!ds) return;
+                        const progress = dfRes?.progress;
 
+                        // Update progress display
+                        if (progress && progress.status !== 'complete') {
+                            const pct = progress.percent || 0;
+                            const cur = progress.current || 0;
+                            const tot = progress.total || 1;
+                            const fieldName = progress.field_name || '';
+                            const caseName = progress.case_name || '';
+                            const elapsed = progress.elapsed_seconds || 0;
+                            const eta = progress.eta_seconds || 0;
+                            const perCase = progress.per_case_seconds || 0;
+                            const computed = progress.computed || 0;
+                            const cached = progress.cached || 0;
+                            const failed = progress.failed || 0;
+                            const statusText = progress.status === 'computing'
+                                ? `Computing <b>${escHtml(caseName)}</b>…`
+                                : `Case ${cur}/${tot}`;
+
+                            statusEl.innerHTML = `
+                                <div style="padding:12px;border-radius:8px;background:rgba(6,182,212,0.08);border:1px solid rgba(6,182,212,0.2);">
+                                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                                        <span style="color:var(--accent-cyan);font-size:12px;font-weight:600;">
+                                            Computing: ${escHtml(fieldName)}
+                                        </span>
+                                        <span style="color:var(--text-muted);font-size:11px;">
+                                            ${fmtTime(elapsed)} elapsed · ~${fmtTime(eta)} remaining
+                                        </span>
+                                    </div>
+                                    <div style="background:rgba(255,255,255,0.06);border-radius:4px;height:6px;overflow:hidden;margin-bottom:6px;">
+                                        <div style="background:var(--accent-cyan);height:100%;width:${pct}%;border-radius:4px;transition:width 0.3s ease;"></div>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);">
+                                        <span>${statusText}</span>
+                                        <span>${cur}/${tot} cases · ${fmtTime(perCase)}/case</span>
+                                    </div>
+                                    ${failed > 0 ? `<div style="margin-top:4px;font-size:11px;color:var(--accent-red);">⚠ ${failed} case(s) failed</div>` : ''}
+                                </div>`;
+                            computeBtn.textContent = `Computing… ${Math.round(pct)}%`;
+                        }
+
+                        if (!ds) return;
                         if (ds.status === 'prepared') {
                             clearInterval(pollPrepare);
                             statusEl.innerHTML = `
