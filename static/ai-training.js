@@ -2852,6 +2852,22 @@ function renderTraining(container) {
             if (hasAny) {
                 fieldList.innerHTML = html;
                 fieldsEmpty.style.display = 'none';
+
+                // Auto-select defaultOn channels into inputs (for new jobs only)
+                // Uses a static set of known defaults since the channel arrays
+                // may be scoped inside isSpatialMode blocks.
+                if (!isResume && isSpatialMode) {
+                    const defaultOnNames = new Set([
+                        'x_norm', 'y_norm',        // coordinates
+                        'moving_body_mask',         // body geometry
+                    ]);
+                    fieldList.querySelectorAll('.stats-col-btn[data-field-type="spatial"]').forEach(btn => {
+                        if (defaultOnNames.has(btn.dataset.fieldValue)) {
+                            window._ioInputs.add(btn.dataset.fieldKey);
+                        }
+                    });
+                    _refreshFieldStyles();
+                }
             } else {
                 fieldList.innerHTML = '';
                 fieldsEmpty.style.display = '';
