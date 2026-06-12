@@ -2857,10 +2857,12 @@ function renderTraining(container) {
                 // Uses a static set of known defaults since the channel arrays
                 // may be scoped inside isSpatialMode blocks.
                 if (!isResume && isSpatialMode) {
+                    const is3D = dsMode.includes('3d');
                     const defaultOnNames = new Set([
-                        'x_norm', 'y_norm',        // coordinates
+                        'x_norm', 'y_norm',        // coordinates (always)
                         'moving_body_mask',         // body geometry
                     ]);
+                    if (is3D) defaultOnNames.add('z_norm');  // 3D needs Z coordinate
                     fieldList.querySelectorAll('.stats-col-btn[data-field-type="spatial"]').forEach(btn => {
                         if (defaultOnNames.has(btn.dataset.fieldValue)) {
                             window._ioInputs.add(btn.dataset.fieldKey);
