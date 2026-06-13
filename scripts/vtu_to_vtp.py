@@ -16,7 +16,12 @@ import os
 
 
 def convert_to_vtp(input_path, output_path):
-    """Convert a VTU or VTI file to VTP format."""
+    """Convert a VTU or VTI file to VTP format.
+
+    For 3D VTI volumes, extracts 3 orthogonal slice planes through the center
+    so the interior data is visible (surface extraction would show only the
+    bounding box faces).
+    """
     from vtkmodules.vtkFiltersGeometry import vtkDataSetSurfaceFilter
     from vtkmodules.vtkIOXML import vtkXMLPolyDataWriter
 
@@ -53,12 +58,67 @@ def convert_to_vtp(input_path, output_path):
     c2p.PassCellDataOn()   # Keep cell data too, just add point data
     c2p.Update()
 
-    # Extract surface — converts any vtkDataSet to PolyData polygons
-    surface_filter = vtkDataSetSurfaceFilter()
-    surface_filter.SetInputConnection(c2p.GetOutputPort())
-    surface_filter.Update()
+    # Check if this is a 3D VTI (dims > 1 in all 3 axes) — needs slice extraction
+    is_3d_vti = False
+    if ext == '.vti':
+        dims = dataset.GetDimensions()
+        if dims[0] > 2 and dims[1] > 2 and dims[2] > 2:
+            is_3d_vti = True
 
-    polydata = surface_filter.GetOutput()
+    if is_3d_vti:
+        # For 3D volumes, extract 3 orthogonal slice planes through the center
+        # so the user sees interior data instead of just bounding box faces
+        from vtkmodules.vtkFiltersCore import vtkCutter, vtkAppendPolyData
+        from vtkmodules.vtkCommonDataModel import vtkPlane
+
+        bounds = dataset.GetBounds()  # (xmin, xmax, ymin, ymax, zmin, zmax)
+        center = [
+            (bounds[0] + bounds[1]) / 2.0,
+            (bounds[2] + bounds[3]) / 2.0,
+            (bounds[4] + bounds[5]) / 2.0,
+        ]
+
+        appender = vtkAppendPolyData()
+
+        # X-plane (YZ cross-section)
+        plane_x = vtkPlane()
+        plane_x.SetOrigin(center[0], center[1], center[2])
+        plane_x.SetNormal(1, 0, 0)
+        cutter_x = vtkCutter()
+        cutter_x.SetInputConnection(c2p.GetOutputPort())
+        cutter_x.SetCutFunction(plane_x)
+        cutter_x.Update()
+        appender.AddInputData(cutter_x.GetOutput())
+
+        # Y-plane (XZ cross-section)
+        plane_y = vtkPlane()
+        plane_y.SetOrigin(center[0], center[1], center[2])
+        plane_y.SetNormal(0, 1, 0)
+        cutter_y = vtkCutter()
+        cutter_y.SetInputConnection(c2p.GetOutputPort())
+        cutter_y.SetCutFunction(plane_y)
+        cutter_y.Update()
+        appender.AddInputData(cutter_y.GetOutput())
+
+        # Z-plane (XY cross-section)
+        plane_z = vtkPlane()
+        plane_z.SetOrigin(center[0], center[1], center[2])
+        plane_z.SetNormal(0, 0, 1)
+        cutter_z = vtkCutter()
+        cutter_z.SetInputConnection(c2p.GetOutputPort())
+        cutter_z.SetCutFunction(plane_z)
+        cutter_z.Update()
+        appender.AddInputData(cutter_z.GetOutput())
+
+        appender.Update()
+        polydata = appender.GetOutput()
+        print(f"3D VTI: extracted 3 orthogonal slices through center {center}", file=sys.stderr)
+    else:
+        # 2D VTI or VTU: extract surface (existing behavior)
+        surface_filter = vtkDataSetSurfaceFilter()
+        surface_filter.SetInputConnection(c2p.GetOutputPort())
+        surface_filter.Update()
+        polydata = surface_filter.GetOutput()
 
     writer = vtkXMLPolyDataWriter()
     writer.SetFileName(output_path)

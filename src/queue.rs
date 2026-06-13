@@ -1109,7 +1109,7 @@ async fn launch_training_job(
 
     // 1. Create artifact directory
     let artifact_dir = std::path::Path::new(&ai_config.artifact_root)
-        .join(format!("training_job_{}", job_id));
+        .join(format!("ai_job_{}", job_id));
 
     if let Err(e) = tokio::fs::create_dir_all(&artifact_dir).await {
         let msg = format!("Failed to create artifact directory: {}", e);

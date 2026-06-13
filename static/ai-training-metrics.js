@@ -1,10 +1,21 @@
 /**
  * AI Training Metrics — M-Star Queue
  * ====================================
- * Standalone module for real-time training progress visualization.
+ * Comprehensive training diagnostics visualization module.
  * Uses Plotly.js (already loaded globally) with the app's dark theme.
  *
- * Exposes: window._aiTrainingMetrics = { openTrainingMetrics, closeTrainingMetrics, refreshTrainingMetrics }
+ * Tabs:
+ *   1. Loss Curves — train/val loss over epochs
+ *   2. Learning Rate — LR schedule
+ *   3. Memory — GPU memory (allocated/reserved/peak) over epochs
+ *   4. Per-Channel — per-channel validation MSE over epochs
+ *   5. Convergence — gradient norm, overfit ratio, epoch time
+ *   6. Test Results — final test metrics with quality indicators
+ *   7. Error Map — spatial error percentiles + worst-case analysis
+ *
+ * Stat Cards (top): Epochs, Best Val Loss, R², Time, GPU Peak, Epoch Time, Overfit, Params
+ *
+ * Exposes: window._aiTrainingMetrics = { openTrainingMetrics, closeTrainingMetrics, refreshTrainingMetrics, renderMetricsInto }
  */
     (function () {
         'use strict';
@@ -24,7 +35,6 @@
         let _activeTipEl = null;
         function _showMetricTip(text, anchorEl, evt) {
             if (evt) { evt.stopPropagation(); evt.preventDefault(); }
-            // Close existing
             if (_activeTipEl) { _activeTipEl.remove(); _activeTipEl = null; }
 
             const pop = document.createElement('div');
@@ -34,26 +44,20 @@
                 + 'box-shadow:0 12px 40px rgba(0,0,0,0.5);color:var(--text-primary,#e2e8f0);font-size:12px;'
                 + 'line-height:1.6;font-family:Inter,system-ui,sans-serif;';
 
-            // Format text: split on \n\n for paragraphs, \n for line breaks
             const formatted = text.split('\n\n').map(para => {
                 const lines = para.split('\n').map(line => {
-                    // Bold lines that look like headers (short, no colon at end)
                     if (line.length < 60 && !line.includes(':') && !line.startsWith(' ') && !line.startsWith('✓') && !line.startsWith('•') && line === line.trim()) {
                         return `<div style="font-weight:600;color:var(--accent-blue,#60a5fa);font-size:13px;margin-bottom:2px;">${escHtml(line)}</div>`;
                     }
-                    // Threshold lines with | separators
                     if (line.includes('|') && (line.includes('Excellent') || line.includes('Good') || line.includes('Fair') || line.includes('Poor'))) {
                         return `<div style="padding:4px 8px;background:rgba(59,130,246,0.08);border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;margin:2px 0;">${escHtml(line)}</div>`;
                     }
-                    // Checkmark lines
                     if (line.startsWith('✓') || line.startsWith('✔')) {
                         return `<div style="color:#22c55e;">${escHtml(line)}</div>`;
                     }
-                    // Bullet lines
                     if (line.trim().startsWith('•')) {
                         return `<div style="padding-left:8px;">${escHtml(line)}</div>`;
                     }
-                    // "To improve:" lines
                     if (line.startsWith('To improve:')) {
                         return `<div style="color:var(--accent-amber,#f59e0b);margin-top:4px;">${escHtml(line)}</div>`;
                     }
@@ -66,20 +70,17 @@
             document.body.appendChild(pop);
             _activeTipEl = pop;
 
-            // Position near the anchor
             const rect = anchorEl.getBoundingClientRect();
             const popW = pop.offsetWidth;
             const popH = pop.offsetHeight;
             let left = rect.left + rect.width / 2 - popW / 2;
             let top = rect.bottom + 8;
-            // Clamp to viewport
             if (left < 8) left = 8;
             if (left + popW > window.innerWidth - 8) left = window.innerWidth - 8 - popW;
             if (top + popH > window.innerHeight - 8) top = rect.top - popH - 8;
             pop.style.left = left + 'px';
             pop.style.top = top + 'px';
 
-            // Dismiss on outside click or Escape
             function dismiss(e) {
                 if (e.type === 'keydown' && e.key !== 'Escape') return;
                 if (e.type === 'click' && pop.contains(e.target)) return;
@@ -94,7 +95,6 @@
             }, 10);
         }
 
-        // ? button HTML helper
         function _tipBtn(tipKey) {
             return `<button class="ai-tip-btn" data-tip-key="${tipKey}" onclick="_mstarShowTip(this)" `
                 + `style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;`
@@ -103,7 +103,6 @@
                 + `vertical-align:middle;padding:0;line-height:1;font-family:Inter,sans-serif;">?</button>`;
         }
 
-        // Global handler (needed for inline onclick)
         window._mstarMetricTips = {};
         window._mstarShowTip = function(btn) {
             const key = btn.dataset.tipKey;
@@ -142,7 +141,21 @@
             return `${s}s`;
         }
 
-        // ---- Plotly dark-theme layout (matches GPU charts in scripts.js) ----
+        function fmtMemory(mb) {
+            if (mb == null || isNaN(mb)) return '—';
+            if (mb >= 1024) return (mb / 1024).toFixed(1) + ' GB';
+            return mb.toFixed(0) + ' MB';
+        }
+
+        function fmtParams(n) {
+            if (!n) return '—';
+            if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+            if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+            return n.toString();
+        }
+
+        // ---- Plotly dark-theme layout ----
         const DARK_LAYOUT = {
             paper_bgcolor: 'transparent',
             plot_bgcolor: 'rgba(15, 20, 35, 0.6)',
@@ -163,7 +176,6 @@
 
         const PLOTLY_CFG = { responsive: true, displayModeBar: false };
 
-        // Colors
         const COL = {
             blue: '#3b82f6',
             cyan: '#06b6d4',
@@ -171,7 +183,22 @@
             green: '#10b981',
             red: '#ef4444',
             purple: '#8b5cf6',
+            pink: '#ec4899',
+            orange: '#f97316',
         };
+
+        const CHANNEL_COLORS = [COL.blue, COL.cyan, COL.green, COL.amber, COL.purple, COL.pink, COL.red, COL.orange];
+
+        // ---- Tab definitions ----
+        const ALL_TABS = [
+            { id: 'loss', label: 'Loss Curves' },
+            { id: 'lr', label: 'Learning Rate' },
+            { id: 'memory', label: 'GPU Memory' },
+            { id: 'perchannel', label: 'Per-Channel' },
+            { id: 'convergence', label: 'Convergence' },
+            { id: 'test', label: 'Test Results' },
+            { id: 'errormap', label: 'Error Map' },
+        ];
 
         // ---- State ----
         let _pollTimer = null;
@@ -180,9 +207,7 @@
 
         // ---- Public API ----
         function openTrainingMetrics(jobId, jobMeta) {
-            // Remove any existing overlay
             closeTrainingMetrics();
-
             _currentJobId = jobId;
             _activeTab = 'loss';
 
@@ -190,12 +215,11 @@
             const title = `Training Metrics — Job #${jobId}`;
             const subtitle = [meta.model_family, meta.run_name].filter(Boolean).join(' · ');
 
-            // Create overlay
             const overlay = document.createElement('div');
             overlay.id = 'ai-metrics-overlay';
             overlay.innerHTML = `
             <div class="modal-backdrop" id="ai-metrics-backdrop"></div>
-            <div class="modal-content modal-lg" style="max-width:900px;max-height:90vh;overflow-y:auto;">
+            <div class="modal-content modal-lg" style="max-width:1100px;max-height:90vh;overflow-y:auto;">
                 <div class="modal-header">
                     <div>
                         <h3 style="margin:0;">${escHtml(title)}</h3>
@@ -207,24 +231,14 @@
                 </div>
                 <div class="modal-body" style="padding:16px;">
                     <!-- Stat cards -->
-                    <div id="ai-metrics-stats" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;"></div>
+                    <div id="ai-metrics-stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;"></div>
 
                     <!-- Tabs -->
-                    <div id="ai-metrics-tabs" style="display:flex;gap:0;margin-bottom:12px;">
-                        <button class="ai-mtab active" data-tab="loss" style="flex:1;padding:10px;text-align:center;cursor:pointer;border:1px solid var(--border-color,#333);background:var(--accent-blue,#3b82f6);color:#fff;font-weight:500;font-size:13px;border-radius:8px 0 0 8px;transition:all 0.2s;">
-                            Loss Curves
-                        </button>
-                        <button class="ai-mtab" data-tab="lr" style="flex:1;padding:10px;text-align:center;cursor:pointer;border:1px solid var(--border-color,#333);background:var(--bg-card,#1a1a2e);color:var(--text-secondary,#a0a0b0);font-weight:500;font-size:13px;transition:all 0.2s;">
-                            Learning Rate
-                        </button>
-                        <button class="ai-mtab" data-tab="test" style="flex:1;padding:10px;text-align:center;cursor:pointer;border:1px solid var(--border-color,#333);background:var(--bg-card,#1a1a2e);color:var(--text-secondary,#a0a0b0);font-weight:500;font-size:13px;border-radius:0 8px 8px 0;transition:all 0.2s;">
-                            Test Results
-                        </button>
-                    </div>
+                    <div id="ai-metrics-tabs" style="display:flex;gap:0;margin-bottom:12px;flex-wrap:wrap;"></div>
 
                     <!-- Chart container -->
                     <div style="background:var(--bg-card,#1a1a2e);border:1px solid var(--border-color,#333);border-radius:8px;padding:8px;">
-                        <div id="ai-metrics-chart" style="width:100%;height:320px;"></div>
+                        <div id="ai-metrics-chart" style="width:100%;min-height:360px;"></div>
                     </div>
 
                     <!-- Status bar -->
@@ -250,7 +264,6 @@
             overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:10000;display:flex;align-items:center;justify-content:center;';
             document.body.appendChild(overlay);
 
-            // Event listeners
             overlay.querySelector('#ai-metrics-close').addEventListener('click', closeTrainingMetrics);
             overlay.querySelector('#ai-metrics-backdrop').addEventListener('click', closeTrainingMetrics);
             document.addEventListener('keydown', _escHandler);
@@ -259,132 +272,53 @@
             const continueBtn = overlay.querySelector('#ai-metrics-continue');
             if (continueBtn) {
                 continueBtn.addEventListener('click', () => {
-                    const resumeOpts = {
-                        mode: 'continue',
-                        sourceJobId: jobId,
-                        modelFamily: meta.model_family,
-                        runName: meta.run_name,
-                        status: meta.status,
-                    };
                     closeTrainingMetrics();
-                    // Dispatch to the AI training module
                     if (window._aiTrainingModule && window._aiTrainingModule.showView) {
-                        window._aiTrainingModule.showView('new-training', resumeOpts);
+                        window._aiTrainingModule.showView('new-training', { mode: 'continue', sourceJobId: jobId, modelFamily: meta.model_family, runName: meta.run_name, status: meta.status });
                     }
                 });
             }
             const transferBtn = overlay.querySelector('#ai-metrics-transfer');
             if (transferBtn) {
                 transferBtn.addEventListener('click', () => {
-                    const resumeOpts = {
-                        mode: 'transfer',
-                        sourceJobId: jobId,
-                        modelFamily: meta.model_family,
-                        runName: meta.run_name,
-                        status: meta.status,
-                    };
                     closeTrainingMetrics();
                     if (window._aiTrainingModule && window._aiTrainingModule.showView) {
-                        window._aiTrainingModule.showView('new-training', resumeOpts);
+                        window._aiTrainingModule.showView('new-training', { mode: 'transfer', sourceJobId: jobId, modelFamily: meta.model_family, runName: meta.run_name, status: meta.status });
                     }
                 });
             }
-
-            // Export button handler
             const exportBtn = overlay.querySelector('#ai-metrics-export');
             if (exportBtn) {
                 exportBtn.addEventListener('click', async () => {
                     exportBtn.disabled = true;
                     exportBtn.innerHTML = '<span class="spinner" style="width:14px;height:14px;border-width:2px;display:inline-block;margin-right:6px;"></span> Exporting…';
                     exportBtn.style.opacity = '0.7';
-
                     try {
-                        const res = await fetch(`/api/ai/training-jobs/${jobId}/export`, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Authorization': `Bearer ${getToken()}`,
-                            },
-                            body: JSON.stringify({ formats: 'onnx,torchscript' }),
-                        });
+                        const res = await fetch(`/api/ai/training-jobs/${jobId}/export`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${getToken()}` }, body: JSON.stringify({ formats: 'onnx,torchscript' }) });
                         const data = await res.json();
-
                         if (data.error) {
                             exportBtn.innerHTML = '❌ Export Failed';
                             exportBtn.style.color = '#ef4444';
-                            exportBtn.style.borderColor = 'rgba(239,68,68,0.3)';
                             _showStatus('Export error: ' + data.error, true);
                         } else {
                             exportBtn.innerHTML = '✅ Exported';
                             exportBtn.style.color = '#22c55e';
-                            exportBtn.style.borderColor = 'rgba(34,197,94,0.3)';
-
-                            // Show export result card
-                            const exportInfo = data.export || {};
-                            const files = exportInfo.exported_files || {};
-                            const outputDir = data.output_dir || exportInfo.output_dir || '';
-                            const params = exportInfo.total_parameters || 0;
-
-                            let fileList = '';
-                            for (const [fmt, path] of Object.entries(files)) {
-                                if (fmt.endsWith('_error')) continue;
-                                const basename = path.split('/').pop();
-                                const icon = fmt === 'onnx' ? '🔷' : '🔶';
-                                fileList += `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;">
-                                    <span>${icon}</span>
-                                    <span style="font-family:monospace;font-size:12px;color:var(--text-primary);">${escHtml(basename)}</span>
-                                    <span style="font-size:10px;color:var(--text-muted);text-transform:uppercase;">${fmt}</span>
-                                </div>`;
-                            }
-
-                            const resultHtml = `
-                                <div style="margin-top:12px;padding:14px;background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.2);border-radius:8px;">
-                                    <div style="font-size:13px;font-weight:600;color:#34d399;margin-bottom:8px;">📦 Model Exported Successfully</div>
-                                    ${fileList}
-                                    <div style="font-size:11px;color:var(--text-muted);margin-top:8px;padding-top:8px;border-top:1px solid rgba(16,185,129,0.1);">
-                                        <div><strong>Parameters:</strong> ${params.toLocaleString()}</div>
-                                        <div style="margin-top:2px;"><strong>Location:</strong> <code style="font-size:11px;">${escHtml(outputDir)}</code></div>
-                                        <div style="margin-top:4px;color:var(--text-muted);">Includes <code style="font-size:11px;">export_metadata.json</code> with normalization stats and field mappings for standalone inference.</div>
-                                    </div>
-                                </div>`;
-
-                            // Insert after the buttons div
-                            exportBtn.closest('div').insertAdjacentHTML('afterend', resultHtml);
-                            _showStatus('Model exported to ' + outputDir, false);
+                            _showStatus('Model exported successfully', false);
                         }
                     } catch (err) {
-                        console.error('[AI Metrics] Export error:', err);
                         exportBtn.innerHTML = '❌ Export Failed';
-                        exportBtn.style.color = '#ef4444';
                         _showStatus('Export request failed: ' + err.message, true);
                     }
-
-                    // Re-enable after 3s
-                    setTimeout(() => {
-                        exportBtn.disabled = false;
-                        exportBtn.style.opacity = '1';
-                    }, 3000);
+                    setTimeout(() => { exportBtn.disabled = false; exportBtn.style.opacity = '1'; }, 3000);
                 });
             }
 
-            // Tab switching
-            overlay.querySelectorAll('.ai-mtab').forEach(tab => {
-                tab.addEventListener('click', () => {
-                    _activeTab = tab.dataset.tab;
-                    overlay.querySelectorAll('.ai-mtab').forEach(t => {
-                        const isActive = t.dataset.tab === _activeTab;
-                        t.style.background = isActive ? 'var(--accent-blue,#3b82f6)' : 'var(--bg-card,#1a1a2e)';
-                        t.style.color = isActive ? '#fff' : 'var(--text-secondary,#a0a0b0)';
-                        t.style.borderColor = isActive ? 'var(--accent-blue,#3b82f6)' : 'var(--border-color,#333)';
-                    });
-                    _renderCurrentTab();
-                });
-            });
+            // Build tabs
+            _renderTabs(overlay);
 
             // Load data
             _loadAndRender(jobId);
 
-            // Poll for running jobs
             const isActive = meta.status === 'running' || meta.status === 'preflight' || meta.status === 'launching';
             if (isActive) {
                 _pollTimer = setInterval(() => _loadAndRender(jobId), 3000);
@@ -392,10 +326,7 @@
         }
 
         function closeTrainingMetrics() {
-            if (_pollTimer) {
-                clearInterval(_pollTimer);
-                _pollTimer = null;
-            }
+            if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
             _currentJobId = null;
             const overlay = document.getElementById('ai-metrics-overlay');
             if (overlay) overlay.remove();
@@ -410,6 +341,35 @@
             if (e.key === 'Escape') closeTrainingMetrics();
         }
 
+        // ---- Tab Rendering ----
+        function _renderTabs(container) {
+            const tabsEl = container.querySelector('#ai-metrics-tabs');
+            if (!tabsEl) return;
+
+            tabsEl.innerHTML = ALL_TABS.map((tab, i) => {
+                const isFirst = i === 0;
+                const isLast = i === ALL_TABS.length - 1;
+                const isActive = tab.id === _activeTab;
+                const radiusL = isFirst ? '8px' : '0';
+                const radiusR = isLast ? '8px' : '0';
+                return `<button class="ai-mtab${isActive ? ' active' : ''}" data-tab="${tab.id}" style="flex:1;min-width:0;padding:8px 4px;text-align:center;cursor:pointer;border:1px solid ${isActive ? 'var(--accent-blue,#3b82f6)' : 'var(--border-color,#333)'};background:${isActive ? 'var(--accent-blue,#3b82f6)' : 'var(--bg-card,#1a1a2e)'};color:${isActive ? '#fff' : 'var(--text-secondary,#a0a0b0)'};font-weight:500;font-size:11px;border-radius:${radiusL} ${radiusR} ${radiusR} ${radiusL};transition:all 0.2s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${tab.label}</button>`;
+            }).join('');
+
+            tabsEl.querySelectorAll('.ai-mtab').forEach(tab => {
+                tab.addEventListener('click', () => {
+                    _activeTab = tab.dataset.tab;
+                    tabsEl.querySelectorAll('.ai-mtab').forEach(t => {
+                        const isAct = t.dataset.tab === _activeTab;
+                        t.style.background = isAct ? 'var(--accent-blue,#3b82f6)' : 'var(--bg-card,#1a1a2e)';
+                        t.style.color = isAct ? '#fff' : 'var(--text-secondary,#a0a0b0)';
+                        t.style.borderColor = isAct ? 'var(--accent-blue,#3b82f6)' : 'var(--border-color,#333)';
+                        if (isAct) t.classList.add('active'); else t.classList.remove('active');
+                    });
+                    _renderCurrentTab();
+                });
+            });
+        }
+
         // ---- Data loading ----
         let _lastData = null;
 
@@ -417,28 +377,17 @@
             if (!jobId) return;
             try {
                 const data = await fetchMetrics(jobId);
-                if (data.error) {
-                    _showStatus(`Error: ${data.error}`, true);
-                    return;
-                }
+                if (data.error) { _showStatus(`Error: ${data.error}`, true); return; }
                 _lastData = data;
                 _renderStats(data);
                 _renderCurrentTab();
 
-                // Update status bar
                 const n = (data.epochs || []).length;
                 const ts = new Date().toLocaleTimeString();
                 const isActive = data.job_status === 'running' || data.job_status === 'preflight';
-                _showStatus(
-                    `${n} epoch${n !== 1 ? 's' : ''} loaded · ${isActive ? '🔴 Live' : '✓ Complete'} · ${ts}`,
-                    false
-                );
+                _showStatus(`${n} epoch${n !== 1 ? 's' : ''} loaded · ${isActive ? '🔴 Live' : '✓ Complete'} · ${ts}`, false);
 
-                // Stop polling if job is done
-                if (!isActive && _pollTimer) {
-                    clearInterval(_pollTimer);
-                    _pollTimer = null;
-                }
+                if (!isActive && _pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
             } catch (err) {
                 console.error('[AI Metrics] Fetch error:', err);
                 _showStatus('Failed to fetch metrics', true);
@@ -462,35 +411,58 @@
             const lastEpoch = epochs.length > 0 ? epochs[epochs.length - 1] : {};
             const tm = data.test_metrics || {};
             const cfg = data.config || {};
+            const ts = data.training_summary || {};
 
             const totalEpochs = cfg.epochs || epochs.length;
             const bestValLoss = epochs.length > 0
                 ? Math.min(...epochs.map(e => e.val_loss).filter(v => v != null && !isNaN(v)))
                 : null;
 
+            // GPU peak memory from latest epoch
+            const gpuPeakMb = lastEpoch.gpu_peak_memory_mb || ts.gpu_peak_memory_mb || null;
+            const avgEpochTime = ts.avg_epoch_time_seconds || (lastEpoch.epoch_time_seconds || null);
+            const ofRatio = lastEpoch.overfit_ratio || null;
+            const totalP = ts.total_parameters || null;
+
+            // Overfit color
+            let ofColor = 'var(--text-primary)';
+            if (ofRatio != null) {
+                if (ofRatio > 3.0) ofColor = COL.red;
+                else if (ofRatio > 2.0) ofColor = COL.amber;
+                else if (ofRatio > 1.5) ofColor = COL.orange;
+                else ofColor = COL.green;
+            }
+
             const cards = [
                 { label: 'Epochs', value: `${epochs.length}${totalEpochs ? ' / ' + totalEpochs : ''}`, color: 'var(--text-primary)', tipKey: 'epochs' },
                 { label: 'Best Val Loss', value: fmtNum(bestValLoss, 4), color: COL.cyan, tipKey: 'val_loss' },
-                { label: 'R²', value: tm.test_r2 != null ? fmtNum(tm.test_r2, 6) : '—', color: COL.green, tipKey: 'r2' },
+                { label: 'R²', value: tm.test_r2 != null ? (tm.test_r2 * 100).toFixed(2) + '%' : '—', color: COL.green, tipKey: 'r2' },
                 { label: 'Time', value: fmtDuration(lastEpoch.elapsed_seconds), color: 'var(--text-primary)', tipKey: 'time' },
+                { label: 'GPU Peak', value: fmtMemory(gpuPeakMb), color: COL.purple, tipKey: 'gpu_peak' },
+                { label: 'Epoch Time', value: avgEpochTime != null ? avgEpochTime.toFixed(1) + 's' : '—', color: COL.blue, tipKey: 'epoch_time' },
+                { label: 'Overfit', value: ofRatio != null ? ofRatio.toFixed(2) + '×' : '—', color: ofColor, tipKey: 'overfit' },
+                { label: 'Params', value: fmtParams(totalP), color: COL.amber, tipKey: 'params' },
             ];
 
             const headerTips = {
-                epochs: 'Training iterations completed out of total requested.\n\nEach epoch processes the entire dataset once. More epochs allow the model to learn better, but too many can lead to overfitting (where the model memorizes training data but fails on new inputs).\n\nTypical range: 200-1000 epochs for CFD surrogates.',
-                val_loss: 'Lowest validation loss achieved during training.\n\nCalculation: Mean Squared Error on a held-out validation split (data the model never trained on).\n\n✓ Lower is better — approaches 0 for a perfect model.\n\nGood: < 0.01 | Fair: 0.01-0.05 | Poor: > 0.05\n\nIf this value stops decreasing while training loss keeps dropping, your model is overfitting. Try reducing model complexity, adding dropout, or getting more training data.',
-                r2: 'R² (Coefficient of Determination) on the test set.\n\nCalculation: 1 − (Σ(y − ŷ)²) / (Σ(y − ȳ)²)\nMeasures how much variance in the true data your model explains.\n\n✓ Higher is better — 1.0 means perfect prediction.\n\nExcellent: ≥ 99.9% | Very Good: ≥ 99% | Good: ≥ 95%\nFair: ≥ 90% | Poor: < 90%\n\nFor CFD surrogate models, aim for R² > 0.95. Values below 0.90 suggest the model is missing significant flow features. Check your input channels, increase model depth, or add more training cases.',
-                time: 'Total wall-clock training time.\n\nIncludes forward/backward passes, validation, and checkpointing. GPU utilization and batch size significantly affect this.',
+                epochs: 'Training iterations completed out of total requested.\n\nEach epoch processes the entire dataset once. More epochs allow the model to learn better, but too many can lead to overfitting.\n\nTypical range: 200-1000 epochs for CFD surrogates.',
+                val_loss: 'Lowest validation loss achieved during training.\n\nCalculation: Mean Squared Error on a held-out validation split (data the model never trained on).\n\n✓ Lower is better — approaches 0 for a perfect model.\n\nGood: < 0.01 | Fair: 0.01-0.05 | Poor: > 0.05\n\nIf this value stops decreasing while training loss keeps dropping, your model is overfitting.',
+                r2: 'R² (Coefficient of Determination) on the test set.\n\nCalculation: 1 − (Σ(y − ŷ)²) / (Σ(y − ȳ)²)\n\n✓ Higher is better — 1.0 means perfect prediction.\n\nExcellent: ≥ 99.9% | Very Good: ≥ 99% | Good: ≥ 95%\nFair: ≥ 90% | Poor: < 90%',
+                time: 'Total wall-clock training time.\n\nIncludes forward/backward passes, validation, and checkpointing.',
+                gpu_peak: 'Peak GPU memory used during training.\n\nIncludes model weights, activations, gradients, and optimizer state.\n\nIf this is close to your GPU\'s total VRAM, you\'re at risk of OOM errors.\n\nTo reduce: lower batch_size, reduce n_hidden, increase spatial downsampling, or enable gradient checkpointing.',
+                epoch_time: 'Average wall-clock time per epoch.\n\nUse to estimate remaining training time.\n\nIf this increases over training, check for memory fragmentation or GPU throttling.',
+                overfit: 'Overfitting ratio: val_loss / train_loss.\n\n✓ 1.0 = perfect generalization (val and train loss are equal)\n\n1.0-1.5: Good generalization\n1.5-2.0: Mild overfitting\n2.0-3.0: Moderate overfitting — consider regularization\n> 3.0: Severe overfitting — needs more data or less model complexity\n\nTo improve: add dropout, reduce n_layers/n_hidden, add more training cases, or use data augmentation.',
+                params: 'Total number of model parameters.\n\nMore parameters = more expressive model, but also more memory and risk of overfitting.\n\nTypical ranges:\n  MLP: 100K-1M\n  U-Net: 1M-10M\n  Transolver: 5M-50M',
             };
 
-            // Register tips globally for the onclick handler
             for (const [k, v] of Object.entries(headerTips)) {
                 window._mstarMetricTips['hdr_' + k] = v;
             }
 
             el.innerHTML = cards.map(c => `
-            <div style="flex:1;min-width:120px;padding:14px 18px;border-radius:10px;background:var(--bg-card,#1a1a2e);border:1px solid var(--border-color,#333);position:relative;">
-                <div style="font-size:24px;font-weight:700;line-height:1;color:${c.color};">${c.value}</div>
-                <div style="font-size:11px;color:var(--text-muted);margin-top:4px;text-transform:uppercase;letter-spacing:0.5px;">${c.label}${c.tipKey ? _tipBtn('hdr_' + c.tipKey) : ''}</div>
+            <div style="padding:12px 14px;border-radius:10px;background:var(--bg-card,#1a1a2e);border:1px solid var(--border-color,#333);">
+                <div style="font-size:22px;font-weight:700;line-height:1;color:${c.color};font-family:'JetBrains Mono',monospace;">${c.value}</div>
+                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;text-transform:uppercase;letter-spacing:0.5px;">${c.label}${c.tipKey ? _tipBtn('hdr_' + c.tipKey) : ''}</div>
             </div>
         `).join('');
         }
@@ -498,145 +470,231 @@
         // ---- Chart Rendering ----
         function _renderCurrentTab() {
             if (!_lastData) return;
-            switch (_activeTab) {
-                case 'loss': _renderLossChart(_lastData); break;
-                case 'lr': _renderLRChart(_lastData); break;
-                case 'test': _renderTestChart(_lastData); break;
-            }
-        }
-
-        function _renderLossChart(data) {
             const chartEl = document.getElementById('ai-metrics-chart');
             if (!chartEl) return;
 
-            const epochs = data.epochs || [];
-            if (epochs.length === 0) {
-                chartEl.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:13px;">No epoch data yet</div>';
-                return;
+            switch (_activeTab) {
+                case 'loss': _renderLossChart(_lastData, chartEl); break;
+                case 'lr': _renderLRChart(_lastData, chartEl); break;
+                case 'memory': _renderMemoryChart(_lastData, chartEl); break;
+                case 'perchannel': _renderPerChannelChart(_lastData, chartEl); break;
+                case 'convergence': _renderConvergenceChart(_lastData, chartEl); break;
+                case 'test': _renderTestChart(_lastData, chartEl); break;
+                case 'errormap': _renderErrorMapChart(_lastData, chartEl); break;
             }
+        }
+
+        function _noData(chartEl, msg) {
+            chartEl.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:320px;color:var(--text-muted);font-size:13px;">${msg || 'No data yet'}</div>`;
+        }
+
+        // ---- Tab: Loss Curves ----
+        function _renderLossChart(data, chartEl) {
+            const epochs = data.epochs || [];
+            if (epochs.length === 0) { _noData(chartEl, 'No epoch data yet'); return; }
 
             const x = epochs.map(e => e.epoch);
             const trainLoss = epochs.map(e => e.train_loss);
             const valLoss = epochs.map(e => e.val_loss);
 
             const traces = [
-                {
-                    x, y: trainLoss,
-                    type: 'scatter', mode: 'lines',
-                    name: 'Train Loss',
-                    line: { color: COL.blue, width: 2 },
-                },
-                {
-                    x, y: valLoss,
-                    type: 'scatter', mode: 'lines',
-                    name: 'Val Loss',
-                    line: { color: COL.cyan, width: 2, dash: 'dot' },
-                },
+                { x, y: trainLoss, type: 'scatter', mode: 'lines', name: 'Train Loss', line: { color: COL.blue, width: 2 } },
+                { x, y: valLoss, type: 'scatter', mode: 'lines', name: 'Val Loss', line: { color: COL.cyan, width: 2, dash: 'dot' } },
             ];
 
-            // Find best val loss epoch
-            let bestIdx = 0;
-            let bestVal = Infinity;
+            let bestIdx = 0, bestVal = Infinity;
             valLoss.forEach((v, i) => { if (v < bestVal) { bestVal = v; bestIdx = i; } });
-
-            // Add best-point marker
             traces.push({
-                x: [x[bestIdx]], y: [bestVal],
-                type: 'scatter', mode: 'markers',
+                x: [x[bestIdx]], y: [bestVal], type: 'scatter', mode: 'markers',
                 name: `Best: ${fmtNum(bestVal, 4)}`,
                 marker: { color: COL.green, size: 10, symbol: 'star', line: { color: '#fff', width: 1 } },
             });
 
-            // Clear any non-Plotly HTML (e.g. from Test Results tab) and redraw
             chartEl.innerHTML = '';
             Plotly.newPlot(chartEl, traces, {
-                ...DARK_LAYOUT,
-                height: 320,
+                ...DARK_LAYOUT, height: 360,
                 title: { text: 'Training & Validation Loss', font: { size: 13, color: '#d1d5db' }, x: 0.02, y: 0.97 },
                 yaxis: { ...DARK_LAYOUT.yaxis, title: { text: 'Loss', font: { size: 11 } } },
             }, PLOTLY_CFG);
         }
 
-        function _renderLRChart(data) {
-            const chartEl = document.getElementById('ai-metrics-chart');
-            if (!chartEl) return;
-
+        // ---- Tab: Learning Rate ----
+        function _renderLRChart(data, chartEl) {
             const epochs = data.epochs || [];
-            if (epochs.length === 0) {
-                chartEl.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:13px;">No epoch data yet</div>';
-                return;
-            }
+            if (epochs.length === 0) { _noData(chartEl, 'No epoch data yet'); return; }
 
             const x = epochs.map(e => e.epoch);
             const lr = epochs.map(e => e.learning_rate);
 
-            // Clear any non-Plotly HTML (e.g. from Test Results tab) and redraw
             chartEl.innerHTML = '';
             Plotly.newPlot(chartEl, [{
-                x, y: lr,
-                type: 'scatter', mode: 'lines+markers',
-                name: 'Learning Rate',
-                line: { color: COL.amber, width: 2 },
-                marker: { color: COL.amber, size: 4 },
+                x, y: lr, type: 'scatter', mode: 'lines+markers', name: 'Learning Rate',
+                line: { color: COL.amber, width: 2 }, marker: { color: COL.amber, size: 4 },
             }], {
-                ...DARK_LAYOUT,
-                height: 320,
+                ...DARK_LAYOUT, height: 360,
                 title: { text: 'Learning Rate Schedule', font: { size: 13, color: '#d1d5db' }, x: 0.02, y: 0.97 },
-                yaxis: {
-                    ...DARK_LAYOUT.yaxis,
-                    title: { text: 'Learning Rate', font: { size: 11 } },
-                    type: lr.some(v => v > 0 && v < 1e-5) ? 'log' : 'linear',
-                    exponentformat: 'e',
-                },
+                yaxis: { ...DARK_LAYOUT.yaxis, title: { text: 'Learning Rate', font: { size: 11 } }, type: lr.some(v => v > 0 && v < 1e-5) ? 'log' : 'linear', exponentformat: 'e' },
             }, PLOTLY_CFG);
         }
 
-        function _renderTestChart(data) {
-            const chartEl = document.getElementById('ai-metrics-chart');
-            if (!chartEl) return;
+        // ---- Tab: GPU Memory ----
+        function _renderMemoryChart(data, chartEl) {
+            const epochs = data.epochs || [];
+            const hasMemory = epochs.some(e => e.gpu_memory_allocated_mb != null);
+            if (!hasMemory) { _noData(chartEl, 'GPU memory tracking not available for this job (requires re-training with updated backend)'); return; }
 
+            const x = epochs.map(e => e.epoch);
+            const allocated = epochs.map(e => (e.gpu_memory_allocated_mb || 0) / 1024);
+            const reserved = epochs.map(e => (e.gpu_memory_reserved_mb || 0) / 1024);
+            const peak = epochs.map(e => (e.gpu_peak_memory_mb || 0) / 1024);
+
+            const traces = [
+                { x, y: allocated, type: 'scatter', mode: 'lines', name: 'Allocated', line: { color: COL.blue, width: 2 }, fill: 'tozeroy', fillcolor: 'rgba(59,130,246,0.1)' },
+                { x, y: reserved, type: 'scatter', mode: 'lines', name: 'Reserved', line: { color: COL.cyan, width: 1.5, dash: 'dash' } },
+                { x, y: peak, type: 'scatter', mode: 'lines', name: 'Peak', line: { color: COL.red, width: 2 } },
+            ];
+
+            chartEl.innerHTML = '';
+            Plotly.newPlot(chartEl, traces, {
+                ...DARK_LAYOUT, height: 360,
+                title: { text: 'GPU Memory Usage', font: { size: 13, color: '#d1d5db' }, x: 0.02, y: 0.97 },
+                yaxis: { ...DARK_LAYOUT.yaxis, title: { text: 'Memory (GB)', font: { size: 11 } } },
+            }, PLOTLY_CFG);
+        }
+
+        // ---- Tab: Per-Channel ----
+        function _renderPerChannelChart(data, chartEl) {
+            const epochs = data.epochs || [];
+            const hasPerCh = epochs.some(e => e.val_per_channel_mse && e.val_per_channel_mse.length > 0);
+            if (!hasPerCh) { _noData(chartEl, 'Per-channel metrics not available for this job'); return; }
+
+            const x = epochs.map(e => e.epoch);
+            const names = epochs.find(e => e.val_per_channel_names)?.val_per_channel_names || [];
+            const nCh = epochs[0].val_per_channel_mse?.length || 0;
+
+            const traces = [];
+            for (let ch = 0; ch < nCh; ch++) {
+                const y = epochs.map(e => (e.val_per_channel_mse || [])[ch] || null);
+                traces.push({
+                    x, y, type: 'scatter', mode: 'lines',
+                    name: names[ch] || `Channel ${ch}`,
+                    line: { color: CHANNEL_COLORS[ch % CHANNEL_COLORS.length], width: 2 },
+                });
+            }
+
+            chartEl.innerHTML = '';
+            Plotly.newPlot(chartEl, traces, {
+                ...DARK_LAYOUT, height: 360,
+                title: { text: 'Per-Channel Validation MSE', font: { size: 13, color: '#d1d5db' }, x: 0.02, y: 0.97 },
+                yaxis: { ...DARK_LAYOUT.yaxis, title: { text: 'MSE', font: { size: 11 } } },
+            }, PLOTLY_CFG);
+        }
+
+        // ---- Tab: Convergence ----
+        function _renderConvergenceChart(data, chartEl) {
+            const epochs = data.epochs || [];
+            if (epochs.length === 0) { _noData(chartEl, 'No epoch data yet'); return; }
+
+            const x = epochs.map(e => e.epoch);
+            const hasGrad = epochs.some(e => e.grad_norm != null);
+            const hasOverfit = epochs.some(e => e.overfit_ratio != null);
+            const hasTime = epochs.some(e => e.epoch_time_seconds != null);
+            const hasSps = epochs.some(e => e.samples_per_second != null);
+
+            // Build subplots with Plotly subplots
+            const traces = [];
+            const annotations = [];
+            let nRows = 0;
+
+            // Row 1: Gradient norm
+            if (hasGrad) {
+                nRows++;
+                traces.push({
+                    x, y: epochs.map(e => e.grad_norm), type: 'scatter', mode: 'lines',
+                    name: 'Grad Norm', line: { color: COL.purple, width: 2 },
+                    yaxis: 'y',
+                });
+            }
+
+            // Row 2: Overfit ratio
+            if (hasOverfit) {
+                nRows++;
+                traces.push({
+                    x, y: epochs.map(e => e.overfit_ratio), type: 'scatter', mode: 'lines',
+                    name: 'Overfit Ratio', line: { color: COL.amber, width: 2 },
+                    yaxis: nRows === 1 ? 'y' : 'y2',
+                });
+                // Add warning line at 2.0
+                traces.push({
+                    x: [x[0], x[x.length - 1]], y: [2.0, 2.0], type: 'scatter', mode: 'lines',
+                    name: 'Overfit Threshold', line: { color: COL.red, width: 1, dash: 'dash' },
+                    yaxis: nRows === 1 ? 'y' : 'y2', showlegend: false,
+                });
+            }
+
+            // Row 3: Epoch time + samples/sec
+            if (hasTime) {
+                nRows++;
+                traces.push({
+                    x, y: epochs.map(e => e.epoch_time_seconds), type: 'scatter', mode: 'lines',
+                    name: 'Epoch Time (s)', line: { color: COL.green, width: 2 },
+                    yaxis: nRows <= 2 ? (nRows === 1 ? 'y' : 'y2') : 'y3',
+                });
+            }
+
+            if (nRows === 0) { _noData(chartEl, 'Convergence data not available for this job'); return; }
+
+            // Use a simple combined chart (not subplots) for simplicity
+            chartEl.innerHTML = '';
+            const layout = {
+                ...DARK_LAYOUT, height: 400,
+                title: { text: 'Convergence Diagnostics', font: { size: 13, color: '#d1d5db' }, x: 0.02, y: 0.97 },
+                yaxis: { ...DARK_LAYOUT.yaxis, title: { text: hasGrad ? 'Gradient Norm' : (hasOverfit ? 'Overfit Ratio' : 'Epoch Time (s)'), font: { size: 11 } } },
+            };
+
+            // If we have multiple signals, use secondary Y axis
+            if (nRows >= 2) {
+                layout.yaxis2 = {
+                    ...DARK_LAYOUT.yaxis,
+                    title: { text: hasOverfit ? 'Overfit Ratio' : 'Epoch Time (s)', font: { size: 11 } },
+                    overlaying: 'y', side: 'right',
+                };
+            }
+            if (nRows >= 3) {
+                // For 3 signals, overlay all
+                layout.yaxis3 = {
+                    ...DARK_LAYOUT.yaxis,
+                    title: { text: 'Epoch Time (s)', font: { size: 11 } },
+                    overlaying: 'y', side: 'right',
+                    anchor: 'free', position: 0.95,
+                };
+            }
+
+            Plotly.newPlot(chartEl, traces, layout, PLOTLY_CFG);
+        }
+
+        // ---- Tab: Test Results ----
+        function _renderTestChart(data, chartEl) {
             const tm = data.test_metrics;
+            const ts = data.training_summary || {};
             if (!tm || Object.keys(tm).length === 0) {
-                chartEl.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:13px;">Test results available after training completes</div>';
+                _noData(chartEl, 'Test results available after training completes');
                 return;
             }
 
-            // Separate R² (0-1 scale) from error metrics (large scale)
             const metricOrder = ['test_r2', 'test_relative_l2', 'test_rmse', 'test_mae', 'test_max_error', 'test_mse'];
-            const labels = {
-                test_r2: 'R²', test_relative_l2: 'Rel. L2',
-                test_rmse: 'RMSE', test_mae: 'MAE',
-                test_max_error: 'Max Error', test_mse: 'MSE',
-            };
-            const colors = {
-                test_r2: COL.green, test_relative_l2: COL.purple,
-                test_rmse: COL.blue, test_mae: COL.cyan,
-                test_max_error: COL.red, test_mse: COL.amber,
-            };
+            const labels = { test_r2: 'R²', test_relative_l2: 'Rel. L2', test_rmse: 'RMSE', test_mae: 'MAE', test_max_error: 'Max Error', test_mse: 'MSE' };
+            const colors = { test_r2: COL.green, test_relative_l2: COL.purple, test_rmse: COL.blue, test_mae: COL.cyan, test_max_error: COL.red, test_mse: COL.amber };
 
-            // Render as a styled table instead of a bar chart (more readable for mixed scales)
-            const available = metricOrder.filter(k => tm[k] != null);
-
-            let html = '<div style="padding:20px;">';
-            html += '<div style="font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:16px;">Test Set Evaluation</div>';
-            html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;">';
-
-            // Detailed tooltip descriptions for each metric
             const tooltips = {
-                test_r2: 'R\u00b2 (Coefficient of Determination)\n\nFormula: 1 \u2212 \u03a3(y \u2212 \u0177)\u00b2 / \u03a3(y \u2212 \u0233)\u00b2\n\nMeasures how much variance in the true data your model explains. A value of 1.0 means perfect prediction; 0.0 means the model is no better than predicting the mean.\n\n\u2714 Higher is better (closer to 100%)\n\nThresholds for CFD surrogates:\n  Excellent: \u2265 99.9% | Very Good: \u2265 99%\n  Good: \u2265 95% | Fair: \u2265 90% | Poor: < 90%\n\nYour value is evaluated on a held-out test set (unseen cases). If R\u00b2 is low but training loss is low, your model may be overfitting.\n\nTo improve: add more training cases, increase model depth, improve input normalization, or add physics-informed loss terms.',
-
-                test_relative_l2: 'Relative L2 Error (Normalized L2 Norm)\n\nFormula: ||y \u2212 \u0177||\u2082 / ||y||\u2082\n\nThe L2 norm of the prediction error divided by the L2 norm of the true field. This is scale-invariant, making it the most reliable single metric for comparing model fidelity across different physical quantities.\n\n\u2714 Lower is better (closer to 0)\n\nThresholds for CFD surrogates:\n  Excellent: < 0.01 (1%) | Good: < 0.05 (5%)\n  Fair: < 0.10 (10%) | Poor: > 0.10 (10%)\n\nA value of 0.26 means 26% relative error \u2014 the model captures the general trend but misses significant details. State-of-the-art CFD surrogates typically achieve < 5%.\n\nTo improve: check input normalization, increase training epochs, try residual learning, or add more cases to the sweep.',
-
-                test_rmse: 'RMSE (Root Mean Squared Error)\n\nFormula: \u221a(\u03a3(y \u2212 \u0177)\u00b2 / N)\n\nSquare root of the average squared error. Expressed in the same units as your target field (e.g., m/s for velocity). Penalizes large errors more than small ones.\n\n\u2714 Lower is better (closer to 0)\n\nInterpretation depends on the magnitude of your field:\n  If velocity range is 0-10 m/s, RMSE of 0.06 \u2248 0.6% error \u2192 excellent\n  If velocity range is 0-1 m/s, RMSE of 0.06 \u2248 6% error \u2192 fair\n\nRule of thumb: RMSE should be < 5% of the target field range for a good surrogate.\n\nTo improve: focus on high-gradient regions in your loss function, or use a weighted MSE loss.',
-
-                test_mae: 'MAE (Mean Absolute Error)\n\nFormula: \u03a3|y \u2212 \u0177| / N\n\nAverage magnitude of errors in the same units as your target field. More robust to outliers than RMSE \u2014 gives equal weight to all errors.\n\n\u2714 Lower is better (closer to 0)\n\nCompare MAE to RMSE:\n  If RMSE >> MAE: a few predictions have very large errors (check boundary regions or wakes)\n  If RMSE \u2248 MAE: errors are uniformly distributed\n\nRule of thumb: MAE should be < 3% of the target field range for engineering use.',
-
-                test_max_error: 'Max Error (L\u221e Norm / Worst-Case Error)\n\nFormula: max(|y \u2212 \u0177|)\n\nThe single largest pointwise error anywhere in your test set. Critical for safety-sensitive applications where one bad prediction region could be catastrophic.\n\n\u2714 Lower is better\n\nThis metric is often dominated by:\n  \u2022 Boundary layers or wall regions\n  \u2022 Stagnation points\n  \u2022 Wake/separation zones\n  \u2022 Regions of high gradients\n\nCompare to field range: Max error should be < 20% of the field range.\n\nTo improve: visualize where the max error occurs. Consider weighting the loss function to penalize errors in high-gradient regions, or add more resolution in the boundary layer.',
-
-                test_mse: 'MSE (Mean Squared Error)\n\nFormula: \u03a3(y \u2212 \u0177)\u00b2 / N\n\nAverage of squared prediction errors. This is typically the training loss function itself \u2014 what the optimizer directly minimizes. Heavily penalizes large errors.\n\n\u2714 Lower is better (closer to 0)\n\nMSE = RMSE\u00b2 (so RMSE is the more interpretable version)\n\nUseful for comparing training loss vs test MSE:\n  If test MSE >> training MSE: model is overfitting\n  If both are similar: good generalization\n\nTo improve: same strategies as RMSE \u2014 better normalization, more data, regularization.',
+                test_r2: 'R² (Coefficient of Determination)\n\nFormula: 1 − Σ(y − ŷ)² / Σ(y − ȳ)²\n\n✓ Higher is better (closer to 100%)\n\nExcellent: ≥ 99.9% | Very Good: ≥ 99%\nGood: ≥ 95% | Fair: ≥ 90% | Poor: < 90%',
+                test_relative_l2: 'Relative L2 Error\n\nFormula: ||y − ŷ||₂ / ||y||₂\n\n✓ Lower is better (closer to 0)\n\nExcellent: < 1% | Good: < 5% | Fair: < 10% | Poor: > 10%',
+                test_rmse: 'RMSE (Root Mean Squared Error)\n\n✓ Lower is better\n\nIn same units as your target field (e.g., m/s for velocity).',
+                test_mae: 'MAE (Mean Absolute Error)\n\n✓ Lower is better\n\nCompare MAE to RMSE: if RMSE >> MAE, a few predictions have very large errors.',
+                test_max_error: 'Max Error (Worst-Case)\n\nThe single largest pointwise error. Critical for safety-sensitive applications.',
+                test_mse: 'MSE (Mean Squared Error)\n\nThis is typically the training loss function itself.',
             };
 
-            // Quality indicators for ALL metrics
             function _getQuality(key, val) {
                 switch(key) {
                     case 'test_r2':
@@ -674,11 +732,15 @@
                 }
             }
 
-            // Register test metric tips globally
-            for (const [k, v] of Object.entries(tooltips)) {
-                window._mstarMetricTips[k] = v;
-            }
+            for (const [k, v] of Object.entries(tooltips)) { window._mstarMetricTips[k] = v; }
 
+            const available = metricOrder.filter(k => tm[k] != null);
+
+            let html = '<div style="padding:20px;">';
+
+            // Global metrics grid
+            html += '<div style="font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:12px;">Global Test Metrics</div>';
+            html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:20px;">';
             for (const key of available) {
                 const val = tm[key];
                 const label = labels[key] || key;
@@ -687,71 +749,161 @@
                 const displayVal = isR2 ? (val * 100).toFixed(4) + '%' : fmtNum(val);
                 const q = _getQuality(key, val);
                 const qualityHtml = q ? `<span style="color:${q.color};font-size:10px;margin-left:6px;">${q.text}</span>` : '';
-
-                html += `
-                <div style="padding:14px 16px;background:var(--bg-tertiary,#0f1423);border-radius:8px;border:1px solid var(--border-color,#333);position:relative;">
+                html += `<div style="padding:12px 14px;background:var(--bg-tertiary,#0f1423);border-radius:8px;border:1px solid var(--border-color,#333);">
                     <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">${escHtml(label)}${_tipBtn(key)}</div>
-                    <div style="font-size:20px;font-weight:700;color:${color};font-family:'JetBrains Mono',monospace;">${displayVal}${qualityHtml}</div>
-                </div>
-            `;
+                    <div style="font-size:18px;font-weight:700;color:${color};font-family:'JetBrains Mono',monospace;">${displayVal}${qualityHtml}</div>
+                </div>`;
+            }
+            html += '</div>';
+
+            // Per-channel metrics table (if available)
+            const chNames = tm.test_per_channel_names || ts.target_channel_names;
+            const chRmse = tm.test_per_channel_rmse;
+            const chR2 = tm.test_per_channel_r2;
+            const chRelL2 = tm.test_per_channel_rel_l2;
+
+            if (chNames && chRmse) {
+                html += '<div style="font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:12px;">Per-Channel Breakdown</div>';
+                html += '<div style="overflow-x:auto;">';
+                html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+                html += '<thead><tr style="border-bottom:1px solid var(--border-color,#333);">';
+                html += '<th style="text-align:left;padding:8px;color:var(--text-muted);">Channel</th>';
+                html += '<th style="text-align:right;padding:8px;color:var(--text-muted);">RMSE</th>';
+                if (chR2) html += '<th style="text-align:right;padding:8px;color:var(--text-muted);">R²</th>';
+                if (chRelL2) html += '<th style="text-align:right;padding:8px;color:var(--text-muted);">Rel. L2</th>';
+                html += '</tr></thead><tbody>';
+
+                for (let i = 0; i < chNames.length; i++) {
+                    const rowColor = CHANNEL_COLORS[i % CHANNEL_COLORS.length];
+                    html += `<tr style="border-bottom:1px solid rgba(99,115,156,0.08);">`;
+                    html += `<td style="padding:8px;color:${rowColor};font-weight:600;">${escHtml(chNames[i])}</td>`;
+                    html += `<td style="padding:8px;text-align:right;font-family:'JetBrains Mono',monospace;color:var(--text-primary);">${fmtNum(chRmse[i])}</td>`;
+                    if (chR2) html += `<td style="padding:8px;text-align:right;font-family:'JetBrains Mono',monospace;color:var(--text-primary);">${(chR2[i] * 100).toFixed(3)}%</td>`;
+                    if (chRelL2) html += `<td style="padding:8px;text-align:right;font-family:'JetBrains Mono',monospace;color:var(--text-primary);">${(chRelL2[i] * 100).toFixed(2)}%</td>`;
+                    html += '</tr>';
+                }
+                html += '</tbody></table></div>';
             }
 
-            html += '</div></div>';
+            html += '</div>';
             chartEl.innerHTML = html;
+        }
+
+        // ---- Tab: Error Map ----
+        function _renderErrorMapChart(data, chartEl) {
+            const tm = data.test_metrics;
+            if (!tm || tm.test_error_p50 == null) {
+                _noData(chartEl, 'Error distribution data available after training completes (requires updated backend)');
+                return;
+            }
+
+            let html = '<div style="padding:20px;">';
+            html += '<div style="font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:16px;">Spatial Error Distribution</div>';
+
+            // Error percentile bar chart
+            const percentiles = [
+                { label: 'Median (p50)', key: 'test_error_p50', color: COL.green },
+                { label: '90th Percentile', key: 'test_error_p90', color: COL.cyan },
+                { label: '95th Percentile', key: 'test_error_p95', color: COL.blue },
+                { label: '99th Percentile', key: 'test_error_p99', color: COL.amber },
+                { label: '99.9th Percentile', key: 'test_error_p999', color: COL.orange },
+                { label: 'Max Error', key: 'test_max_error', color: COL.red },
+            ];
+
+            const pctData = percentiles.filter(p => tm[p.key] != null);
+            if (pctData.length > 0) {
+                // Horizontal bar chart
+                html += '<div id="ai-metrics-errorbar" style="width:100%;height:220px;margin-bottom:20px;"></div>';
+            }
+
+            // Worst-case analysis cards
+            html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-bottom:16px;">';
+
+            if (tm.test_worst_1pct_mean_error != null) {
+                html += `<div style="padding:14px;background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.2);border-radius:8px;">
+                    <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;margin-bottom:4px;">Worst 1% Mean Error</div>
+                    <div style="font-size:20px;font-weight:700;color:${COL.red};font-family:'JetBrains Mono',monospace;">${fmtNum(tm.test_worst_1pct_mean_error)}</div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">${tm.test_worst_1pct_count ? tm.test_worst_1pct_count.toLocaleString() + ' voxels' : ''}</div>
+                </div>`;
+            }
+
+            if (tm.test_error_skewness != null) {
+                const skew = tm.test_error_skewness;
+                const skewLabel = skew > 3 ? 'Heavy tail (localized errors)' : skew > 1.5 ? 'Moderate tail' : 'Well-distributed';
+                const skewColor = skew > 3 ? COL.amber : skew > 1.5 ? COL.cyan : COL.green;
+                html += `<div style="padding:14px;background:rgba(139,92,246,0.06);border:1px solid rgba(139,92,246,0.2);border-radius:8px;">
+                    <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;margin-bottom:4px;">Error Skewness</div>
+                    <div style="font-size:20px;font-weight:700;color:${COL.purple};font-family:'JetBrains Mono',monospace;">${fmtNum(skew, 2)}</div>
+                    <div style="font-size:11px;color:${skewColor};margin-top:4px;">${skewLabel}</div>
+                </div>`;
+            }
+
+            // Error ratio: p99/p50 — tells you how concentrated the errors are
+            if (tm.test_error_p99 != null && tm.test_error_p50 != null && tm.test_error_p50 > 0) {
+                const ratio = tm.test_error_p99 / tm.test_error_p50;
+                const ratioLabel = ratio > 20 ? 'Highly concentrated errors' : ratio > 10 ? 'Moderate concentration' : 'Evenly distributed';
+                const ratioColor = ratio > 20 ? COL.red : ratio > 10 ? COL.amber : COL.green;
+                html += `<div style="padding:14px;background:rgba(6,182,212,0.06);border:1px solid rgba(6,182,212,0.2);border-radius:8px;">
+                    <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;margin-bottom:4px;">P99/P50 Ratio</div>
+                    <div style="font-size:20px;font-weight:700;color:${COL.cyan};font-family:'JetBrains Mono',monospace;">${ratio.toFixed(1)}×</div>
+                    <div style="font-size:11px;color:${ratioColor};margin-top:4px;">${ratioLabel}</div>
+                </div>`;
+            }
+
+            html += '</div>';
+
+            // Interpretation guidance
+            html += `<div style="padding:12px;background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.15);border-radius:8px;font-size:12px;color:var(--text-secondary);line-height:1.5;">
+                <strong style="color:var(--text-primary);">How to read this:</strong> The percentile chart shows what fraction of spatial points have errors below each threshold.
+                If p99 >> p50, errors are concentrated in a small number of regions (typically boundaries, wakes, or stagnation points).
+                Use ParaView to visualize the error VTI files in the run directory to identify WHERE the model struggles.
+            </div>`;
+
+            html += '</div>';
+            chartEl.innerHTML = html;
+
+            // Render the Plotly bar chart after HTML is in the DOM
+            if (pctData.length > 0) {
+                const barEl = document.getElementById('ai-metrics-errorbar');
+                if (barEl) {
+                    Plotly.newPlot(barEl, [{
+                        y: pctData.map(p => p.label),
+                        x: pctData.map(p => tm[p.key]),
+                        type: 'bar', orientation: 'h',
+                        marker: { color: pctData.map(p => p.color) },
+                        text: pctData.map(p => fmtNum(tm[p.key])),
+                        textposition: 'outside',
+                        textfont: { color: '#9ca3af', size: 11 },
+                    }], {
+                        ...DARK_LAYOUT, height: 220,
+                        margin: { l: 140, r: 60, t: 10, b: 30 },
+                        xaxis: { ...DARK_LAYOUT.xaxis, title: { text: 'Absolute Error', font: { size: 11 } } },
+                        yaxis: { ...DARK_LAYOUT.yaxis, autorange: 'reversed' },
+                        showlegend: false,
+                    }, PLOTLY_CFG);
+                }
+            }
         }
 
         // ---- Embeddable renderer (for inline modal use) ----
         function renderMetricsInto(container, jobId, jobMeta) {
             _currentJobId = jobId;
             _activeTab = 'loss';
-
             const meta = jobMeta || {};
 
             container.innerHTML = `
                 <div style="padding:16px 24px;">
-                    <!-- Stat cards -->
-                    <div id="ai-metrics-stats" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;"></div>
-
-                    <!-- Tabs -->
-                    <div id="ai-metrics-tabs" style="display:flex;gap:0;margin-bottom:12px;">
-                        <button class="ai-mtab active" data-tab="loss" style="flex:1;padding:10px;text-align:center;cursor:pointer;border:1px solid var(--border-color,#333);background:var(--accent-blue,#3b82f6);color:#fff;font-weight:500;font-size:13px;border-radius:8px 0 0 8px;transition:all 0.2s;">
-                            Loss Curves
-                        </button>
-                        <button class="ai-mtab" data-tab="lr" style="flex:1;padding:10px;text-align:center;cursor:pointer;border:1px solid var(--border-color,#333);background:var(--bg-card,#1a1a2e);color:var(--text-secondary,#a0a0b0);font-weight:500;font-size:13px;transition:all 0.2s;">
-                            Learning Rate
-                        </button>
-                        <button class="ai-mtab" data-tab="test" style="flex:1;padding:10px;text-align:center;cursor:pointer;border:1px solid var(--border-color,#333);background:var(--bg-card,#1a1a2e);color:var(--text-secondary,#a0a0b0);font-weight:500;font-size:13px;border-radius:0 8px 8px 0;transition:all 0.2s;">
-                            Test Results
-                        </button>
-                    </div>
-
-                    <!-- Chart container -->
+                    <div id="ai-metrics-stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;"></div>
+                    <div id="ai-metrics-tabs" style="display:flex;gap:0;margin-bottom:12px;flex-wrap:wrap;"></div>
                     <div style="background:var(--bg-card,#1a1a2e);border:1px solid var(--border-color,#333);border-radius:8px;padding:8px;">
-                        <div id="ai-metrics-chart" style="width:100%;height:320px;"></div>
+                        <div id="ai-metrics-chart" style="width:100%;min-height:360px;"></div>
                     </div>
-
-                    <!-- Status bar -->
                     <div id="ai-metrics-status" style="font-size:11px;color:var(--text-muted);margin-top:8px;text-align:right;"></div>
                 </div>`;
 
-            // Tab switching
-            container.querySelectorAll('.ai-mtab').forEach(tab => {
-                tab.addEventListener('click', () => {
-                    _activeTab = tab.dataset.tab;
-                    container.querySelectorAll('.ai-mtab').forEach(t => {
-                        const isAct = t.dataset.tab === _activeTab;
-                        t.style.background = isAct ? 'var(--accent-blue,#3b82f6)' : 'var(--bg-card,#1a1a2e)';
-                        t.style.color = isAct ? '#fff' : 'var(--text-secondary,#a0a0b0)';
-                        t.style.borderColor = isAct ? 'var(--accent-blue,#3b82f6)' : 'var(--border-color,#333)';
-                    });
-                    _renderCurrentTab();
-                });
-            });
-
-            // Load data
+            _renderTabs(container);
             _loadAndRender(jobId);
 
-            // Poll for running jobs, return timer for cleanup
             const isRunning = meta.status === 'running' || meta.status === 'preflight' || meta.status === 'launching';
             let timer = null;
             if (isRunning) {

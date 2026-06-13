@@ -21,6 +21,9 @@
             vtkXMLImageDataReader: vtk.IO.XML.vtkXMLImageDataReader,
             vtkColorTransferFunction: vtk.Rendering.Core.vtkColorTransferFunction,
             vtkDataArray: vtk.Common.Core.vtkDataArray,
+            // Vector glyph support
+            vtkArrowSource: vtk.Filters.Sources.vtkArrowSource,
+            vtkGlyph3DMapper: vtk.Rendering.Core.vtkGlyph3DMapper,
         };
     }
 
@@ -205,6 +208,13 @@
             opacityMappingEnabled: false,
             opacityPoints: [{x: 0, o: 1}, {x: 0.25, o: 1}, {x: 0.5, o: 1}, {x: 0.75, o: 1}, {x: 1, o: 1}],
             opacityEditorVisible: false,
+            // Vector glyph state
+            vectorGlyphsEnabled: false,
+            vectorGlyphActors: [],
+            vectorGlyphScale: 3.0,      // arrow length in multiples of grid spacing
+            vectorGlyphDensity: 1000,    // target number of arrows
+            vectorGlyphLut: vtkClasses.vtkColorTransferFunction.newInstance(),
+            lastLoadedPolydatas: [],     // cached for glyph rebuild
         };
 
         // Build controls
@@ -273,6 +283,13 @@
             '</div>' +
             '<div class="pvd-controls-group">' +
             '  <button class="pvd-play-btn pvd-opacity-toggle" id="pvd-opacity-toggle" title="Opacity Transfer Function">Opacity \u25BC</button>' +
+            '</div>' +
+            '<div class="pvd-controls-group pvd-vector-controls">' +
+            '  <button class="pvd-play-btn" id="pvd-vector-toggle" title="Toggle velocity arrows">\u279C Arrows</button>' +
+            '  <label class="pvd-controls-label" style="margin-left:6px;">Scale</label>' +
+            '  <input type="range" id="pvd-vector-scale" min="0.5" max="15" step="0.5" value="3" style="width:60px;display:none;">' +
+            '  <label class="pvd-controls-label" style="margin-left:6px;">Density</label>' +
+            '  <input type="range" id="pvd-vector-density" min="200" max="5000" step="100" value="1000" style="width:60px;display:none;">' +
             '</div>' +
             '<div class="pvd-controls-group">' +
             '  <span class="pvd-controls-label">Legend</span>' +
@@ -371,6 +388,36 @@
             }
         });
 
+        // Vector glyph controls
+        document.getElementById('pvd-vector-toggle').addEventListener('click', function() {
+            var st = viewerState;
+            st.vectorGlyphsEnabled = !st.vectorGlyphsEnabled;
+            this.classList.toggle('active', st.vectorGlyphsEnabled);
+            this.style.background = st.vectorGlyphsEnabled ? 'var(--accent-blue)' : '';
+            this.style.color = st.vectorGlyphsEnabled ? '#fff' : '';
+            var scaleEl = document.getElementById('pvd-vector-scale');
+            var densityEl = document.getElementById('pvd-vector-density');
+            if (scaleEl) scaleEl.style.display = st.vectorGlyphsEnabled ? '' : 'none';
+            if (densityEl) densityEl.style.display = st.vectorGlyphsEnabled ? '' : 'none';
+            if (st.vectorGlyphsEnabled) {
+                buildVectorGlyphs(st);
+            } else {
+                removeVectorGlyphs(st);
+            }
+        });
+
+        document.getElementById('pvd-vector-scale').addEventListener('input', function() {
+            var st = viewerState;
+            st.vectorGlyphScale = parseFloat(this.value);
+            if (st.vectorGlyphsEnabled) buildVectorGlyphs(st);
+        });
+
+        document.getElementById('pvd-vector-density').addEventListener('input', function() {
+            var st = viewerState;
+            st.vectorGlyphDensity = parseInt(this.value);
+            if (st.vectorGlyphsEnabled) buildVectorGlyphs(st);
+        });
+
         // Legend position
         document.getElementById('pvd-legend-pos').addEventListener('change', function(e) {
             viewerState.legendPosition = e.target.value;
@@ -396,6 +443,9 @@
         // Remove old actors
         st.actors.forEach(function(a) { st.renderer.removeActor(a); });
         st.actors = [];
+        // Remove old glyph actors (they'll be rebuilt after new data loads)
+        st.vectorGlyphActors.forEach(function(a) { st.renderer.removeActor(a); });
+        st.vectorGlyphActors = [];
 
         // Load all parts for this timestep
         var files = ts.files || [];
@@ -556,10 +606,14 @@
                 }
             }
 
+            // Cache polydatas for vector glyph rebuild
+            st.lastLoadedPolydatas = [];
+
             results.forEach(function(result) {
                 if (!result) return;
                 st.renderer.addActor(result.actor);
                 st.actors.push(result.actor);
+                st.lastLoadedPolydatas.push(result.polydata);
 
                 // Get range for active array
                 if (st.activeArrayName) {
@@ -598,6 +652,11 @@
                 st.renderer.resetCamera();
                 autoOrientCamera(st);
                 st.firstLoad = false;
+            }
+
+            // Rebuild vector glyphs if enabled
+            if (st.vectorGlyphsEnabled) {
+                buildVectorGlyphs(st);
             }
 
             st.renderWindow.render();
@@ -679,6 +738,268 @@
         }
         lut.setMappingRange(min, max);
         lut.updateRange();
+    }
+
+    // =========================================================================
+    // Vector Glyph (Arrow) Visualization
+    // =========================================================================
+
+    /**
+     * Remove all vector glyph actors from the scene.
+     */
+    function removeVectorGlyphs(st) {
+        st.vectorGlyphActors.forEach(function(a) { st.renderer.removeActor(a); });
+        st.vectorGlyphActors = [];
+        st.renderWindow.render();
+    }
+
+    /**
+     * Find a 3-component vector array in the polydata (cell or point data).
+     * Returns { array, name, isCell } or null.
+     */
+    function findVectorArray(polydata) {
+        var cd = polydata.getCellData();
+        var pd = polydata.getPointData();
+
+        // Search cell data first (M-Star uses cell-centered data)
+        for (var i = 0; i < cd.getNumberOfArrays(); i++) {
+            var arr = cd.getArrayByIndex(i);
+            var name = cd.getArrayName(i);
+            if (arr.getNumberOfComponents() === 3 && name && name.toLowerCase().indexOf('velocity') >= 0) {
+                return { array: arr, name: name, isCell: true };
+            }
+        }
+        // Then point data
+        for (var j = 0; j < pd.getNumberOfArrays(); j++) {
+            var parr = pd.getArrayByIndex(j);
+            var pname = pd.getArrayName(j);
+            if (parr.getNumberOfComponents() === 3 && pname && pname.toLowerCase().indexOf('velocity') >= 0) {
+                return { array: parr, name: pname, isCell: false };
+            }
+        }
+        // Fallback: any 3-component array
+        for (var k = 0; k < cd.getNumberOfArrays(); k++) {
+            if (cd.getArrayByIndex(k).getNumberOfComponents() === 3) {
+                return { array: cd.getArrayByIndex(k), name: cd.getArrayName(k), isCell: true };
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Find a 1-component magnitude array in the polydata.
+     */
+    function findMagnitudeArray(polydata) {
+        var cd = polydata.getCellData();
+        var pd = polydata.getPointData();
+        var sources = [
+            { data: cd, isCell: true },
+            { data: pd, isCell: false }
+        ];
+        for (var s = 0; s < sources.length; s++) {
+            var src = sources[s];
+            for (var i = 0; i < src.data.getNumberOfArrays(); i++) {
+                var arr = src.data.getArrayByIndex(i);
+                var name = src.data.getArrayName(i);
+                if (arr.getNumberOfComponents() === 1 && name &&
+                    (name.toLowerCase().indexOf('magnitude') >= 0 ||
+                     name.toLowerCase().indexOf('velocity magnitude') >= 0)) {
+                    return { array: arr, name: name, isCell: src.isCell };
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Build vector glyph actors from cached polydatas.
+     * Downsamples to st.vectorGlyphDensity arrows, each oriented by the
+     * velocity vector and scaled/colored by magnitude.
+     */
+    function buildVectorGlyphs(st) {
+        // Remove existing glyphs first
+        removeVectorGlyphs(st);
+
+        if (!st.lastLoadedPolydatas || st.lastLoadedPolydatas.length === 0) return;
+
+        st.lastLoadedPolydatas.forEach(function(polydata) {
+            var vecInfo = findVectorArray(polydata);
+            if (!vecInfo) return; // No vector data — can't draw arrows
+
+            var magInfo = findMagnitudeArray(polydata);
+
+            var numCells = polydata.getNumberOfCells();
+            var numPoints = polydata.getNumberOfPoints();
+            var totalItems = vecInfo.isCell ? numCells : numPoints;
+            if (totalItems === 0) return;
+
+            // Compute stride for downsampling
+            var targetCount = Math.max(50, st.vectorGlyphDensity);
+            var stride = Math.max(1, Math.floor(totalItems / targetCount));
+            var sampledCount = Math.ceil(totalItems / stride);
+
+            // Build arrays for the downsampled polydata:
+            //   - positions (3 floats per point)
+            //   - orientations (3 floats per point — velocity vector)
+            //   - magnitudes (1 float per point — for color + scale)
+            var positions = new Float32Array(sampledCount * 3);
+            var orientations = new Float32Array(sampledCount * 3);
+            var magnitudes = new Float32Array(sampledCount);
+
+            var bounds = polydata.getBounds();
+            // Estimate grid spacing from bounds and point count
+            var dx = (bounds[1] - bounds[0]) || 1;
+            var dy = (bounds[3] - bounds[2]) || 1;
+            var dz = (bounds[5] - bounds[4]) || 1;
+            // For a 2D slice, one dimension will be ~0
+            var dims = [];
+            if (dx > 1e-6) dims.push(dx);
+            if (dy > 1e-6) dims.push(dy);
+            if (dz > 1e-6) dims.push(dz);
+            var estimatedSpacing = dims.length > 0
+                ? Math.sqrt(dims.reduce(function(a, b) { return a * b; }, 1) / totalItems)
+                : 0.01;
+
+            var maxMag = 0;
+            var idx = 0;
+
+            // Pre-compute cell centers for cell data using the polys connectivity
+            var cellCenters = null;
+            if (vecInfo.isCell) {
+                var allPoints = polydata.getPoints();
+                var polysData = polydata.getPolys().getData();
+                cellCenters = [];
+                var offset = 0;
+                while (offset < polysData.length) {
+                    var nPts = polysData[offset];
+                    var cx = 0, cy = 0, cz = 0;
+                    for (var p = 0; p < nPts; p++) {
+                        var ptIdx = polysData[offset + 1 + p];
+                        var pt = allPoints.getPoint(ptIdx);
+                        cx += pt[0]; cy += pt[1]; cz += pt[2];
+                    }
+                    cellCenters.push([cx / nPts, cy / nPts, cz / nPts]);
+                    offset += nPts + 1;
+                }
+            }
+
+            for (var i = 0; i < totalItems && idx < sampledCount; i += stride) {
+                // Get position
+                var pos;
+                if (vecInfo.isCell) {
+                    if (i >= cellCenters.length) continue;
+                    pos = cellCenters[i];
+                } else {
+                    pos = polydata.getPoints().getPoint(i);
+                }
+
+                var vec = vecInfo.array.getTuple(i);
+                var mag;
+                if (magInfo) {
+                    mag = magInfo.array.getTuple(i)[0];
+                } else {
+                    mag = Math.sqrt(vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2]);
+                }
+
+                positions[idx * 3] = pos[0];
+                positions[idx * 3 + 1] = pos[1];
+                positions[idx * 3 + 2] = pos[2];
+                orientations[idx * 3] = vec[0];
+                orientations[idx * 3 + 1] = vec[1];
+                orientations[idx * 3 + 2] = vec[2];
+                magnitudes[idx] = mag;
+                if (mag > maxMag) maxMag = mag;
+                idx++;
+            }
+
+            // Trim to actual count (some cells might be skipped)
+            sampledCount = idx;
+            if (sampledCount === 0) return;
+
+            // Build a vtkPolyData with the sampled points
+            var vtkPD = vtk.Common.DataModel.vtkPolyData.newInstance();
+
+            var pointsTypedArray = positions.subarray(0, sampledCount * 3);
+            var vtkPoints = vtk.Common.Core.vtkPoints.newInstance();
+            vtkPoints.setData(pointsTypedArray, 3);
+            vtkPD.setPoints(vtkPoints);
+
+            // Add vertex cells so Glyph3DMapper has cells to iterate
+            var verts = new Uint32Array(sampledCount * 2);
+            for (var v = 0; v < sampledCount; v++) {
+                verts[v * 2] = 1;
+                verts[v * 2 + 1] = v;
+            }
+            vtkPD.getVerts().setData(verts);
+
+            // Add orientation array
+            var oriArray = vtk.Common.Core.vtkDataArray.newInstance({
+                numberOfComponents: 3,
+                values: orientations.subarray(0, sampledCount * 3),
+                name: 'Velocity',
+            });
+            vtkPD.getPointData().addArray(oriArray);
+
+            // Add magnitude array for coloring
+            var magArray = vtk.Common.Core.vtkDataArray.newInstance({
+                numberOfComponents: 1,
+                values: magnitudes.subarray(0, sampledCount),
+                name: 'Magnitude',
+            });
+            vtkPD.getPointData().addArray(magArray);
+            vtkPD.getPointData().setActiveScalars('Magnitude');
+
+            // Create arrow source
+            var arrowSource = st.vtkClasses.vtkArrowSource.newInstance({
+                tipResolution: 12,
+                tipRadius: 0.08,
+                tipLength: 0.3,
+                shaftResolution: 8,
+                shaftRadius: 0.025,
+            });
+
+            // Create Glyph3DMapper
+            var glyphMapper = st.vtkClasses.vtkGlyph3DMapper.newInstance();
+            glyphMapper.setInputData(vtkPD, 0);
+            glyphMapper.setInputConnection(arrowSource.getOutputPort(), 1);
+
+            // Orientation: use the 'Velocity' array for direction
+            glyphMapper.setOrientationArray('Velocity');
+            glyphMapper.setOrientationModeToDirection();
+
+            // Scale: uniform scale based on user's scale factor and grid spacing
+            // Scale factor = scaleSetting * gridSpacing
+            // This makes arrows sized relative to the grid, not the velocity magnitude
+            // (magnitude is already encoded in the color)
+            var scaleFactor = st.vectorGlyphScale * estimatedSpacing;
+            if (maxMag > 0) {
+                // Normalize so the longest arrow = scaleFactor
+                glyphMapper.setScaleFactor(scaleFactor / maxMag);
+            } else {
+                glyphMapper.setScaleFactor(scaleFactor);
+            }
+            glyphMapper.setScaleArray('Magnitude');
+            glyphMapper.setScaleModeToScaleByMagnitude();
+
+            // Color by magnitude using the viewer's colormap
+            var glyphLut = st.vtkClasses.vtkColorTransferFunction.newInstance();
+            applyColormap(glyphLut, st.colormap, 0, maxMag > 0 ? maxMag : 1);
+            glyphMapper.setLookupTable(glyphLut);
+            glyphMapper.setScalarVisibility(true);
+            glyphMapper.setScalarModeToUsePointFieldData();
+            glyphMapper.setColorByArrayName('Magnitude');
+            glyphMapper.setScalarRange(0, maxMag > 0 ? maxMag : 1);
+
+            // Create actor
+            var glyphActor = st.vtkClasses.vtkActor.newInstance();
+            glyphActor.setMapper(glyphMapper);
+            glyphActor.getProperty().setBackfaceCulling(false);
+
+            st.renderer.addActor(glyphActor);
+            st.vectorGlyphActors.push(glyphActor);
+        });
+
+        st.renderWindow.render();
     }
 
     function updateColorbar() {
@@ -1365,6 +1686,7 @@
         if (viewerState) {
             if (viewerState.playTimer) clearInterval(viewerState.playTimer);
             viewerState.actors.forEach(function(a) { viewerState.renderer.removeActor(a); });
+            viewerState.vectorGlyphActors.forEach(function(a) { viewerState.renderer.removeActor(a); });
             try { viewerState.fullScreenRenderWindow.delete(); } catch (e) {}
             viewerState = null;
         }

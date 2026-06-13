@@ -74,9 +74,9 @@ sleep 1
 
 # --- Deploy binary -----------------------------------------------------------
 echo "[3/6] Installing binary..."
-sudo cp "${BINARY}" "/usr/local/bin/${BINARY_NAME}"
-sudo chmod +x "/usr/local/bin/${BINARY_NAME}"
-echo "      ✓ /usr/local/bin/${BINARY_NAME}"
+sudo cp "${BINARY}" "${INSTALL_DIR}/${BINARY_NAME}"
+sudo chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+echo "      ✓ ${INSTALL_DIR}/${BINARY_NAME}"
 
 # --- Deploy service + config files -------------------------------------------
 echo "[4/6] Installing service files..."

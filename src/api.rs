@@ -4609,19 +4609,22 @@ async fn handle_ai_training_metrics(
     if !results_path.exists() {
         results_path = artifact_dir.join("results.json");
     }
-    let test_metrics = if results_path.exists() {
+    let (test_metrics, training_summary) = if results_path.exists() {
         match tokio::fs::read_to_string(&results_path).await {
             Ok(content) => {
                 if let Ok(results) = serde_json::from_str::<serde_json::Value>(&content) {
-                    results.get("test_metrics").cloned()
+                    (
+                        results.get("test_metrics").cloned(),
+                        results.get("training_summary").cloned(),
+                    )
                 } else {
-                    None
+                    (None, None)
                 }
             }
-            Err(_) => None,
+            Err(_) => (None, None),
         }
     } else {
-        None
+        (None, None)
     };
 
     // 3. Read training_config.json (key config fields)
@@ -4657,6 +4660,7 @@ async fn handle_ai_training_metrics(
         "job_status": job.status,
         "epochs": epochs,
         "test_metrics": test_metrics,
+        "training_summary": training_summary,
         "config": config,
     })))
 }

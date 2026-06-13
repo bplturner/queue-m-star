@@ -12,8 +12,8 @@ User=mstar_user
 Group=mstar_user
 WorkingDirectory=/opt/mstar_queue
 
-# Binary with quiet flag for production
-ExecStart=/usr/local/bin/mstar_queue --quiet
+# Binary lives alongside config, static files, and python in /opt/mstar_queue/
+ExecStart=/opt/mstar_queue/mstar_queue --quiet
 
 # Restart policy: always restart, even on clean exit (e.g. unexpected shutdown)
 Restart=always
