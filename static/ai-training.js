@@ -2164,6 +2164,7 @@ function renderTraining(container) {
                                     <select class="form-select" id="ai-tj-model">
                                         <option value="unet" selected>U-Net (Encoder-Decoder)</option>
                                         <option value="transolver">Transolver (Physics-Attention Transformer)</option>
+                                        <option value="transolverpp">Transolver++ (Point-Cloud Neural Operator)</option>
                                         <option value="gnn">GNN (Graph Neural Network)</option>
                                         <option value="mlp">MLP (Multi-Layer Perceptron)</option>
                                     </select>
@@ -2374,6 +2375,13 @@ function renderTraining(container) {
                 optimizer: 'adamw', scheduler: 'cosine', checkpoint_interval: 10,
                 amp: 'true', gradient_accumulation_steps: 1, weight_decay: 0.01,
                 spatial_downsample: 'auto',
+            },
+            transolverpp: {
+                note: 'Point-cloud neural operator for unstructured million-scale CFD fields — operates on raw cell centers (Volume.pvd + BoundaryConditions.pvd)',
+                epochs: 500, batch_size: 1, learning_rate: 0.0003,
+                optimizer: 'adamw', scheduler: 'cosine', checkpoint_interval: 10,
+                amp: 'true', gradient_accumulation_steps: 4, weight_decay: 0.01,
+                spatial_downsample: '1',
             },
             gnn: {
                 note: 'Unstructured meshes, particle neighborhoods, irregular geometry, graph-based flow fields',
@@ -4066,6 +4074,22 @@ function renderTraining(container) {
                 changes.push(`batch_size=${suggestedBatch} (based on ${minVram.toFixed(0)} GB VRAM)`);
                 changes.push('AMP enabled (Transolver benefits from mixed precision)');
             }
+        } else if (modelFamily === 'transolverpp') {
+            // Transolver++ operates on point clouds — batch=1, AMP essential,
+            // gradient accumulation to simulate larger effective batch.
+            document.getElementById('ai-tj-batch').value = 1;
+            document.getElementById('ai-tj-amp').value = 'true';
+            document.getElementById('ai-tj-grad-accum').value = 4;
+            document.getElementById('ai-tj-lr').value = 0.0003;
+            document.getElementById('ai-tj-epochs').value = 500;
+            document.getElementById('ai-tj-weight-decay').value = 0.01;
+            document.getElementById('ai-tj-optimizer').value = 'adamw';
+            document.getElementById('ai-tj-scheduler').value = 'cosine';
+            document.getElementById('ai-tj-downsample').value = '1';
+            changes.push('batch_size=1 (point-cloud, million-scale)');
+            changes.push('AMP enabled (float32 Gumbel-Softmax internally)');
+            changes.push('gradient accumulation=4 (effective batch=4)');
+            changes.push('No spatial downsampling (operates on raw cell centers)');
         } else if (modelFamily === 'gnn') {
             document.getElementById('ai-tj-batch').value = 2;
             document.getElementById('ai-tj-amp').value = is3d ? 'true' : 'false';

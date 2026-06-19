@@ -365,7 +365,7 @@ impl Config {
                 return Err(format!("AI training: invalid default_dataset_format '{}'. Valid: {:?}",
                     self.ai_training.default_dataset_format, valid_formats));
             }
-            let valid_families = ["fno", "unet", "gnn", "mlp", "transolver"];
+            let valid_families = ["fno", "unet", "gnn", "mlp", "transolver", "transolverpp"];
             if !valid_families.contains(&self.ai_training.default_model_family.as_str()) {
                 return Err(format!("AI training: invalid default_model_family '{}'. Valid: {:?}",
                     self.ai_training.default_model_family, valid_families));
