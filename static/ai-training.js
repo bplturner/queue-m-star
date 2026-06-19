@@ -4142,6 +4142,59 @@ function renderTraining(container) {
             // Also update the autosuggest bar hint
             const msgEl = document.getElementById('ai-autosuggest-msg');
             if (msgEl) msgEl.style.display = 'none'; // hide old suggestions
+
+            // --- Auto-deselect fields that don't match the new mode ---
+            const newMode = dataModeEl.value;
+            if (newMode === 'stats_table') return; // stats mode has no VTK fields
+
+            // Determine which PVD prefix to deselect:
+            //   3D mode → remove Slice fields
+            //   2D mode → remove Volume fields
+            const is3d = newMode === 'time_averaged_3d';
+
+            // Check each selected field key in inputs and outputs
+            const inputs = window._ioInputs || new Set();
+            const outputs = window._ioOutputs || new Set();
+            const toRemove = [];
+
+            function isIncompatibleKey(key) {
+                // VTK field keys: "vtk:<pvdName>:<field>" or "output_vtk:<pvdLabel>:<field>"
+                const parts = key.split(':');
+                if (parts.length < 2) return false;
+                const prefix = parts[0];
+                if (prefix !== 'vtk' && prefix !== 'output_vtk') return false;
+                const pvdName = parts[1].toLowerCase();
+                if (is3d) {
+                    // In 3D mode, deselect anything from a Slice PVD
+                    return pvdName.includes('slice');
+                } else {
+                    // In 2D mode, deselect anything from a Volume PVD
+                    return pvdName.includes('volume') || pvdName.includes('boundaryconditions');
+                }
+            }
+
+            for (const key of inputs) {
+                if (isIncompatibleKey(key)) toRemove.push({ key, set: inputs });
+            }
+            for (const key of outputs) {
+                if (isIncompatibleKey(key)) toRemove.push({ key, set: outputs });
+            }
+
+            if (toRemove.length > 0) {
+                for (const { key, set } of toRemove) {
+                    set.delete(key);
+                }
+                // Refresh visual state of all field buttons
+                if (typeof _refreshFieldStyles === 'function') _refreshFieldStyles();
+                if (typeof _updateIOCounts === 'function') _updateIOCounts();
+                if (window.updateTensorSummary) updateTensorSummary();
+
+                const label = is3d ? '2D Slice' : '3D Volume';
+                showToast(
+                    `Deselected ${toRemove.length} ${label} field${toRemove.length > 1 ? 's' : ''} — incompatible with ${is3d ? '3D Volume' : '2D Slice'} mode.`,
+                    'info'
+                );
+            }
         });
     }
 
